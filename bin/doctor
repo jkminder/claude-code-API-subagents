@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Install health check (dispatched as: claude-api doctor [--ping]).
+# Verifies every load-bearing assumption without printing the key.
+# --ping additionally does one live worker run (spends a little API credit).
+set -uo pipefail
+
+SRC="${BASH_SOURCE[0]}"
+while [ -L "$SRC" ]; do
+  dir="$(cd "$(dirname "$SRC")" && pwd)"
+  SRC="$(readlink "$SRC")"
+  case "$SRC" in /*) ;; *) SRC="$dir/$SRC" ;; esac
+done
+BIN_DIR="$(cd "$(dirname "$SRC")" && pwd)"
+CONFIG_DIR="${CLAUDE_API_CONFIG_DIR:-$HOME/.claude-api}"
+KEYCHAIN_SERVICE="${CLAUDE_API_KEYCHAIN_SERVICE:-claude-api-worker}"
+
+fails=0; warns=0
+ok()   { echo "  ok    $1"; }
+warn() { echo "  WARN  $1"; warns=$((warns + 1)); }
+fail() { echo "  FAIL  $1"; fails=$((fails + 1)); }
+
+echo "claude-api doctor"
+
+if command -v claude >/dev/null 2>&1; then
+  ok "claude on PATH ($(claude --version 2>/dev/null | head -1))"
+else
+  fail "claude not on PATH — npm install -g @anthropic-ai/claude-code"
+fi
+
+src=""
+if [ -n "${CLAUDE_API_KEY_CMD:-}" ] && [ -n "$(eval "$CLAUDE_API_KEY_CMD" 2>/dev/null || true)" ]; then
+  src="CLAUDE_API_KEY_CMD"
+elif [ "$(uname)" = Darwin ] && security find-generic-password -s "$KEYCHAIN_SERVICE" >/dev/null 2>&1; then
+  src="macOS Keychain ($KEYCHAIN_SERVICE)"
+elif [ -f "$CONFIG_DIR/api-key" ]; then
+  src="file $CONFIG_DIR/api-key"
+  perms="$(stat -f %Lp "$CONFIG_DIR/api-key" 2>/dev/null || stat -c %a "$CONFIG_DIR/api-key" 2>/dev/null)"
+  [ "$perms" = "600" ] || warn "api-key file perms are $perms (expected 600)"
+fi
+if [ -n "$src" ]; then ok "API key available via $src"; else fail "no API key — run claude-api-store-key"; fi
+
+if [ -d "$CONFIG_DIR" ]; then
+  dperms="$(stat -f %Lp "$CONFIG_DIR" 2>/dev/null || stat -c %a "$CONFIG_DIR" 2>/dev/null)"
+  [ "$dperms" = "700" ] && ok "config dir $CONFIG_DIR (0700)" || warn "config dir perms are $dperms (expected 700)"
+else
+  fail "config dir $CONFIG_DIR missing — run setup-worker"
+fi
+
+if [ -f "$CONFIG_DIR/settings.json" ]; then
+  if python3 -c "import json;json.load(open('$CONFIG_DIR/settings.json'))" 2>/dev/null; then
+    ok "worker settings.json parses"
+  else
+    fail "worker settings.json is invalid JSON"
+  fi
+else
+  warn "worker settings.json missing — run setup-worker"
+fi
+
+if [ -f "$CONFIG_DIR/.credentials.json" ]; then
+  warn "OAuth credentials present in the worker identity ($CONFIG_DIR/.credentials.json) — if the API key ever goes missing, workers would silently bill that account. Remove: rm '$CONFIG_DIR/.credentials.json'"
+else
+  ok "no OAuth credentials in the worker identity"
+fi
+
+if grep -qs "permission-mode-hook" "$HOME/.claude/settings.json"; then
+  ok "permission-mode hook registered"
+else
+  warn "permission-mode hook not registered — inheritance disabled (rerun setup-worker)"
+fi
+if [ -x "$HOME/.claude/skills/delegate/../../bin/permission-mode-hook" ]; then
+  ok "hook path resolves through the skill symlink"
+else
+  warn "hook path does not resolve — is ~/.claude/skills/delegate a copy instead of a symlink?"
+fi
+
+if [ -f "$HOME/.claude/skills/delegate/SKILL.md" ]; then
+  ok "delegate skill installed"
+else
+  fail "delegate skill missing — run setup-worker"
+fi
+if [ -x "$HOME/.local/bin/claude-api" ]; then
+  ok "claude-api linked in ~/.local/bin"
+else
+  warn "claude-api not linked in ~/.local/bin — run setup-worker"
+fi
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ok "~/.local/bin on PATH" ;;
+  *) warn "~/.local/bin NOT on PATH — the skill's fallback path still works" ;;
+esac
+
+if [ "${1:-}" = "--ping" ]; then
+  echo "  ....  live ping (one sonnet worker run)"
+  out="$("$BIN_DIR/claude-api" -p 'Reply with exactly: PING OK' --model sonnet --output-format json 2>/tmp/claude-api-doctor-ping.err)" \
+    && printf '%s' "$out" | grep -q "PING OK" \
+    && ok "live worker run OK (bills the API key)" \
+    || { fail "live ping failed — see /tmp/claude-api-doctor-ping.err"; }
+fi
+
+echo
+echo "doctor: $fails fail, $warns warn"
+[ "$fails" -eq 0 ]

@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Worker wrapper: runs `claude` against a dedicated Anthropic API key with an
+# identity fully isolated from any subscription login in the parent environment.
+#
+# Key resolution order (each source cascades to the next on failure/empty):
+#   1. $CLAUDE_API_KEY_CMD        (a command that prints the key, e.g. a vault CLI)
+#   2. macOS Keychain             (service $CLAUDE_API_KEYCHAIN_SERVICE, default claude-api-worker)
+#   3. $CLAUDE_API_CONFIG_DIR/api-key   (0600 file — the path for Linux/clusters)
+# Store the key with bin/store-key (works on both platforms).
+#
+# Permission mode resolution (first match wins):
+#   1. Explicit --permission-mode / --dangerously-skip-permissions in the args
+#   2. Inherited from the parent Claude Code session when it runs in an elevated
+#      mode (bypassPermissions / dontAsk / auto) — recorded per Bash call by
+#      bin/permission-mode-hook (registered in ~/.claude/settings.json by setup-worker)
+#   3. Floor default: acceptEdits
+#
+# Framework subcommands (handled here, not passed to claude):
+#   claude-api ps | kill | clean      → bin/worker-ctl   (worker lifecycle)
+#   claude-api doctor [--ping]        → bin/doctor       (install health check)
+#   claude-api selftest               → bin/selftest     (validation matrix; spends credits)
+#   claude-api worktree add|list|clean → bin/worker-worktree (parallel-worker isolation)
+# Every real run is appended to $CONFIG_DIR/run/ledger.jsonl (see claude-api ps).
+set -euo pipefail
+
+# Resolve our own location through symlinks (~/.local/bin/claude-api → repo/bin).
+SRC="${BASH_SOURCE[0]}"
+while [ -L "$SRC" ]; do
+  dir="$(cd "$(dirname "$SRC")" && pwd)"
+  SRC="$(readlink "$SRC")"
+  case "$SRC" in /*) ;; *) SRC="$dir/$SRC" ;; esac
+done
+BIN_DIR="$(cd "$(dirname "$SRC")" && pwd)"
+
+CONFIG_DIR="${CLAUDE_API_CONFIG_DIR:-$HOME/.claude-api}"
+KEYCHAIN_SERVICE="${CLAUDE_API_KEYCHAIN_SERVICE:-claude-api-worker}"
+RUN_DIR="$CONFIG_DIR/run"
+export CLAUDE_CONFIG_DIR="$CONFIG_DIR"
+
+# Framework subcommands.
+case "${1:-}" in
+  ps|kill|clean) exec "$BIN_DIR/worker-ctl" "$@" ;;
+  doctor)        shift; exec "$BIN_DIR/doctor" "$@" ;;
+  selftest)      shift; exec "$BIN_DIR/selftest" "$@" ;;
+  worktree)      shift; exec "$BIN_DIR/worker-worktree" "$@" ;;
+esac
+
+# Meta calls pass through without mode injection, ledger, or a hard key requirement.
+meta=0
+case "${1:-}" in
+  mcp|config|update|install|setup-token|auth|plugin|migrate-installer|agents|-h|--help|-v|--version) meta=1 ;;
+esac
+
+# Key resolution — independent cascading sources.
+key=""
+if [ -n "${CLAUDE_API_KEY_CMD:-}" ]; then
+  key="$(eval "$CLAUDE_API_KEY_CMD" 2>/dev/null || true)"
+  [ -n "$key" ] || echo "claude-api: CLAUDE_API_KEY_CMD produced no key; trying next source" >&2
+fi
+if [ -z "$key" ] && [ "$(uname)" = Darwin ] && command -v security >/dev/null 2>&1; then
+  key="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)"
+fi
+if [ -z "$key" ] && [ -f "$CONFIG_DIR/api-key" ]; then
+  key="$(tr -d '[:space:]' < "$CONFIG_DIR/api-key")"
+fi
+
+if [ -n "$key" ]; then
+  export ANTHROPIC_API_KEY="$key"
+elif [ "$meta" -eq 0 ]; then
+  echo "claude-api: no API key found." >&2
+  echo "Store it once with:  claude-api-store-key  (or $BIN_DIR/store-key)" >&2
+  echo "(macOS: Keychain service '$KEYCHAIN_SERVICE'; Linux: $CONFIG_DIR/api-key, 0600)" >&2
+  exit 1
+fi
+
+# Nothing inherited from the parent may win the auth precedence (AUTH_TOKEN
+# outranks API_KEY), reroute traffic (BASE_URL, Bedrock/Vertex switches), or
+# override the worker model.
+unset ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_BASE_URL \
+      CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
+      ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_CUSTOM_HEADERS 2>/dev/null || true
+
+if [ "$meta" -eq 1 ]; then
+  exec claude "$@"
+fi
+
+# Permission mode: explicit flag > inherited elevated parent mode > acceptEdits.
+explicit=0
+for a in "$@"; do
+  case "$a" in
+    --permission-mode|--permission-mode=*|--dangerously-skip-permissions) explicit=1 ;;
+  esac
+done
+if [ "$explicit" -eq 0 ]; then
+  mode=""
+  if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+    mode_file="$RUN_DIR/permission-mode-${CLAUDE_CODE_SESSION_ID}"
+    # Trust the file only if it's a regular, non-symlink file we own.
+    if [ -f "$mode_file" ] && [ ! -L "$mode_file" ] && [ -O "$mode_file" ]; then
+      mode="$(cat "$mode_file" 2>/dev/null || true)"
+    fi
+  fi
+  case "$mode" in
+    bypassPermissions|dontAsk|auto)
+      echo "claude-api: inheriting permission mode '$mode' from parent session" >&2
+      set -- --permission-mode "$mode" "$@" ;;
+    *) set -- --permission-mode acceptEdits "$@" ;;
+  esac
+fi
+
+# Run ledger (read by claude-api ps). Values sanitized to JSON-safe characters.
+mkdir -p "$RUN_DIR" 2>/dev/null || true
+chmod 700 "$RUN_DIR" 2>/dev/null || true
+LEDGER="$RUN_DIR/ledger.jsonl"
+san() { printf '%s' "$1" | tr -c 'A-Za-z0-9 ._/=:,+@-' '_' | cut -c1-200; }
+start_ts="$(date +%s)"
+
+# `<&0` is load-bearing: bash redirects a background job's stdin to /dev/null
+# when job control is off, which would starve FIFO/stream-json workers.
+claude "$@" <&0 &
+child=$!
+trap 'kill -TERM "$child" 2>/dev/null || true' TERM INT
+printf '{"event":"spawn","ts":%s,"pid":%s,"cwd":"%s","cmd":"%s"}\n' \
+  "$start_ts" "$child" "$(san "$PWD")" "$(san "$*")" >> "$LEDGER" 2>/dev/null || true
+rc=0
+wait "$child" || rc=$?
+printf '{"event":"exit","ts":%s,"pid":%s,"exit":%s,"secs":%s}\n' \
+  "$(date +%s)" "$child" "$rc" "$(( $(date +%s) - start_ts ))" >> "$LEDGER" 2>/dev/null || true
+exit "$rc"

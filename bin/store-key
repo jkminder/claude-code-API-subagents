@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Store the API key for claude-api workers.
+# macOS → Keychain: `security` prompts with hidden input itself, so the key
+# never enters argv (visible in `ps`) or shell history.
+# Elsewhere (or if the Keychain is unavailable) → 0600 file in the config dir.
+set -euo pipefail
+
+CONFIG_DIR="${CLAUDE_API_CONFIG_DIR:-$HOME/.claude-api}"
+KEYCHAIN_SERVICE="${CLAUDE_API_KEYCHAIN_SERVICE:-claude-api-worker}"
+ACCOUNT="${USER:-$(id -un)}"
+
+store_file() {
+  umask 077
+  mkdir -p "$CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR" 2>/dev/null || true
+  printf 'Paste API key (input hidden): ' >&2
+  read -rs key
+  echo >&2
+  [ -n "$key" ] || { echo "store-key: empty key, aborting" >&2; exit 1; }
+  case "$key" in
+    sk-ant-*) ;;
+    *) echo "WARNING: key does not start with sk-ant- — storing anyway" >&2 ;;
+  esac
+  printf '%s' "$key" > "$CONFIG_DIR/api-key"
+  chmod 600 "$CONFIG_DIR/api-key"
+  echo "Stored in $CONFIG_DIR/api-key (0600)."
+}
+
+if [ "$(uname)" = Darwin ] && command -v security >/dev/null 2>&1; then
+  # Trailing -w with no value: security prompts interactively (asks twice).
+  if security add-generic-password -U -a "$ACCOUNT" -s "$KEYCHAIN_SERVICE" -w; then
+    echo "Stored in macOS Keychain (service '$KEYCHAIN_SERVICE')."
+  else
+    echo "Keychain unavailable (locked? headless SSH?) — falling back to file storage." >&2
+    store_file
+  fi
+else
+  store_file
+fi
+echo "Verify with:  claude-api -p 'Reply with exactly: WORKER OK' --model sonnet"

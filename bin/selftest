@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Validation matrix (dispatched as: claude-api selftest). Re-verifies the
+# version-pinned behaviors the framework depends on — run after Claude Code
+# upgrades. Spends a few API-billed sonnet runs.
+set -uo pipefail
+
+SRC="${BASH_SOURCE[0]}"
+while [ -L "$SRC" ]; do
+  dir="$(cd "$(dirname "$SRC")" && pwd)"
+  SRC="$(readlink "$SRC")"
+  case "$SRC" in /*) ;; *) SRC="$dir/$SRC" ;; esac
+done
+BIN_DIR="$(cd "$(dirname "$SRC")" && pwd)"
+CA="$BIN_DIR/claude-api"
+WORK="$(mktemp -d)"
+fails=0
+trap '[ "$fails" -eq 0 ] && rm -rf "$WORK" || echo "artifacts kept in $WORK"' EXIT
+cd "$WORK"
+
+# Poll for a pattern in a growing file. Deliberately NOT `tail -f | grep -q`:
+# that pipeline hangs when the match is the last line ever written (grep exits,
+# tail blocks forever, the shell waits on both).
+wait_for() { # file pattern timeout_secs
+  local f="$1" pat="$2" t="${3:-120}" i=0
+  while [ "$i" -lt "$t" ]; do
+    grep -q -E "$pat" "$f" 2>/dev/null && return 0
+    sleep 1; i=$((i + 1))
+  done
+  return 1
+}
+
+step() { echo; echo "== $1"; }
+ok()   { echo "   PASS"; }
+bad()  { echo "   FAIL: $1"; fails=$((fails + 1)); }
+
+step "1/4 basic headless run + JSON output"
+SID=""
+if "$CA" -p 'Reply with exactly: SELFTEST OK' --model sonnet --output-format json > t1.json 2> t1.err \
+   && python3 -c 'import json;d=json.load(open("t1.json"));assert not d.get("is_error");assert "SELFTEST OK" in d["result"]' 2>/dev/null; then
+  ok
+  SID="$(python3 -c 'import json;print(json.load(open("t1.json"))["session_id"])')"
+else
+  bad "basic run (t1.err)"
+fi
+
+step "2/4 --resume continuity"
+if [ -n "$SID" ] \
+   && "$CA" --resume "$SID" -p 'What exact phrase did you reply with earlier? Answer with just the phrase.' --model sonnet --output-format json > t2.json 2> t2.err \
+   && python3 -c 'import json;assert "SELFTEST OK" in json.load(open("t2.json"))["result"]' 2>/dev/null; then
+  ok
+else
+  bad "resume (t2.err)"
+fi
+
+step "3/4 acceptEdits floor: file creation"
+mkdir -p edit && ( cd edit && "$CA" -p 'Create a file named hello.txt in the current directory containing exactly: selftest file
+Then reply DONE.' --model sonnet --output-format json > ../t3.json 2> ../t3.err )
+if [ "$(cat edit/hello.txt 2>/dev/null)" = "selftest file" ]; then ok; else bad "file not created (t3.err)"; fi
+
+step "4/4 FIFO streaming: envelope + mid-run input + clean shutdown"
+mkfifo w.in
+tail -f /dev/null > w.in & keeper=$!
+touch w.ndjson
+"$CA" -p --input-format stream-json --output-format stream-json --verbose --model sonnet < w.in > w.ndjson 2> w.err & worker=$!
+printf '%s\n' '{"type":"user","message":{"role":"user","content":"Reply with exactly: FIRST"}}' > w.in
+if wait_for w.ndjson '"type":"assistant".*FIRST' 180; then
+  printf '%s\n' '{"type":"user","message":{"role":"user","content":"Now reply with exactly: SECOND"}}' > w.in
+  if wait_for w.ndjson '"type":"assistant".*SECOND' 180; then
+    kill "$keeper" 2>/dev/null
+    if wait_for w.ndjson '"type":"result"' 60; then ok; else bad "no result event after closing stdin (w.err)"; fi
+  else
+    kill "$keeper" 2>/dev/null
+    bad "mid-run injected message got no reply (w.err)"
+  fi
+else
+  kill "$keeper" 2>/dev/null
+  bad "no assistant reply on FIFO (w.err) — stream-json envelope may have changed"
+fi
+kill "$worker" 2>/dev/null
+wait 2>/dev/null
+
+echo
+if [ "$fails" -eq 0 ]; then
+  echo "selftest: all 4 checks passed"
+else
+  echo "selftest: $fails check(s) FAILED"
+fi
+[ "$fails" -eq 0 ]

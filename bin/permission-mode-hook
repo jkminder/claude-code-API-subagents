@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# PreToolUse hook (matcher: Bash): records the parent session's current
+# permission mode so claude-api workers can inherit it. Fires just before any
+# Bash tool call, so the recorded mode is fresh at worker-spawn time — including
+# mid-session toggles. Must never block the tool call: always exits 0.
+#
+# Mode files live in a private per-user dir (0700, atomic 0600 writes), NOT in
+# shared /tmp — a world-writable predictable path would let another local user
+# pre-plant "bypassPermissions" on multi-user hosts. Stale files are pruned.
+set -u
+python3 -c '
+import json, sys, os, time, tempfile
+try:
+    d = json.load(sys.stdin)
+    sid, mode = d.get("session_id"), d.get("permission_mode")
+    base = os.environ.get("CLAUDE_API_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude-api")
+    run = os.path.join(base, "run")
+    os.makedirs(run, mode=0o700, exist_ok=True)
+    if sid and mode:
+        fd, tmp = tempfile.mkstemp(dir=run)
+        os.write(fd, mode.encode())
+        os.close(fd)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, os.path.join(run, "permission-mode-%s" % sid))
+    now = time.time()
+    for name in os.listdir(run):
+        if name.startswith("permission-mode-"):
+            p = os.path.join(run, name)
+            try:
+                if now - os.stat(p).st_mtime > 86400:
+                    os.unlink(p)
+            except OSError:
+                pass
+except Exception:
+    pass
+' 2>/dev/null
+exit 0

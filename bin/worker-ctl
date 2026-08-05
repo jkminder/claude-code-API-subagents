@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Worker lifecycle manager (dispatched as: claude-api ps | kill | clean).
+# Reads the run ledger written by bin/claude-api.
+set -euo pipefail
+
+CONFIG_DIR="${CLAUDE_API_CONFIG_DIR:-$HOME/.claude-api}"
+LEDGER="$CONFIG_DIR/run/ledger.jsonl"
+cmd="${1:-ps}"
+shift || true
+
+running_pids() {
+  [ -f "$LEDGER" ] || return 0
+  python3 - "$LEDGER" <<'PY'
+import json, os, sys
+spawns, exits = {}, set()
+for line in open(sys.argv[1]):
+    try:
+        e = json.loads(line)
+    except ValueError:
+        continue
+    if e.get("event") == "spawn":
+        spawns[e["pid"]] = e
+    elif e.get("event") == "exit":
+        exits.add((e["pid"], True))
+        spawns.pop(e["pid"], None)
+for pid in spawns:
+    try:
+        os.kill(pid, 0)
+        print(pid)
+    except OSError:
+        pass
+PY
+}
+
+case "$cmd" in
+ps)
+  if [ ! -f "$LEDGER" ]; then echo "no workers recorded yet"; exit 0; fi
+  python3 - "$LEDGER" <<'PY'
+import json, os, sys, time
+entries, order = {}, []
+for line in open(sys.argv[1]):
+    try:
+        e = json.loads(line)
+    except ValueError:
+        continue
+    pid = e.get("pid")
+    if e.get("event") == "spawn":
+        key = (pid, e.get("ts"))
+        entries[key] = {"spawn": e, "exit": None}
+        order.append(key)
+    elif e.get("event") == "exit":
+        for key in reversed(order):
+            if key[0] == pid and entries[key]["exit"] is None:
+                entries[key]["exit"] = e
+                break
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+now = time.time()
+for key in order[-25:]:
+    s, x = entries[key]["spawn"], entries[key]["exit"]
+    ts = time.strftime("%m-%d %H:%M", time.localtime(s["ts"]))
+    if x is not None:
+        status = "exit %-3s %4ss" % (x.get("exit"), x.get("secs"))
+    elif alive(s["pid"]):
+        status = "RUNNING  %3dm" % ((now - s["ts"]) / 60)
+    else:
+        status = "DIED (no exit record)"
+    print("%s  pid %-7s %-22s %s" % (ts, s["pid"], status, s.get("cmd", "")[:90]))
+PY
+  echo
+  echo "(output files: /tmp/worker-<slug>.* per skill convention · claude-api kill <pid>|--all · claude-api clean [--all])"
+  ;;
+kill)
+  target="${1:-}"
+  case "$target" in
+    "") echo "usage: claude-api kill <pid>|--all" >&2; exit 1 ;;
+    --all)
+      pids="$(running_pids)"
+      if [ -z "$pids" ]; then echo "no running workers"; exit 0; fi
+      for p in $pids; do kill -TERM "$p" 2>/dev/null && echo "sent TERM to $p" || true; done
+      ;;
+    *) kill -TERM "$target" && echo "sent TERM to $target" ;;
+  esac
+  ;;
+clean)
+  force="${1:-}"
+  # FIFO keepers: remove artifacts of dead keepers; --all also ends live ones.
+  for k in /tmp/worker-*.keeper; do
+    [ -e "$k" ] || continue
+    pid="$(cat "$k" 2>/dev/null || true)"
+    base="${k%.keeper}"
+    if [ "$force" = "--all" ] && [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
+    if [ "$force" = "--all" ] || [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+      rm -f "$k" "$base.in"
+      echo "cleaned $(basename "$base") keeper/FIFO"
+    fi
+  done
+  if [ "$force" = "--all" ]; then
+    rm -f /tmp/worker-*.json /tmp/worker-*.err /tmp/worker-*.ndjson 2>/dev/null || true
+    echo "removed all /tmp/worker-* artifacts"
+  else
+    find /tmp -maxdepth 1 -name 'worker-*' \( -name '*.json' -o -name '*.err' -o -name '*.ndjson' \) -mtime +1 -exec rm -f {} + 2>/dev/null || true
+    echo "removed /tmp/worker-* artifacts older than 24h (--all removes everything and ends streaming workers)"
+  fi
+  if [ -f "$LEDGER" ]; then
+    tail -n 500 "$LEDGER" > "$LEDGER.tmp" && mv "$LEDGER.tmp" "$LEDGER"
+  fi
+  ;;
+*)
+  echo "usage: claude-api ps | kill <pid>|--all | clean [--all]" >&2
+  exit 1
+  ;;
+esac

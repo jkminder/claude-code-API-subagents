@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Git-worktree fan-out helper (dispatched as: claude-api worktree ...).
+# Gives each parallel worker an isolated checkout on its own worker/<slug>
+# branch, created by the MAIN session (workers can't — worktree creation writes
+# outside their sandbox). Worktrees live next to the repo in <repo>-worktrees/.
+#
+#   claude-api worktree add <slug> [repo]   # create; prints the worktree path (last line)
+#   claude-api worktree list [repo]         # worktrees + branches safe to clean
+#   claude-api worktree clean [repo]        # remove worktrees whose branch is merged into HEAD
+set -euo pipefail
+
+sub="${1:-}"
+shift || true
+
+case "$sub" in
+add)
+  slug="${1:?usage: claude-api worktree add <slug> [repo-path]}"
+  root="$(git -C "${2:-.}" rev-parse --show-toplevel)"
+  base="$(dirname "$root")/$(basename "$root")-worktrees"
+  path="$base/$slug"
+  branch="worker/$slug"
+  if git -C "$root" show-ref --verify --quiet "refs/heads/$branch"; then
+    echo "branch $branch already exists — pick a fresh slug or run: claude-api worktree clean" >&2
+    exit 1
+  fi
+  mkdir -p "$base"
+  git -C "$root" worktree add -b "$branch" "$path" >/dev/null
+  echo "$path"
+  ;;
+list)
+  root="$(git -C "${1:-.}" rev-parse --show-toplevel)"
+  git -C "$root" worktree list
+  echo "-- worker/* branches merged into HEAD (safe to clean):"
+  git -C "$root" branch --merged HEAD --list 'worker/*' --format '%(refname:short)' || true
+  ;;
+clean)
+  root="$(git -C "${1:-.}" rev-parse --show-toplevel)"
+  base="$(dirname "$root")/$(basename "$root")-worktrees"
+  merged="$(git -C "$root" branch --merged HEAD --list 'worker/*' --format '%(refname:short)' || true)"
+  if [ -z "$merged" ]; then
+    echo "no merged worker/* branches"
+    git -C "$root" worktree prune
+    exit 0
+  fi
+  for b in $merged; do
+    p="$base/${b#worker/}"
+    if [ -d "$p" ]; then
+      if git -C "$root" worktree remove "$p" 2>/dev/null; then
+        echo "removed worktree $p"
+      else
+        echo "skip $p (uncollected changes?) — resolve manually, then rerun" >&2
+        continue
+      fi
+    fi
+    if git -C "$root" branch -d "$b" >/dev/null 2>&1; then
+      echo "deleted branch $b"
+    fi
+  done
+  git -C "$root" worktree prune
+  ;;
+*)
+  echo "usage: claude-api worktree add <slug> [repo] | list [repo] | clean [repo]" >&2
+  exit 1
+  ;;
+esac

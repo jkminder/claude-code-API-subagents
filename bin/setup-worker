@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# Installer for the API-billed worker identity. Idempotent; macOS + Linux.
+# Fresh machine: git clone <repo> && <repo>/bin/setup-worker && <repo>/bin/store-key
+# Remove everything it installed: setup-worker --uninstall
+set -euo pipefail
+
+# Resolve through symlinks so REPO_DIR is right even if this script is linked.
+SRC="${BASH_SOURCE[0]}"
+while [ -L "$SRC" ]; do
+  dir="$(cd "$(dirname "$SRC")" && pwd)"
+  SRC="$(readlink "$SRC")"
+  case "$SRC" in /*) ;; *) SRC="$dir/$SRC" ;; esac
+done
+REPO_DIR="$(cd "$(dirname "$SRC")/.." && pwd)"
+CONFIG_DIR="${CLAUDE_API_CONFIG_DIR:-$HOME/.claude-api}"
+
+deregister_hook() {
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$HOME/.claude/settings.json" <<'PY' || true
+import json, os, sys, tempfile
+path = sys.argv[1]
+if not os.path.exists(path):
+    sys.exit(0)
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+except Exception:
+    sys.exit(0)
+pre = cfg.get("hooks", {}).get("PreToolUse")
+if not isinstance(pre, list):
+    sys.exit(0)
+kept = [g for g in pre if not (isinstance(g, dict) and any(
+    isinstance(h, dict) and "permission-mode-hook" in h.get("command", "")
+    for h in g.get("hooks", [])))]
+if len(kept) != len(pre):
+    cfg["hooks"]["PreToolUse"] = kept
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+    print("permission-mode hook deregistered from ~/.claude/settings.json")
+PY
+}
+
+if [ "${1:-}" = "--uninstall" ]; then
+  for l in "$HOME/.local/bin/claude-api" "$HOME/.local/bin/claude-api-store-key" "$HOME/.claude/skills/delegate"; do
+    if [ -L "$l" ]; then rm -f "$l" && echo "removed $l"; fi
+  done
+  deregister_hook
+  echo "Left in place (contain data/credentials — remove manually if wanted):"
+  echo "  $CONFIG_DIR   → rm -rf '$CONFIG_DIR'"
+  if [ "$(uname)" = Darwin ]; then
+    echo "  Keychain entry → security delete-generic-password -s claude-api-worker"
+  fi
+  exit 0
+fi
+
+if ! command -v claude >/dev/null 2>&1; then
+  echo "WARNING: 'claude' not found on PATH. Install it first:" >&2
+  echo "  npm install -g @anthropic-ai/claude-code   (or the native installer)" >&2
+fi
+
+mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/run"
+chmod 700 "$CONFIG_DIR" "$CONFIG_DIR/run" 2>/dev/null || true
+
+# Worker settings: MERGE managed keys, preserve user customizations, atomic write.
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$CONFIG_DIR/settings.json" <<'PY'
+import json, os, sys, tempfile
+path = sys.argv[1]
+cfg = {}
+if os.path.exists(path):
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except Exception:
+        print("ERROR: %s is not valid JSON — fix or remove it, then rerun setup-worker" % path)
+        sys.exit(1)
+if not isinstance(cfg, dict):
+    cfg = {}
+changed = False
+if "model" not in cfg:
+    cfg["model"] = "claude-fable-5"; changed = True
+env = cfg.setdefault("env", {})
+if env.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS") != "1":
+    env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"; changed = True
+if cfg.get("skipDangerousModePermissionPrompt") is not True:
+    cfg["skipDangerousModePermissionPrompt"] = True; changed = True
+if changed:
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+    print("worker settings updated (managed keys merged; customizations preserved)")
+else:
+    print("worker settings OK")
+PY
+elif [ ! -f "$CONFIG_DIR/settings.json" ]; then
+  cat > "$CONFIG_DIR/settings.json" <<'JSON'
+{
+  "model": "claude-fable-5",
+  "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" },
+  "skipDangerousModePermissionPrompt": true
+}
+JSON
+  echo "wrote $CONFIG_DIR/settings.json (python3 absent: created, will not merge on rerun)"
+fi
+
+# Skip first-run onboarding so headless -p runs work out of the box.
+if [ ! -f "$CONFIG_DIR/.claude.json" ]; then
+  printf '{"hasCompletedOnboarding": true}\n' > "$CONFIG_DIR/.claude.json"
+  echo "wrote $CONFIG_DIR/.claude.json"
+fi
+
+# Symlinks — refuse to clobber a real file/directory at the destination.
+safe_link() {
+  if [ -e "$2" ] && [ ! -L "$2" ]; then
+    echo "ERROR: $2 exists and is not a symlink — move it aside and rerun." >&2
+    exit 1
+  fi
+  ln -sfn "$1" "$2"
+}
+mkdir -p "$HOME/.local/bin" "$HOME/.claude/skills"
+safe_link "$REPO_DIR/bin/claude-api" "$HOME/.local/bin/claude-api"
+safe_link "$REPO_DIR/bin/store-key" "$HOME/.local/bin/claude-api-store-key"
+echo "linked claude-api into ~/.local/bin (ensure it's on PATH)"
+safe_link "$REPO_DIR/skills/delegate" "$HOME/.claude/skills/delegate"
+echo "skill installed: ~/.claude/skills/delegate -> $REPO_DIR/skills/delegate"
+
+# Register the permission-mode hook in the user's main settings so workers can
+# inherit an elevated permission mode from the parent session. The command path
+# routes through the skill symlink, so it survives repo moves (rerun setup after
+# moving). Idempotent merge, atomic write; takes effect for new sessions.
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$HOME/.claude/settings.json" <<'PY'
+import json, os, sys, tempfile
+path = sys.argv[1]
+hook_cmd = '"$HOME"/.claude/skills/delegate/../../bin/permission-mode-hook'
+cfg = {}
+if os.path.exists(path):
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except Exception:
+        print("ERROR: %s is not valid JSON — fix it, then rerun setup-worker (hook not registered)" % path)
+        sys.exit(1)
+if not isinstance(cfg, dict):
+    print("ERROR: %s is not a JSON object — fix it, then rerun setup-worker" % path)
+    sys.exit(1)
+hooks = cfg.setdefault("hooks", {})
+pre = hooks.setdefault("PreToolUse", [])
+if not isinstance(pre, list):
+    print("ERROR: hooks.PreToolUse is not a list in %s — fix it, then rerun" % path)
+    sys.exit(1)
+registered = any(
+    isinstance(h, dict) and "permission-mode-hook" in h.get("command", "")
+    for grp in pre if isinstance(grp, dict) for h in grp.get("hooks", []))
+if registered:
+    print("permission-mode hook already registered")
+else:
+    pre.append({"matcher": "Bash", "hooks": [{"type": "command", "command": hook_cmd}]})
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+    print("permission-mode hook registered in ~/.claude/settings.json (active for new sessions)")
+PY
+  if [ ! -x "$HOME/.claude/skills/delegate/../../bin/permission-mode-hook" ]; then
+    echo "WARNING: hook path does not resolve to an executable — inheritance will not work (is the skill a copy instead of a symlink?)" >&2
+  fi
+else
+  echo "WARNING: python3 not found — skipped permission-mode hook registration (workers use the acceptEdits floor)." >&2
+fi
+
+if [ "$(uname)" = Darwin ] && command -v security >/dev/null 2>&1; then
+  have_key() { security find-generic-password -s "${CLAUDE_API_KEYCHAIN_SERVICE:-claude-api-worker}" >/dev/null 2>&1; }
+else
+  have_key() { [ -f "$CONFIG_DIR/api-key" ]; }
+fi
+if have_key; then
+  echo "API key present. Verify with:  claude-api -p 'Reply with exactly: WORKER OK' --model sonnet"
+else
+  echo "NEXT (manual): run  $REPO_DIR/bin/store-key  to store the API key."
+fi
