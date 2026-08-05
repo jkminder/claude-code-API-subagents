@@ -76,7 +76,7 @@ The two compose into **multi-level fan-out**: the main session spawns one worker
 
 ## Components
 
-- [bin/claude-api](bin/claude-api) — worker wrapper: resolves the key (`$CLAUDE_API_KEY_CMD` → Keychain → `~/.claude-api/api-key`), sets `CLAUDE_CONFIG_DIR`, strips everything inherited that could reroute billing (`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, Bedrock/Vertex switches, `ANTHROPIC_MODEL`), resolves the permission mode, runs `claude`, and records every run in the ledger. Also the dispatcher for the subcommands below.
+- [bin/claude-api](bin/claude-api) — worker wrapper: resolves the key (`$CLAUDE_API_KEY_CMD` → Keychain → `~/.claude-api/api-key`), sets `CLAUDE_CONFIG_DIR`, strips everything inherited that could reroute billing (`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, Bedrock/Vertex switches, `ANTHROPIC_MODEL`), resolves the permission mode, pins the default worker model to fable via `--settings '{"model": "claude-fable-5"}'` (headless sessions ignore the settings.json model key; an explicit `--model` or caller-supplied `--settings` wins), runs `claude`, and records every run in the ledger. Also the dispatcher for the subcommands below.
 - [bin/worker-ctl](bin/worker-ctl) — `ps` / `kill` / `clean`: worker registry from the ledger, liveness, artifact sweeping; session-scoped by default, `--global` for machine-wide.
 - [bin/worker-worktree](bin/worker-worktree) — per-worker git worktrees (`worker/<slug>` branches) for parallel edits on one repo.
 - [bin/doctor](bin/doctor) — install health check (key source, config perms, no stray OAuth creds in the worker identity, hook registration, symlinks; `--ping` for a live run).

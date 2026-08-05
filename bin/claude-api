@@ -108,6 +108,21 @@ if [ "$explicit" -eq 0 ]; then
   esac
 fi
 
+# Default model: fable. Headless sessions ignore the `model` key in the
+# worker settings.json (verified on Claude Code v2.1.222), so the default is
+# pinned via the --settings flagSettings scope instead. An explicit --model
+# wins; a caller-supplied --settings suppresses the injection.
+has_settings=0 has_model=0
+for a in "$@"; do
+  case "$a" in
+    --settings|--settings=*) has_settings=1 ;;
+    --model|--model=*) has_model=1 ;;
+  esac
+done
+if [ "$has_settings" -eq 0 ] && [ "$has_model" -eq 0 ]; then
+  set -- --settings '{"model": "claude-fable-5"}' "$@"
+fi
+
 # Run ledger (read by claude-api ps). Values sanitized to JSON-safe characters.
 mkdir -p "$RUN_DIR" 2>/dev/null || true
 chmod 700 "$RUN_DIR" 2>/dev/null || true

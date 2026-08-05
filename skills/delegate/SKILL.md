@@ -30,7 +30,7 @@ cd <target-repo> && claude-api -p "<self-contained task prompt>" \
 - Pick a slug unique **within this session** (the dir is per-session, so no cross-session collisions).
 - Prompt must be self-contained: goal, constraints, a verification step ("run the tests and include the output"), and what to report.
 - **Commit policy:** tell workers to leave changes uncommitted (or commit only on their own worktree branch, below) — integration and committing is this session's job. Nothing else stops parallel workers from committing over each other.
-- Model: defaults to fable (worker settings); `--model sonnet` for lighter work, `--model opus` when fable is overkill but the task still needs strong reasoning.
+- Model: defaults to fable (pinned by the wrapper via `--settings '{"model": "claude-fable-5"}'` — headless runs ignore the settings.json model key). An explicit `--model` wins: `--model sonnet` for lighter work, `--model opus` when fable is overkill but the task still needs strong reasoning.
 - Concurrency: **spawn as many workers as the work decomposes into** — there is no fixed cap, and tokens are not the constraint. One worker per independent subtask (per file, per test target, per research question) is the right default; dozens in parallel is fine and usually the point. The only real limits are machine resources (if the box gets sluggish or you exhaust file handles, stagger the next batch) and API rate limits (a 429 in a worker's `.err` means back off and retry that worker, not that you over-delegated). For very wide work, prefer fewer workers that each fan out internally (see below) over hundreds of processes.
 
 ### Let workers decompose further

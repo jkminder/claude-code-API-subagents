@@ -84,8 +84,13 @@ if os.path.exists(path):
 if not isinstance(cfg, dict):
     cfg = {}
 changed = False
-if "model" not in cfg:
-    cfg["model"] = "claude-fable-5"; changed = True
+# Default worker model: fable. "claude-opus-5" was briefly the managed default,
+# so migrate it back; any other explicitly-chosen model is preserved. (Headless
+# runs ignore this key — bin/claude-api pins the same default via --settings —
+# but it still governs interactive worker sessions.)
+if cfg.get("model") in (None, "claude-opus-5"):
+    if cfg.get("model") != "claude-fable-5":
+        cfg["model"] = "claude-fable-5"; changed = True
 env = cfg.setdefault("env", {})
 if env.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS") != "1":
     env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"; changed = True
