@@ -31,6 +31,8 @@ claude-api -p 'Reply with exactly: WORKER OK' --model sonnet   # verify → appe
 claude-api doctor                                              # health-check the install
 ```
 
+**Updating an existing install:** `git pull && ./bin/setup-worker`. The PATH and skill symlinks point into the checkout, so repo-side changes arrive with the pull alone — but anything materialized outside the repo (user-context passthrough links, mirrored hooks, worker-settings keys) only updates when setup-worker reruns. It's idempotent; also rerun it after adding a user skill or moving the repo.
+
 Prerequisite: `claude` on PATH (`npm install -g @anthropic-ai/claude-code`); `~/.local/bin` on PATH. `setup-worker` **merges** its managed keys into `~/.claude-api/settings.json` — your customizations survive re-runs. The wrapper also accepts `$CLAUDE_API_KEY_CMD` (a command printing the key, e.g. a vault CLI) instead of Keychain/file storage. `setup-worker --uninstall` removes the symlinks and deregisters the hook.
 
 ## Usage
