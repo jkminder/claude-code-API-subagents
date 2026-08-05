@@ -65,10 +65,14 @@ mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/run"
 chmod 700 "$CONFIG_DIR" "$CONFIG_DIR/run" 2>/dev/null || true
 
 # Worker settings: MERGE managed keys, preserve user customizations, atomic write.
+# The `hooks` key is managed: mirrored from ~/.claude/settings.json on every run
+# (minus the permission-mode hook, which is main-session-only) so workers run
+# the user's hooks too. Worker-specific hooks belong in the target repo's
+# .claude/settings.json or a per-spawn --settings.
 if command -v python3 >/dev/null 2>&1; then
-  python3 - "$CONFIG_DIR/settings.json" <<'PY'
+  python3 - "$CONFIG_DIR/settings.json" "$HOME/.claude/settings.json" <<'PY'
 import json, os, sys, tempfile
-path = sys.argv[1]
+path, user_path = sys.argv[1], sys.argv[2]
 cfg = {}
 if os.path.exists(path):
     try:
@@ -87,6 +91,34 @@ if env.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS") != "1":
     env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"; changed = True
 if cfg.get("skipDangerousModePermissionPrompt") is not True:
     cfg["skipDangerousModePermissionPrompt"] = True; changed = True
+# Mirror user hooks (minus permission-mode-hook) into the worker identity.
+try:
+    with open(user_path) as f:
+        user_hooks = json.load(f).get("hooks", {})
+except Exception:
+    user_hooks = None
+if isinstance(user_hooks, dict):
+    mirrored = {}
+    for event, groups in user_hooks.items():
+        if not isinstance(groups, list):
+            continue
+        kept = []
+        for g in groups:
+            if not isinstance(g, dict):
+                continue
+            hooks = [h for h in g.get("hooks", [])
+                     if not (isinstance(h, dict) and "permission-mode-hook" in h.get("command", ""))]
+            if hooks:
+                kept.append({**g, "hooks": hooks})
+        if kept:
+            mirrored[event] = kept
+    if cfg.get("hooks", {}) != mirrored:
+        if mirrored:
+            cfg["hooks"] = mirrored
+        else:
+            cfg.pop("hooks", None)
+        changed = True
+        print("user hooks mirrored into worker settings (permission-mode hook excluded)")
 if changed:
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
     with os.fdopen(fd, "w") as f:
@@ -128,6 +160,31 @@ safe_link "$REPO_DIR/bin/store-key" "$HOME/.local/bin/claude-api-store-key"
 echo "linked claude-api into ~/.local/bin (ensure it's on PATH)"
 safe_link "$REPO_DIR/skills/delegate" "$HOME/.claude/skills/delegate"
 echo "skill installed: ~/.claude/skills/delegate -> $REPO_DIR/skills/delegate"
+
+# User-context passthrough: workers should feel like the user's normal Claude —
+# same user CLAUDE.md, user skills, and user agents — EXCEPT the delegate skill,
+# which is main-session-only by design. Symlinks stay live; per-skill links are
+# refreshed on every run (rerun setup-worker after adding user skills).
+if [ -f "$HOME/.claude/CLAUDE.md" ]; then
+  safe_link "$HOME/.claude/CLAUDE.md" "$CONFIG_DIR/CLAUDE.md"
+  echo "user CLAUDE.md passed through to workers"
+fi
+if [ -d "$HOME/.claude/agents" ]; then
+  safe_link "$HOME/.claude/agents" "$CONFIG_DIR/agents"
+  echo "user agents passed through to workers"
+fi
+mkdir -p "$CONFIG_DIR/skills"
+for s in "$HOME/.claude/skills"/*/; do
+  [ -d "$s" ] || continue
+  name="$(basename "$s")"
+  if [ "$name" = "delegate" ]; then continue; fi
+  safe_link "${s%/}" "$CONFIG_DIR/skills/$name"
+done
+for l in "$CONFIG_DIR/skills"/*; do
+  [ -L "$l" ] || continue
+  if [ ! -e "$l" ] || [ "$(basename "$l")" = "delegate" ]; then rm -f "$l"; fi
+done
+echo "user skills passed through to workers (delegate excluded)"
 
 # Register the permission-mode hook in the user's main settings so workers can
 # inherit an elevated permission mode from the parent session. The command path
