@@ -66,7 +66,7 @@ Headless workers never prompt — unauthorized tool calls are denied, so the mod
 | Best for | fast in-context fan-out | everything nontrivial: long jobs, parallel work, swarms |
 | Steering | orchestrated in-context | FIFO mid-run messages, `--resume` |
 
-The two compose into a **two-level fan-out**: the main session spawns one worker per group of work, and each worker fans out to its *own* built-in subagents — 10 workers × 10 subagents = 100 units of parallel work in 10 processes. Crossing the billing boundary is only worth a process once, so `claude-api` and this skill are **main-session-only**: a worker is already on API billing, where plain subagents are cheaper and inherit its permission mode. (Structurally reinforced — the skill lives in `~/.claude/skills`, outside the worker's `CLAUDE_CONFIG_DIR`, so workers never see it.)
+The two compose into **multi-level fan-out**: the main session spawns one worker per group of work, each worker fans out to its *own* built-in subagents, and any level whose chunk is still too big leads an agent team below it (teammates are full sessions, so they can delegate again). 10 workers × 10 subagents = 100 units in 10 processes; add a level for ~1000. Crossing the billing boundary is only worth a process once, so `claude-api` and this skill are **main-session-only**: everything below is already on API billing, where built-in delegation is cheaper and inherits the worker's permission mode. (Structurally reinforced — the skill lives in `~/.claude/skills`, outside the worker's `CLAUDE_CONFIG_DIR`, so workers never see it.)
 
 ## Components
 

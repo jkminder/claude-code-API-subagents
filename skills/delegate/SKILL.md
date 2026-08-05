@@ -30,20 +30,30 @@ cd <target-repo> && claude-api -p "<self-contained task prompt>" \
 - Model: defaults to fable (worker settings); `--model sonnet` for lighter work, `--model opus` when fable is overkill but the task still needs strong reasoning.
 - Concurrency: **spawn as many workers as the work decomposes into** — there is no fixed cap, and tokens are not the constraint. One worker per independent subtask (per file, per test target, per research question) is the right default; dozens in parallel is fine and usually the point. The only real limits are machine resources (if the box gets sluggish or you exhaust file handles, stagger the next batch) and API rate limits (a 429 in a worker's `.err` means back off and retry that worker, not that you over-delegated). For very wide work, prefer fewer workers that each fan out internally (see below) over hundreds of processes.
 
-### Delegate the decomposition too (two-level fan-out)
+### Delegate the decomposition too (multi-level fan-out)
 
-When breaking the task down is itself substantial work — a vague brief, an unfamiliar codebase, a scope you'd have to explore before you could split it — **don't decompose it in this session**. Hand each chunk to a worker and tell it to decompose further. Exploration, planning, and execution then all run on API credits, and this session's context stays clean.
+When breaking the task down is itself substantial work — a vague brief, an unfamiliar codebase, a scope you'd have to explore before you could split it — **don't decompose it in this session**. Hand each chunk to a worker and tell it to decompose further, and to pass that same mandate down. Exploration, planning, and execution then all run on API credits, and this session's context stays clean.
 
-The shape for a task that is ~10 groups of ~10 subtasks: **you** spawn 10 workers (one per group); **each worker** fans out to ~10 of its *own built-in subagents*. 100 units of work, 10 processes.
+**Recurse as deep as the work's natural hierarchy, not to a fixed depth.** Each level splits its own chunk and delegates the pieces; a level stops when its chunk is one coherent unit of work. Levels multiply, so depth grows slowly with size:
+
+| Work | Shape | Processes |
+|---|---|---|
+| ~10 units | you → 10 workers | 10 |
+| ~100 units (10 groups × 10) | you → 10 workers → each ~10 subagents | 10 |
+| ~1000 units | you → 10 workers → each an agent team of ~10 → each teammate ~10 subagents | 110 |
+
+Mechanism per level: a **worker** fans out to its built-in subagents, or — when its chunk needs another level below it — leads an **agent team**, since teammates are full sessions that can themselves use subagents. Subagents are leaves: they generally can't nest further, so reach for an agent team at the level that needs depth.
+
+Because deep trees make failures hard to attribute, require every level to report a consolidated summary upward that names which sub-unit failed and why — so a leaf failure surfaces as a specific gap, not "the worker said it didn't finish."
 
 > ⚠️ **Workers must fan out with their built-in subagents (the Agent/Task tool), never with `claude-api`.** The `delegate` skill and the `claude-api` wrapper are **main-session-only tools** — their entire purpose is crossing the subscription→API billing boundary, and a worker is already on the other side. Inside a worker, plain subagents are strictly better: same API billing, no session-startup cost, no ledger/FIFO plumbing, natively orchestrated, and they inherit the worker's permission mode automatically. (Workers also don't get this skill — it lives in `~/.claude/skills`, outside the worker's `CLAUDE_CONFIG_DIR` — so the only way one calls `claude-api` is if you tell it to. Don't.)
 
 Make the mandate explicit in the worker's prompt:
 
-> "Scope this yourself first, then split it into independent subtasks and run them **in parallel using your built-in subagents (the Agent tool), sending them in a single message so they run concurrently**. Do not spawn `claude-api` or nested Claude Code processes. Report a consolidated summary."
+> "Scope this yourself first, then split it into independent subtasks and run them **in parallel using your built-in subagents (the Agent tool), sending them in a single message so they run concurrently**. If a subtask is still too big to do in one go, have that layer split it the same way — assemble an agent team for it, since teammates can delegate further, and give each teammate this same instruction. Do not spawn `claude-api` or nested Claude Code processes at any level. Report a consolidated summary naming any sub-unit that failed and why."
 
-- If a group is genuinely huge or the subtasks need to talk to each other, tell the worker to assemble an **agent team** instead (enabled in the worker settings — see Swarms below).
-- Keep the nesting at two levels — you → workers → their subagents. Deeper nesting buys nothing and makes failures hard to attribute.
+- Pass the mandate down verbatim — every level needs to know it may split further and how, or the recursion stops at the first layer.
+- Agent teams are enabled in the worker settings (see Swarms below), so any worker or teammate can lead one without extra setup.
 
 ### Parallel workers on the same repo → worktrees
 
