@@ -19,12 +19,15 @@ description: Delegate work to API-billed Claude Code workers or swarms. Worker t
 
 **Always spawn via background Bash** (`run_in_background`) so this session stays free — you'll be notified when the command completes. Run **from the target repo directory** (cwd defines the worker's project and its sandbox-writable workspace). For non-repo work (research, generation), create and `cd` into a scratch directory — never spawn from `$HOME`, which would make the whole home dir writable under `acceptEdits`.
 
+Worker outputs live in **this session's private worker dir** — set it once per Bash call:
+
 ```bash
+WDIR="$HOME/.claude-api/run/workers/${CLAUDE_CODE_SESSION_ID:-manual}" && mkdir -p "$WDIR"
 cd <target-repo> && claude-api -p "<self-contained task prompt>" \
-  --output-format json > /tmp/worker-<slug>.json 2> /tmp/worker-<slug>.err
+  --output-format json > "$WDIR/<slug>.json" 2> "$WDIR/<slug>.err"
 ```
 
-- Pick a **unique slug** (task name + a short timestamp/random suffix) — `/tmp/worker-*` is shared across sessions.
+- Pick a slug unique **within this session** (the dir is per-session, so no cross-session collisions).
 - Prompt must be self-contained: goal, constraints, a verification step ("run the tests and include the output"), and what to report.
 - **Commit policy:** tell workers to leave changes uncommitted (or commit only on their own worktree branch, below) — integration and committing is this session's job. Nothing else stops parallel workers from committing over each other.
 - Model: defaults to fable (worker settings); `--model sonnet` for lighter work, `--model opus` when fable is overkill but the task still needs strong reasoning.
@@ -62,13 +65,13 @@ After collecting and merging results: `claude-api worktree clean` removes merged
 
 ## Collecting results
 
-You'll be notified when the background spawn exits. **Check for failure before trusting the output** — any of these means the run failed: nonzero exit code of the background command, empty or unparseable `/tmp/worker-<slug>.json`, or `.is_error == true` / `.subtype != "success"` in it. On failure, read `/tmp/worker-<slug>.err`, then respin with a sharper prompt or resume (below) — respinning is cheap, don't hesitate.
+You'll be notified when the background spawn exits. **Check for failure before trusting the output** — any of these means the run failed: nonzero exit code of the background command, empty or unparseable `$WDIR/<slug>.json`, or `.is_error == true` / `.subtype != "success"` in it. On failure, read `$WDIR/<slug>.err`, then respin with a sharper prompt or resume (below) — respinning is cheap, don't hesitate.
 
 On success, summarize `.result` for the user. **`.session_id` is the resume handle** (for stream-json workers it's in the initial `system`/`init` line of the `.ndjson`). Best-effort log (skip if `jq` is absent):
 
 ```bash
 jq -c '{ts: now|todate, task: "<slug>", cost: .total_cost_usd, session: .session_id}' \
-  /tmp/worker-<slug>.json >> ~/.claude-api/cost-log.jsonl 2>/dev/null || true
+  "$WDIR/<slug>.json" >> ~/.claude-api/cost-log.jsonl 2>/dev/null || true
 ```
 
 ## Permissions
@@ -87,7 +90,7 @@ For jobs you want to *watch* but not steer, spawn with streaming output — no F
 
 ```bash
 cd <target-repo> && claude-api -p "<task>" --output-format stream-json --verbose \
-  > /tmp/worker-<slug>.ndjson 2> /tmp/worker-<slug>.err
+  > "$WDIR/<slug>.ndjson" 2> "$WDIR/<slug>.err"
 ```
 
 Tail the `.ndjson` for progress; the final `result` line carries `.result` and `.session_id`.
@@ -97,17 +100,17 @@ Tail the `.ndjson` for progress; the final `result` line carries `.result` and `
 For long jobs you expect to steer, start the worker reading a FIFO:
 
 ```bash
-rm -f /tmp/worker-<slug>.in && mkfifo /tmp/worker-<slug>.in
-tail -f /dev/null > /tmp/worker-<slug>.in & echo $! > /tmp/worker-<slug>.keeper   # holds the pipe open
+rm -f "$WDIR/<slug>.in" && mkfifo "$WDIR/<slug>.in"
+tail -f /dev/null > "$WDIR/<slug>.in" & echo $! > "$WDIR/<slug>.keeper"   # holds the pipe open
 cd <target-repo> && claude-api -p --input-format stream-json --output-format stream-json --verbose \
-  < /tmp/worker-<slug>.in > /tmp/worker-<slug>.ndjson 2> /tmp/worker-<slug>.err &
-printf '%s\n' '{"type":"user","message":{"role":"user","content":"<initial task>"}}' > /tmp/worker-<slug>.in
+  < "$WDIR/<slug>.in" > "$WDIR/<slug>.ndjson" 2> "$WDIR/<slug>.err" &
+printf '%s\n' '{"type":"user","message":{"role":"user","content":"<initial task>"}}' > "$WDIR/<slug>.in"
 ```
 
 - **This worker is shell-backgrounded, not harness-tracked — no completion notification will arrive.** Poll by tailing the `.ndjson`; a `"type":"result"` line means the session ended.
-- Send further messages with another `printf '{"type":"user",...}' > /tmp/worker-<slug>.in` — but **check the worker is still alive first** (`kill -0 $(pgrep -f "worker-<slug>")` or check for a `result` line): writing to a FIFO with no reader blocks forever. Safer: wrap writes in `perl -e 'alarm shift; exec @ARGV' 10 sh -c 'printf ... > fifo'`.
+- Send further messages with another `printf '{"type":"user",...}' > "$WDIR/<slug>.in"` — but **check the worker is still alive first** (`claude-api ps`, or check for a `result` line): writing to a FIFO with no reader blocks forever. Safer: wrap writes in `perl -e 'alarm shift; exec @ARGV' 10 sh -c 'printf ... > fifo'`.
 - Match replies on `"type":"assistant"` lines (plain grep also hits the echoed user events). To block until a reply, **poll — do not use `tail -f … | grep -q`**, which hangs when the match is the last line ever written: `i=0; while [ $i -lt 120 ]; do grep -q -E '"type":"assistant".*<marker>' <ndjson> && break; sleep 1; i=$((i+1)); done`.
-- End the session with `kill "$(cat /tmp/worker-<slug>.keeper)"`, wait for the final `result` event, then **clean up**: `rm -f /tmp/worker-<slug>.in /tmp/worker-<slug>.keeper`.
+- End the session with `kill "$(cat "$WDIR/<slug>.keeper")"`, wait for the final `result` event, then **clean up**: `rm -f "$WDIR/<slug>.in" "$WDIR/<slug>.keeper"`.
 
 ## Follow-ups after completion
 
@@ -123,15 +126,17 @@ The worker identity has `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in its settings
 
 ```bash
 cd <target-repo> && claude-api -p "Assemble an agent team of <N> teammates to <goal>. Split the work as: <split>. Coordinate via the shared task list; report a consolidated summary." \
-  --output-format json > /tmp/swarm-<slug>.json 2> /tmp/swarm-<slug>.err
+  --output-format json > "$WDIR/swarm-<slug>.json" 2> "$WDIR/swarm-<slug>.err"
 ```
 
 Give the lead an explicit team size and work split. Agent teams are experimental: if a headless swarm misbehaves, run the lead interactively instead (`tmux new -d -s swarm-<slug> 'claude-api "<swarm prompt>"'`). **The tmux lead is interactive and CAN hang on a permission prompt** — check `tmux capture-pane -t swarm-<slug> -p` for pending prompts and answer via `tmux send-keys`, or pass the same `--allowedTools` grants you would headlessly. Never run swarms through the main session — every teammate would bill the subscription.
 
 ## Housekeeping
 
-- `claude-api ps` — every spawned worker with liveness/exit status (from the wrapper's run ledger).
-- `claude-api kill <pid>|--all` — stop runaway workers.
-- `claude-api clean [--all]` — sweep dead FIFO keepers and stale `/tmp/worker-*` artifacts (`--all` also ends live streaming workers).
+**Scoping: `ps`, `kill --all`, and `clean` act on THIS session's workers only** — other main sessions on the machine may be running their own fleets, and you must not touch theirs. The wrapper tags every spawn with the parent session ID, so scoping is automatic. Add `--global` only when the user explicitly asks about the whole machine. `kill <pid>` is always literal.
+
+- `claude-api ps [--global]` — spawned workers with liveness/exit status (from the wrapper's run ledger).
+- `claude-api kill <pid>|--all [--global]` — stop runaway workers.
+- `claude-api clean [--all] [--global]` — sweep dead FIFO keepers and stale artifacts in the session's worker dir (`--all` also ends live streaming workers).
 - `claude-api doctor [--ping]` — when spawning misbehaves: checks key, config, hook, symlinks (`--ping` does one live run).
 - `claude-api selftest` — after Claude Code upgrades: re-validates the behaviors this skill depends on (spends a few sonnet runs).

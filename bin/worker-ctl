@@ -1,28 +1,53 @@
 #!/usr/bin/env bash
 # Worker lifecycle manager (dispatched as: claude-api ps | kill | clean).
 # Reads the run ledger written by bin/claude-api.
+#
+# SESSION SCOPING: several main Claude Code sessions can delegate on one
+# machine. When invoked from inside a session (CLAUDE_CODE_SESSION_ID set —
+# true for every Bash tool call), ps/kill/clean act on THAT session's workers
+# only. Pass --global to act machine-wide; from a plain terminal (no session
+# id) everything is global by default. Explicit `kill <pid>` is always literal.
 set -euo pipefail
 
 CONFIG_DIR="${CLAUDE_API_CONFIG_DIR:-$HOME/.claude-api}"
 LEDGER="$CONFIG_DIR/run/ledger.jsonl"
+WORKERS_BASE="$CONFIG_DIR/run/workers"
+
 cmd="${1:-ps}"
 shift || true
+
+# Extract --global; keep remaining simple-token args (pids, --all).
+GLOBAL=0
+rest=""
+for a in "$@"; do
+  case "$a" in
+    --global) GLOBAL=1 ;;
+    *) rest="$rest $a" ;;
+  esac
+done
+# shellcheck disable=SC2086
+set -- $rest
+SID="${CLAUDE_CODE_SESSION_ID:-}"
+if [ -z "$SID" ]; then GLOBAL=1; fi
+export WCTL_SCOPE_SID="$([ "$GLOBAL" -eq 1 ] && echo "" || echo "$SID")"
 
 running_pids() {
   [ -f "$LEDGER" ] || return 0
   python3 - "$LEDGER" <<'PY'
 import json, os, sys
-spawns, exits = {}, set()
+scope = os.environ.get("WCTL_SCOPE_SID", "")
+spawns = {}
 for line in open(sys.argv[1]):
     try:
         e = json.loads(line)
     except ValueError:
         continue
     if e.get("event") == "spawn":
+        if scope and e.get("sid", "") != scope:
+            continue
         spawns[e["pid"]] = e
     elif e.get("event") == "exit":
-        exits.add((e["pid"], True))
-        spawns.pop(e["pid"], None)
+        spawns.pop(e.get("pid"), None)
 for pid in spawns:
     try:
         os.kill(pid, 0)
@@ -37,6 +62,7 @@ ps)
   if [ ! -f "$LEDGER" ]; then echo "no workers recorded yet"; exit 0; fi
   python3 - "$LEDGER" <<'PY'
 import json, os, sys, time
+scope = os.environ.get("WCTL_SCOPE_SID", "")
 entries, order = {}, []
 for line in open(sys.argv[1]):
     try:
@@ -45,6 +71,8 @@ for line in open(sys.argv[1]):
         continue
     pid = e.get("pid")
     if e.get("event") == "spawn":
+        if scope and e.get("sid", "") != scope:
+            continue
         key = (pid, e.get("ts"))
         entries[key] = {"spawn": e, "exit": None}
         order.append(key)
@@ -60,6 +88,8 @@ def alive(pid):
     except OSError:
         return False
 now = time.time()
+if not order:
+    print("no workers in scope" + (" (this session — try --global)" if scope else ""))
 for key in order[-25:]:
     s, x = entries[key]["spawn"], entries[key]["exit"]
     ts = time.strftime("%m-%d %H:%M", time.localtime(s["ts"]))
@@ -69,18 +99,26 @@ for key in order[-25:]:
         status = "RUNNING  %3dm" % ((now - s["ts"]) / 60)
     else:
         status = "DIED (no exit record)"
-    print("%s  pid %-7s %-22s %s" % (ts, s["pid"], status, s.get("cmd", "")[:90]))
+    sid_col = "" if scope else " [%s]" % (s.get("sid", "")[:8] or "manual")
+    print("%s  pid %-7s %-22s%s %s" % (ts, s["pid"], status, sid_col, s.get("cmd", "")[:80]))
 PY
   echo
-  echo "(output files: /tmp/worker-<slug>.* per skill convention · claude-api kill <pid>|--all · claude-api clean [--all])"
+  if [ -n "$WCTL_SCOPE_SID" ]; then
+    echo "(this session's workers only — add --global for all sessions · outputs: ~/.claude-api/run/workers/<session>/)"
+  else
+    echo "(all sessions · outputs: ~/.claude-api/run/workers/<session>/ · kill <pid>|--all · clean [--all])"
+  fi
   ;;
 kill)
   target="${1:-}"
   case "$target" in
-    "") echo "usage: claude-api kill <pid>|--all" >&2; exit 1 ;;
+    "") echo "usage: claude-api kill <pid>|--all [--global]" >&2; exit 1 ;;
     --all)
       pids="$(running_pids)"
-      if [ -z "$pids" ]; then echo "no running workers"; exit 0; fi
+      if [ -z "$pids" ]; then
+        echo "no running workers in scope$([ -n "$WCTL_SCOPE_SID" ] && echo ' (this session — add --global for all sessions)')"
+        exit 0
+      fi
       for p in $pids; do kill -TERM "$p" 2>/dev/null && echo "sent TERM to $p" || true; done
       ;;
     *) kill -TERM "$target" && echo "sent TERM to $target" ;;
@@ -88,30 +126,48 @@ kill)
   ;;
 clean)
   force="${1:-}"
-  # FIFO keepers: remove artifacts of dead keepers; --all also ends live ones.
-  for k in /tmp/worker-*.keeper; do
-    [ -e "$k" ] || continue
-    pid="$(cat "$k" 2>/dev/null || true)"
-    base="${k%.keeper}"
-    if [ "$force" = "--all" ] && [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
-    if [ "$force" = "--all" ] || [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-      rm -f "$k" "$base.in"
-      echo "cleaned $(basename "$base") keeper/FIFO"
+  clean_dir() { # dir force
+    local d="$1" f="$2" k pid base
+    [ -d "$d" ] || return 0
+    for k in "$d"/*.keeper; do
+      [ -e "$k" ] || continue
+      pid="$(cat "$k" 2>/dev/null || true)"
+      base="${k%.keeper}"
+      if [ "$f" = "--all" ] && [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
+      if [ "$f" = "--all" ] || [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$k" "$base.in"
+        echo "cleaned $(basename "$base") keeper/FIFO"
+      fi
+    done
+    if [ "$f" = "--all" ]; then
+      find "$d" -maxdepth 1 \( -name '*.json' -o -name '*.err' -o -name '*.ndjson' \) -exec rm -f {} + 2>/dev/null || true
+    else
+      find "$d" -maxdepth 1 \( -name '*.json' -o -name '*.err' -o -name '*.ndjson' \) -mtime +1 -exec rm -f {} + 2>/dev/null || true
     fi
-  done
-  if [ "$force" = "--all" ]; then
-    rm -f /tmp/worker-*.json /tmp/worker-*.err /tmp/worker-*.ndjson 2>/dev/null || true
-    echo "removed all /tmp/worker-* artifacts"
+    rmdir "$d" 2>/dev/null || true
+  }
+  if [ -n "$WCTL_SCOPE_SID" ]; then
+    clean_dir "$WORKERS_BASE/$WCTL_SCOPE_SID" "$force"
+    echo "cleaned this session's worker dir$([ "$force" = "--all" ] && echo " (everything)" || echo " (artifacts >24h; --all for everything incl. live keepers)")"
   else
-    find /tmp -maxdepth 1 -name 'worker-*' \( -name '*.json' -o -name '*.err' -o -name '*.ndjson' \) -mtime +1 -exec rm -f {} + 2>/dev/null || true
-    echo "removed /tmp/worker-* artifacts older than 24h (--all removes everything and ends streaming workers)"
+    for d in "$WORKERS_BASE"/*/; do
+      [ -d "$d" ] || continue
+      clean_dir "${d%/}" "$force"
+    done
+    # legacy shared-/tmp convention from older skill versions
+    if [ "$force" = "--all" ]; then
+      rm -f /tmp/worker-*.json /tmp/worker-*.err /tmp/worker-*.ndjson /tmp/worker-*.in /tmp/worker-*.keeper 2>/dev/null || true
+    else
+      find /tmp -maxdepth 1 -name 'worker-*' \( -name '*.json' -o -name '*.err' -o -name '*.ndjson' \) -mtime +1 -exec rm -f {} + 2>/dev/null || true
+    fi
+    echo "cleaned all sessions' worker dirs$([ "$force" = "--all" ] && echo " (everything)" || echo " (artifacts >24h)")"
   fi
   if [ -f "$LEDGER" ]; then
     tail -n 500 "$LEDGER" > "$LEDGER.tmp" && mv "$LEDGER.tmp" "$LEDGER"
   fi
   ;;
 *)
-  echo "usage: claude-api ps | kill <pid>|--all | clean [--all]" >&2
+  echo "usage: claude-api ps [--global] | kill <pid>|--all [--global] | clean [--all] [--global]" >&2
   exit 1
   ;;
 esac

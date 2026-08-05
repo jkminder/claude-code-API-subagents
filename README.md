@@ -37,7 +37,9 @@ Prerequisite: `claude` on PATH (`npm install -g @anthropic-ai/claude-code`); `~/
 
 Once installed, the `delegate` skill is available in every Claude Code session on the machine. Say "delegate …" or "swarm …" — or let the agent trigger it on its own for heavy work. Workers run in background; the agent monitors them, can message them mid-run, and reports results. Every run lands in the wrapper's ledger (`~/.claude-api/run/ledger.jsonl`, inspect with `claude-api ps`); the agent additionally appends a best-effort cost/session line to `~/.claude-api/cost-log.jsonl` (client-side estimate — the Console usage dashboard is authoritative).
 
-**Lifecycle:** `claude-api ps` (list workers + status) · `claude-api kill <pid>|--all` · `claude-api clean [--all]` (sweep FIFO keepers and stale `/tmp/worker-*` artifacts) · `claude-api worktree add|list|clean` (isolated checkouts for parallel workers) · `claude-api doctor [--ping]` (install health) · `claude-api selftest` (re-validate the version-pinned behaviors after a Claude Code upgrade).
+**Lifecycle:** `claude-api ps` (list workers + status) · `claude-api kill <pid>|--all` · `claude-api clean [--all]` (sweep FIFO keepers and stale artifacts) · `claude-api worktree add|list|clean` (isolated checkouts for parallel workers) · `claude-api doctor [--ping]` (install health) · `claude-api selftest` (re-validate the version-pinned behaviors after a Claude Code upgrade).
+
+**Multi-session safe:** several main sessions can delegate on one machine at once. The wrapper tags each spawn with the parent session's ID, worker outputs live under `~/.claude-api/run/workers/<session>/`, and `ps`/`kill --all`/`clean` are scoped to the invoking session by default — one session cannot kill another's fleet. `--global` widens to the whole machine (the default when run from a plain terminal, where no session ID exists).
 
 **Delegation policy:** the skill assumes worker tokens come from a flat/sponsored credit pool and are therefore *effectively free* — it instructs the agent to delegate liberally and fan out in parallel, treating latency and coordination (not tokens) as the only costs. If your API usage is metered, tune [skills/delegate/SKILL.md](skills/delegate/SKILL.md).
 
@@ -71,7 +73,7 @@ The two compose into **multi-level fan-out**: the main session spawns one worker
 ## Components
 
 - [bin/claude-api](bin/claude-api) — worker wrapper: resolves the key (`$CLAUDE_API_KEY_CMD` → Keychain → `~/.claude-api/api-key`), sets `CLAUDE_CONFIG_DIR`, strips everything inherited that could reroute billing (`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, Bedrock/Vertex switches, `ANTHROPIC_MODEL`), resolves the permission mode, runs `claude`, and records every run in the ledger. Also the dispatcher for the subcommands below.
-- [bin/worker-ctl](bin/worker-ctl) — `ps` / `kill` / `clean`: worker registry from the ledger, liveness, artifact sweeping.
+- [bin/worker-ctl](bin/worker-ctl) — `ps` / `kill` / `clean`: worker registry from the ledger, liveness, artifact sweeping; session-scoped by default, `--global` for machine-wide.
 - [bin/worker-worktree](bin/worker-worktree) — per-worker git worktrees (`worker/<slug>` branches) for parallel edits on one repo.
 - [bin/doctor](bin/doctor) — install health check (key source, config perms, no stray OAuth creds in the worker identity, hook registration, symlinks; `--ping` for a live run).
 - [bin/selftest](bin/selftest) — re-runs the validation matrix (basic run, `--resume`, `acceptEdits` edits, FIFO envelope).
