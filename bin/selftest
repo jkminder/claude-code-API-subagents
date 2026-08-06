@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Validation matrix (dispatched as: claude-api selftest). Re-verifies the
 # version-pinned behaviors the framework depends on — run after Claude Code
-# upgrades. Spends a few API-billed sonnet runs.
+# upgrades. Spends a few API-billed sonnet/haiku runs; the supervision-protocol
+# checks (8-9) use a fake reader and are free.
 set -uo pipefail
 
 SRC="${BASH_SOURCE[0]}"
@@ -33,7 +34,7 @@ step() { echo; echo "== $1"; }
 ok()   { echo "   PASS"; }
 bad()  { echo "   FAIL: $1"; fails=$((fails + 1)); }
 
-step "1/5 basic headless run + JSON output"
+step "1/10 basic headless run + JSON output"
 SID=""
 if "$CA" -p 'Reply with exactly: SELFTEST OK' --model sonnet --output-format json > t1.json 2> t1.err \
    && python3 -c 'import json;d=json.load(open("t1.json"));assert not d.get("is_error");assert "SELFTEST OK" in d["result"]' 2>/dev/null; then
@@ -43,7 +44,7 @@ else
   bad "basic run (t1.err)"
 fi
 
-step "2/5 --resume continuity"
+step "2/10 --resume continuity"
 if [ -n "$SID" ] \
    && "$CA" --resume "$SID" -p 'What exact phrase did you reply with earlier? Answer with just the phrase.' --model sonnet --output-format json > t2.json 2> t2.err \
    && python3 -c 'import json;assert "SELFTEST OK" in json.load(open("t2.json"))["result"]' 2>/dev/null; then
@@ -52,12 +53,12 @@ else
   bad "resume (t2.err)"
 fi
 
-step "3/5 acceptEdits floor: file creation"
+step "3/10 acceptEdits floor: file creation"
 mkdir -p edit && ( cd edit && "$CA" -p 'Create a file named hello.txt in the current directory containing exactly: selftest file
 Then reply DONE.' --model sonnet --output-format json > ../t3.json 2> ../t3.err )
 if [ "$(cat edit/hello.txt 2>/dev/null)" = "selftest file" ]; then ok; else bad "file not created (t3.err)"; fi
 
-step "4/5 FIFO streaming: envelope + send helper + clean shutdown"
+step "4/10 legacy manual FIFO: envelope + send helper + clean shutdown"
 mkfifo w.in
 tail -f /dev/null > w.in & keeper=$!
 touch w.ndjson
@@ -80,9 +81,9 @@ fi
 kill "$worker" 2>/dev/null
 wait 2>/dev/null
 
-step "5/5 worker→human question relay (ask grant + questions + answer)"
-"$CA" -p 'Run exactly this shell command with your Bash tool (set the tool call timeout to 120000 ms) and wait for it: claude-api ask --from selftest --timeout 90 "Reply with exactly: GRANTED". Then reply with exactly: GOT=<its stdout>.' \
-  --model sonnet --allowedTools 'Bash(claude-api ask:*)' --output-format json > t5.json 2> t5.err & qworker=$!
+step "5/10 worker→human question relay from a run worker (ask grant + questions + answer)"
+"$CA" run st-ask 'Run exactly this shell command with your Bash tool (set the tool call timeout to 120000 ms) and wait for it: claude-api ask --from selftest --timeout 90 "Reply with exactly: GRANTED". Then reply with exactly: GOT=<its stdout>.' \
+  --model sonnet --allowedTools 'Bash(claude-api ask:*)' > t5.out 2> t5.err & qworker=$!
 qid=""
 i=0
 while [ "$i" -lt 90 ]; do
@@ -92,11 +93,11 @@ while [ "$i" -lt 90 ]; do
 done
 if [ -n "$qid" ] && "$CA" answer "$qid" "GRANTED" > /dev/null \
    && wait "$qworker" \
-   && python3 -c 'import json;r=json.load(open("t5.json"))["result"];assert "GOT" in r and "GRANTED" in r' 2>/dev/null; then
+   && grep -q 'GOT' t5.out && grep -q 'GRANTED' t5.out; then
   ok
 else
   [ -z "$qid" ] && bad "no question arrived — ask grant syntax may have changed (t5.err)" \
-                || bad "answer did not flow back (t5.json / t5.err)"
+                || bad "answer did not flow back (t5.out / t5.err)"
 fi
 kill "$qworker" 2>/dev/null
 wait 2>/dev/null
@@ -105,9 +106,120 @@ QD="${CLAUDE_API_CONFIG_DIR:-$HOME/.claude-api}/run/workers/${CLAUDE_CODE_SESSIO
 [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] || QD="${CLAUDE_API_CONFIG_DIR:-$HOME/.claude-api}/run/questions"
 rm -f "$QD"/selftest-*.q "$QD"/selftest-*.a 2>/dev/null || true
 
+# run-form checks. Worker artifacts live in the session worker dir; send/end
+# take explicit paths so these also work from a plain terminal (no session id).
+RWDIR="${CLAUDE_API_CONFIG_DIR:-$HOME/.claude-api}/run/workers/${CLAUDE_CODE_SESSION_ID:-manual}"
+
+# send may hit the moment between run's mkfifo and its probe-fd open (ENXIO) —
+# retry briefly before calling it a failure.
+send_retry() { # fifo-path message [extra send args...]
+  local f="$1" m="$2" i=0; shift 2
+  while [ "$i" -lt 10 ]; do
+    "$CA" send "$f" "$m" "$@" && return 0
+    sleep 0.5; i=$((i + 1))
+  done
+  return 1
+}
+
+step "6/10 run: one-shot answer on stdout"
+if "$CA" run st-one 'Reply with exactly: RUN OK' --model haiku > t6.out 2> t6.err \
+   && [ "$(cat t6.out)" = "RUN OK" ] && grep -q 'resume:' t6.err \
+   && [ ! -e "$RWDIR/st-one.in" ]; then
+  ok
+else
+  bad "run one-shot (t6.out / t6.err)"
+fi
+
+# Steps 7-9 exercise the supervision protocol with a fake `claude` on PATH —
+# deterministic timing, no API spend.
+mkdir -p fakebin
+cat > fakebin/claude <<'EOF'
+#!/usr/bin/env bash
+# selftest stub: stream-json worker, one result per input line; FAKE_MODE=crash
+# dies mid-turn without a result.
+n=0
+while IFS= read -r _; do
+  n=$((n+1))
+  if [ "${FAKE_MODE:-}" = crash ]; then
+    printf '{"type":"assistant","session_id":"fake-sid"}\n'
+    exit 3
+  fi
+  sleep "${FAKE_DELAY:-0.3}"
+  printf '{"type":"result","subtype":"success","is_error":false,"result":"TURN %s","session_id":"fake-sid","total_cost_usd":0}\n' "$n"
+done
+EOF
+chmod +x fakebin/claude
+
+step "7/10 run: two sends queued during a slow turn — both drained before close (EOF drain)"
+# The stub's slow first turn (FAKE_DELAY) guarantees both sends are queued in
+# the pipe at the first result boundary; the close protocol must then give
+# each its own turn instead of closing. (A live model can't test this
+# deterministically: it either folds queued messages into the in-flight turn
+# — content survives, result lines merge — or finishes turn 1 before the
+# send lands, closing legitimately.)
+PATH="$PWD/fakebin:$PATH" FAKE_DELAY=5 "$CA" run st-drain 'task one' > t7.out 2> t7.err & drpid=$!
+i=0; while [ ! -p "$RWDIR/st-drain.in" ] && [ "$i" -lt 200 ]; do sleep 0.05; i=$((i + 1)); done
+if send_retry "$RWDIR/st-drain.in" 'task two' > /dev/null 2>&1 \
+   && "$CA" send "$RWDIR/st-drain.in" 'task three' > /dev/null 2>&1 \
+   && wait "$drpid" \
+   && [ "$(cat t7.out)" = "TURN 3" ] \
+   && [ "$(grep -c '"type":"result"' "$RWDIR/st-drain.ndjson")" -eq 3 ]; then
+  ok
+else
+  bad "a queued message was lost at close (t7.out / $RWDIR/st-drain.ndjson)"
+fi
+
+step "8/10 run: close handoff vs a racing send (fake reader)"
+PATH="$PWD/fakebin:$PATH" "$CA" run st-race 'task one' > t8.out 2> t8.err & rcpid=$!
+i=0; while ! grep -q '"TURN 1"' "$RWDIR/st-race.ndjson" 2>/dev/null && [ "$i" -lt 200 ]; do sleep 0.05; i=$((i + 1)); done
+"$CA" send "$RWDIR/st-race.in" 'task two' > t8.send 2>&1; srrc=$?
+wait "$rcpid"; rrc=$?
+if [ "$srrc" -eq 0 ]; then
+  # send won the race — its message must get its own turn and the final answer
+  if [ "$rrc" -eq 0 ] && [ "$(cat t8.out)" = "TURN 2" ]; then
+    ok
+  else
+    bad "send reported success but its message got no turn — SILENT LOSS (t8.out / t8.send)"
+  fi
+else
+  # run won — the losing send must have failed loudly
+  if grep -q 'gone\|not a FIFO\|nothing is reading' t8.send; then ok; else bad "racing send failed without a loud diagnostic (t8.send)"; fi
+fi
+
+step "9/10 run: worker crash mid-turn fails loudly"
+FAKE_MODE=crash PATH="$PWD/fakebin:$PATH" "$CA" run st-crash 'boom' > t9.out 2> t9.err; crc=$?
+if [ "$crc" -ne 0 ] && grep -q 'FAILED' t9.err && grep -q 'no-result-line' t9.err \
+   && [ ! -e "$RWDIR/st-crash.in" ]; then
+  ok
+else
+  bad "crash: rc=$crc, want nonzero + FAILED/no-result-line diagnostics + fifo removed (t9.err)"
+fi
+
+step "10/10 run --stay: steer mid-run, then graceful end"
+"$CA" run st-steer 'Reply with exactly: FIRST' --stay --model haiku > t10.out 2> t10.err & stpid=$!
+if wait_for "$RWDIR/st-steer.ndjson" '"type":"result"' 180; then
+  if send_retry "$RWDIR/st-steer.in" 'Reply with exactly: SECOND' --wait 180 > /dev/null 2>&1 \
+     && "$CA" end "$RWDIR/st-steer.keeper" > /dev/null \
+     && wait "$stpid" \
+     && [ "$(cat t10.out)" = "SECOND" ] \
+     && [ "$(grep -c '"type":"result"' "$RWDIR/st-steer.ndjson")" -ge 2 ]; then
+    ok
+  else
+    bad "steer/end (t10.out / t10.err)"
+  fi
+else
+  kill "$stpid" 2>/dev/null
+  bad "no first result from the --stay worker (t10.err)"
+fi
+wait 2>/dev/null
+rm -f "$RWDIR"/st-ask.ndjson "$RWDIR"/st-one.ndjson "$RWDIR"/st-drain.ndjson \
+      "$RWDIR"/st-race.ndjson "$RWDIR"/st-crash.ndjson "$RWDIR"/st-steer.ndjson \
+      "$RWDIR"/st-ask.err "$RWDIR"/st-one.err "$RWDIR"/st-drain.err \
+      "$RWDIR"/st-race.err "$RWDIR"/st-crash.err "$RWDIR"/st-steer.err 2>/dev/null || true
+
 echo
 if [ "$fails" -eq 0 ]; then
-  echo "selftest: all 5 checks passed"
+  echo "selftest: all 10 checks passed"
 else
   echo "selftest: $fails check(s) FAILED"
 fi
