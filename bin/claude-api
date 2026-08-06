@@ -464,18 +464,20 @@ if [ "$has_settings" -eq 0 ] && [ "$has_model" -eq 0 ]; then
   set -- --settings '{"model": "claude-fable-5"}' "$@"
 fi
 
-# Cost ceiling: headless workers run unattended — cap the per-run spend unless
-# the caller passes their own --max-budget-usd. The flag only works with
-# --print, so interactive invocations (tmux swarm fallback) are left alone.
-has_budget=0 has_print=0
-for a in "$@"; do
-  case "$a" in
-    --max-budget-usd|--max-budget-usd=*) has_budget=1 ;;
-    -p|--print) has_print=1 ;;
-  esac
-done
-if [ "$has_budget" -eq 0 ] && [ "$has_print" -eq 1 ]; then
-  set -- --max-budget-usd "${CLAUDE_API_MAX_BUDGET_USD:-5}" "$@"
+# No default spend cap: the key bills a flat pool, so a cap would only abort
+# legitimately expensive runs. Opt in per spawn with --max-budget-usd, or set
+# CLAUDE_API_MAX_BUDGET_USD to restore a default ceiling.
+if [ -n "${CLAUDE_API_MAX_BUDGET_USD:-}" ]; then
+  has_budget=0 has_print=0
+  for a in "$@"; do
+    case "$a" in
+      --max-budget-usd|--max-budget-usd=*) has_budget=1 ;;
+      -p|--print) has_print=1 ;;
+    esac
+  done
+  if [ "$has_budget" -eq 0 ] && [ "$has_print" -eq 1 ]; then
+    set -- --max-budget-usd "$CLAUDE_API_MAX_BUDGET_USD" "$@"
+  fi
 fi
 
 # Run ledger (read by claude-api ps). Values sanitized to JSON-safe characters.

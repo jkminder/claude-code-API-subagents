@@ -29,7 +29,7 @@ Every `run` worker is **steerable while it runs**: `claude-api send <slug> "<fol
 
 - Exit 0 → stdout is the answer (a stderr footer gives cost, turn count, the resume handle, and the `.ndjson` path). Exit 1 → a `FAILED` line with the failure subtype, any partial result, and the worker's stderr tail; respin or resume. Extra flags pass through after the prompt: `claude-api run <slug> "<task>" --model sonnet --allowedTools "Bash(git push *)"`.
 - `--stay` keeps the worker alive between turns — it idles waiting for the next `send` until `claude-api end <slug>` or death. Use it for monitors, babysitters, and any standing worker. Without `--stay` the run closes once every message it received has been answered.
-- Cost cap: `run` (and any headless `-p` call) gets `--max-budget-usd 5` injected unless you pass your own; `CLAUDE_API_MAX_BUDGET_USD` changes the default.
+- No default spend cap (the key bills a flat pool). For a run you want bounded — e.g. an experimental loop that could spin — pass `--max-budget-usd <n>` yourself, or set `CLAUDE_API_MAX_BUDGET_USD` to give every headless run a default ceiling.
 - Pick a slug unique **within this session** (the dir is per-session, so no cross-session collisions; `run` warns before overwriting a reused slug, and refuses a slug whose worker is still alive).
 - Prompt must be self-contained: goal, constraints, a verification step ("run the tests and include the output"), and what to report.
 - **Commit policy:** tell workers to leave changes uncommitted (or commit only on their own worktree branch, below) — integration and committing is this session's job. Nothing else stops parallel workers from committing over each other.
