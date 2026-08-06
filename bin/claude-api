@@ -56,44 +56,52 @@ case "${1:-}" in
     case "$slug" in
       *[!A-Za-z0-9._-]*) echo "claude-api run: slug must match [A-Za-z0-9._-]" >&2; exit 2 ;;
     esac
-    if [ "$PWD" = "$HOME" ]; then
+    if [ "$PWD" -ef "$HOME" ]; then
       echo "claude-api run: refusing to spawn from \$HOME (the worker sandbox would cover your whole home dir) — cd into the target repo or a scratch dir" >&2
       exit 2
     fi
-    WDIR="${CLAUDE_API_CONFIG_DIR:-$HOME/.claude-api}/run/workers/${CLAUDE_CODE_SESSION_ID:-manual}"
+    WDIR="$CONFIG_DIR/run/workers/${CLAUDE_CODE_SESSION_ID:-manual}"
     mkdir -p "$WDIR"
+    if [ -e "$WDIR/$slug.json" ]; then
+      echo "claude-api run: note — slug '$slug' was used before in this session; overwriting its artifacts (concurrent same-slug runs would corrupt each other)" >&2
+    fi
     rc=0
-    "$SRC" -p "$prompt" --output-format json "$@" \
+    "$SRC" -p "$prompt" --output-format json ${1+"$@"} \
       > "$WDIR/$slug.json" 2> "$WDIR/$slug.err" < /dev/null || rc=$?
-    exec python3 - "$WDIR/$slug.json" "$WDIR/$slug.err" "$slug" "$rc" <<'PYEOF'
+    exec python3 - "$WDIR/$slug.json" "$WDIR/$slug.err" "$slug" "$rc" "$CONFIG_DIR" <<'PYEOF'
 import json, sys, time, os
-out, err, slug, rc = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+out, err, slug, rc, cfg = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
+for s in (sys.stdout, sys.stderr):
+    s.reconfigure(errors="replace")
 try:
-    with open(out) as f:
+    with open(out, encoding="utf-8") as f:
         d = json.load(f)
+    if not isinstance(d, dict):
+        d = None
 except Exception:
     d = None
 ok = rc == 0 and d is not None and not d.get("is_error") and d.get("subtype") == "success"
+sid = d.get("session_id", "?") if d else "?"
 if ok:
     print(d.get("result") or "")
-    sid, cost = d.get("session_id", "?"), d.get("total_cost_usd")
+    cost = d.get("total_cost_usd")
     coststr = f"${cost:.2f}" if isinstance(cost, (int, float)) else "?"
     print(f'[worker {slug}: {coststr} · resume: claude-api --resume {sid} -p "<follow-up>" --output-format json · json: {out}]',
           file=sys.stderr)
     try:
-        with open(os.path.expanduser("~/.claude-api/cost-log.jsonl"), "a") as f:
+        with open(os.path.join(cfg, "cost-log.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                                 "task": slug, "cost": cost, "session": sid}) + "\n")
     except OSError:
         pass
     sys.exit(0)
 subtype = d.get("subtype") if d else "unparseable-or-empty-json"
-print(f"worker {slug} FAILED (exit {rc}, subtype: {subtype}) — respin with a sharper prompt or resume; see {out}",
+print(f"worker {slug} FAILED (exit {rc}, subtype: {subtype}, session: {sid}) — respin with a sharper prompt or resume; see {out}",
       file=sys.stderr)
 if d and d.get("result"):
     print(f"partial result:\n{d['result']}", file=sys.stderr)
 try:
-    with open(err) as f:
+    with open(err, encoding="utf-8", errors="replace") as f:
         tail = f.read()[-2000:]
     if tail.strip():
         print(f"stderr tail:\n{tail}", file=sys.stderr)

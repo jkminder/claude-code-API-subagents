@@ -26,7 +26,7 @@ cd <target-repo> && claude-api run <slug> "<self-contained task prompt>"
 ```
 
 - Exit 0 → stdout is the answer (a stderr footer gives cost, the resume handle, and the raw-JSON path). Exit 1 → a `FAILED` line with the failure subtype, any partial result, and the worker's stderr tail; respin or resume. Extra flags pass through after the prompt: `claude-api run <slug> "<task>" --model sonnet --allowedTools "Bash(git push *)"`.
-- The plumbing form behind `run` — use it only for the streaming/FIFO variants below, which need explicit redirection:
+- The plumbing form behind `run` — the pattern the streaming/FIFO variants below build on; for plain one-shots always prefer `run`:
 
 ```bash
 WDIR="$HOME/.claude-api/run/workers/${CLAUDE_CODE_SESSION_ID:-manual}" && mkdir -p "$WDIR"
@@ -34,9 +34,11 @@ cd <target-repo> && claude-api -p "<self-contained task prompt>" \
   --output-format json > "$WDIR/<slug>.json" 2> "$WDIR/<slug>.err"
 ```
 
-- Pick a slug unique **within this session** (the dir is per-session, so no cross-session collisions).
+The bullets below apply to **both forms**:
+
+- Pick a slug unique **within this session** (the dir is per-session, so no cross-session collisions; `run` warns before overwriting a reused slug).
 - Prompt must be self-contained: goal, constraints, a verification step ("run the tests and include the output"), and what to report.
-- **Steerability: use the FIFO form ("Talk to a running worker" below) for any worker that will run more than a few minutes** — a plain `-p` worker cannot be redirected mid-run. Reserve the plain form for short, fully-specified, one-shot tasks.
+- **Steerability:** one-shot workers (`run` or plain `-p`) cannot be redirected mid-run. `run` is fine at any duration when the task is fully specified up front; use the FIFO form ("Talk to a running worker" below) when plans might change mid-run — monitors, jobs tied to external state, anything you might want to cancel or redirect.
 - **Commit policy:** tell workers to leave changes uncommitted (or commit only on their own worktree branch, below) — integration and committing is this session's job. Nothing else stops parallel workers from committing over each other.
 - Model: defaults to fable (pinned by the wrapper via `--settings '{"model": "claude-fable-5"}'` — headless runs ignore the settings.json model key). An explicit `--model` wins: `--model sonnet` for lighter work, `--model opus` when fable is overkill but the task still needs strong reasoning.
 - Concurrency: **spawn as many workers as the work decomposes into** — one per independent subtask; dozens in parallel is fine. Real limits: machine resources (stagger the next batch if the box gets sluggish) and API rate limits (a 429 in a worker's `.err` means back off and retry that worker, not that you over-delegated). For very wide work, prefer fewer workers that each fan out internally (see below) over hundreds of processes.
@@ -68,7 +70,7 @@ If more than one worker will modify the same repo (or the tree is dirty), isolat
 
 ```bash
 WT=$(claude-api worktree add <slug>)   # prints the worktree path; branch worker/<slug>
-cd "$WT" && claude-api -p "..." ...
+cd "$WT" && claude-api run <slug> "..."
 ```
 
 After collecting and merging results: `claude-api worktree clean` removes merged worktrees and branches (`claude-api worktree list` to inspect).
@@ -107,9 +109,9 @@ cd <target-repo> && claude-api -p "<task>" --output-format stream-json --verbose
 
 Tail the `.ndjson` for progress; the final `result` line carries `.result` and `.session_id`. To block until something appears in a worker's stream, run the wait itself as a harness-tracked background command (`run_in_background` + `until grep -q '<pat>' <f>; do sleep 5; done`) or use a monitor tool if your harness has one — a foreground Bash call times out at 2 min and chained `sleep`s get blocked.
 
-## Talk to a running worker (mid-run steering) — the default for long jobs
+## Talk to a running worker (mid-run steering) — for jobs that may need redirecting
 
-**Use this form whenever the worker will run more than a few minutes.** Plans change while a worker runs (e.g. the target job gets cancelled); with a plain `-p` worker your only options are to let it finish work you no longer want or kill it and lose its progress. Three Bash calls (re-set `WDIR` in each — see Spawning):
+**Use this form when plans might change while the worker runs** (e.g. the target job gets cancelled, a monitor, external state); with a one-shot worker your only options are to let it finish work you no longer want or kill it and lose its progress. Three Bash calls (re-set `WDIR` in each — see Spawning):
 
 ```bash
 rm -f "$WDIR/<slug>.in" && mkfifo "$WDIR/<slug>.in"
@@ -148,7 +150,7 @@ A worker at a genuine decision point can escalate to the human instead of guessi
 
 > If you hit a genuine decision point — ambiguous requirement, irreversible or costly action, a fork only the user can decide — ask the human: run `claude-api ask --from <slug> --timeout 540 "<question — state what you will do by default if unanswered>"` as a single foreground Bash call with the tool timeout set to 600000 ms. Do not `&`-background it or poll for it. Its stdout is the answer. On NO_ANSWER, a denial, or a tool error, take your stated default if safe, otherwise stop and report the open decision. Never ask for status updates, confirmations of your own analysis, or anything you can determine yourself — every question stalls you and interrupts the human. This is the only `claude-api` command you may run.
 
-Answer within the worker's `--timeout` (default 540 s); after that `answer` fails cleanly — the worker has moved on, reach a FIFO worker via `send`. A FIFO worker blocked mid-`ask` cannot act on `send` until the ask returns; to redirect it immediately, answer its pending question.
+Answer within the worker's `--timeout` (default 540 s); after that `answer` fails cleanly — the worker has moved on and takes its stated default. A FIFO worker can still be reached via `send`; a one-shot (`run`/`-p`) worker cannot be reached mid-run at all. A FIFO worker blocked mid-`ask` cannot act on `send` until the ask returns; to redirect it immediately, answer its pending question.
 
 ## Follow-ups after completion
 
@@ -163,8 +165,7 @@ cd <target-repo> && claude-api --resume <session_id> -p "<follow-up>" --output-f
 The worker identity has `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in its settings, so any worker can lead a swarm. Teammates are separate processes spawned by the lead and inherit its environment → **lead, all teammates, and their subagents bill the API key** — swarms are free too, so reach for them when work is genuinely parallel. Within the swarm, lead↔teammate communication is native (shared task list + mailbox). Size the team to the work, not to a process budget.
 
 ```bash
-cd <target-repo> && claude-api -p "Assemble an agent team of <N> teammates to <goal>. Split the work as: <split>. Coordinate via the shared task list; report a consolidated summary." \
-  --output-format json > "$WDIR/swarm-<slug>.json" 2> "$WDIR/swarm-<slug>.err"
+cd <target-repo> && claude-api run swarm-<slug> "Assemble an agent team of <N> teammates to <goal>. Split the work as: <split>. Coordinate via the shared task list; report a consolidated summary."
 ```
 
 Give the lead an explicit team size and work split. Agent teams are experimental: if a headless swarm misbehaves, run the lead interactively instead (`tmux new -d -s swarm-<slug> 'claude-api "<swarm prompt>"'`). **The tmux lead is interactive and CAN hang on a permission prompt** — check `tmux capture-pane -t swarm-<slug> -p` for pending prompts and answer via `tmux send-keys`, or pass the same `--allowedTools` grants you would headlessly. Never run swarms through the main session — every teammate would bill the subscription.
