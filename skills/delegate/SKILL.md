@@ -19,26 +19,19 @@ description: Delegate work to API-billed Claude Code workers or swarms. Worker t
 
 **Always spawn via background Bash** (`run_in_background`) so this session stays free — you'll be notified when the command completes. Run **from the target repo directory** (cwd defines the worker's project and its sandbox-writable workspace). For non-repo work (research, generation), create and `cd` into a scratch directory — never spawn from `$HOME`, which would make the whole home dir writable under `acceptEdits`.
 
-**Default form — `run` (one-shot):** a single background Bash call; the worker's answer is the command's stdout, so it arrives in the completion notification with no files to parse:
+**The one form — `run`:** a single background Bash call; the worker's answer is the command's stdout, so it arrives in the completion notification with no files to parse:
 
 ```bash
 cd <target-repo> && claude-api run <slug> "<self-contained task prompt>"
 ```
 
-- Exit 0 → stdout is the answer (a stderr footer gives cost, the resume handle, and the raw-JSON path). Exit 1 → a `FAILED` line with the failure subtype, any partial result, and the worker's stderr tail; respin or resume. Extra flags pass through after the prompt: `claude-api run <slug> "<task>" --model sonnet --allowedTools "Bash(git push *)"`.
-- The plumbing form behind `run` — the pattern the streaming/FIFO variants below build on; for plain one-shots always prefer `run`:
+Every `run` worker is **steerable while it runs**: `claude-api send <slug> "<follow-up>"` injects messages mid-run (see *Steering a running worker* below). With nothing sent it behaves one-shot — one turn, then it closes and reports.
 
-```bash
-WDIR="$HOME/.claude-api/run/workers/${CLAUDE_CODE_SESSION_ID:-manual}" && mkdir -p "$WDIR"
-cd <target-repo> && claude-api -p "<self-contained task prompt>" \
-  --output-format json > "$WDIR/<slug>.json" 2> "$WDIR/<slug>.err"
-```
-
-The bullets below apply to **both forms**:
-
-- Pick a slug unique **within this session** (the dir is per-session, so no cross-session collisions; `run` warns before overwriting a reused slug).
+- Exit 0 → stdout is the answer (a stderr footer gives cost, turn count, the resume handle, and the `.ndjson` path). Exit 1 → a `FAILED` line with the failure subtype, any partial result, and the worker's stderr tail; respin or resume. Extra flags pass through after the prompt: `claude-api run <slug> "<task>" --model sonnet --allowedTools "Bash(git push *)"`.
+- `--stay` keeps the worker alive between turns — it idles waiting for the next `send` until `claude-api end <slug>` or death. Use it for monitors, babysitters, and any standing worker. Without `--stay` the run closes once every message it received has been answered.
+- Cost cap: `run` (and any headless `-p` call) gets `--max-budget-usd 5` injected unless you pass your own; `CLAUDE_API_MAX_BUDGET_USD` changes the default.
+- Pick a slug unique **within this session** (the dir is per-session, so no cross-session collisions; `run` warns before overwriting a reused slug, and refuses a slug whose worker is still alive).
 - Prompt must be self-contained: goal, constraints, a verification step ("run the tests and include the output"), and what to report.
-- **Steerability:** one-shot workers (`run` or plain `-p`) cannot be redirected mid-run. `run` is fine at any duration when the task is fully specified up front; use the FIFO form ("Talk to a running worker" below) when plans might change mid-run — monitors, jobs tied to external state, anything you might want to cancel or redirect.
 - **Commit policy:** tell workers to leave changes uncommitted (or commit only on their own worktree branch, below) — integration and committing is this session's job. Nothing else stops parallel workers from committing over each other.
 - Model: defaults to fable (pinned by the wrapper via `--settings '{"model": "claude-fable-5"}'` — headless runs ignore the settings.json model key). An explicit `--model` wins: `--model sonnet` for lighter work, `--model opus` when fable is overkill but the task still needs strong reasoning.
 - Concurrency: **spawn as many workers as the work decomposes into** — one per independent subtask; dozens in parallel is fine. Real limits: machine resources (stagger the next batch if the box gets sluggish) and API rate limits (a 429 in a worker's `.err` means back off and retry that worker, not that you over-delegated). For very wide work, prefer fewer workers that each fan out internally (see below) over hundreds of processes.
@@ -77,16 +70,9 @@ After collecting and merging results: `claude-api worktree clean` removes merged
 
 ## Collecting results
 
-You'll be notified when the background spawn exits.
+You'll be notified when the background spawn exits. The notification's output already contains the answer (stdout) or a `FAILED` diagnosis (stderr) — nothing to fetch or parse. Success is also logged to `~/.claude-api/cost-log.jsonl` automatically; the stderr footer has the resume handle and the `.ndjson` path.
 
-**`run` workers:** the notification's output already contains the answer (stdout) or a `FAILED` diagnosis (stderr) — nothing to fetch or parse. Success is also logged to `~/.claude-api/cost-log.jsonl` automatically; the stderr footer has the resume handle.
-
-**Plumbing-form workers (`-p` with redirection):** check for failure before trusting the output — any of these means the run failed: nonzero exit code of the background command, empty or unparseable `$WDIR/<slug>.json`, or `.is_error == true` / `.subtype != "success"` in it. On failure, read `$WDIR/<slug>.err` — but know a worker can die mid-stream with `subtype: "error_during_execution"`, `result: null`, and an *empty* `.err`; that's a connection drop, not your prompt. Either way, respin with a sharper prompt or resume (below) — respinning is cheap, don't hesitate. On success, summarize `.result` for the user. **`.session_id` is the resume handle** (for stream-json workers it's in the initial `system`/`init` line of the `.ndjson`). Best-effort log (skip if `jq` is absent):
-
-```bash
-jq -c '{ts: now|todate, task: "<slug>", cost: .total_cost_usd, session: .session_id}' \
-  "$WDIR/<slug>.json" >> ~/.claude-api/cost-log.jsonl 2>/dev/null || true
-```
+On failure, know that a worker can die mid-stream with subtype `error_during_execution` and an empty `.err` — that's a connection drop, not your prompt (`no-result-line` means it died before finishing even one turn). Respin with a sharper prompt or resume (below) — respinning is cheap, don't hesitate.
 
 ## Permissions
 
@@ -98,47 +84,27 @@ Headless workers never see permission prompts — an unauthorized tool call is s
 
 For blocked categories, grant per spawn: `--allowedTools "Bash(npm install *),Bash(git push *),Bash(curl *)"` — match what the task actually needs (especially the verification step you asked for). The target repo's own `.claude/settings.json` / `settings.local.json` permission rules also apply to workers. If a worker reports it was blocked, respin with the specific missing grant; escalate to `bypassPermissions` yourself only when the user explicitly OKs it.
 
-## Watching a long worker (no steering)
+## Watching a long worker
 
-For jobs you want to *watch* but not steer, spawn with streaming output — no FIFO needed:
+Every `run` worker streams its transcript to `~/.claude-api/run/workers/<session>/<slug>.ndjson` — tail it for progress; each turn ends with a `"type":"result"` line. To block until something appears in the stream, run the wait itself as a harness-tracked background command (`run_in_background` + `until grep -q '<pat>' <f>; do sleep 5; done`) or use a monitor tool if your harness has one — a foreground Bash call times out at 2 min and chained `sleep`s get blocked.
 
-```bash
-cd <target-repo> && claude-api -p "<task>" --output-format stream-json --verbose \
-  > "$WDIR/<slug>.ndjson" 2> "$WDIR/<slug>.err"
-```
+## Steering a running worker
 
-Tail the `.ndjson` for progress; the final `result` line carries `.result` and `.session_id`. To block until something appears in a worker's stream, run the wait itself as a harness-tracked background command (`run_in_background` + `until grep -q '<pat>' <f>; do sleep 5; done`) or use a monitor tool if your harness has one — a foreground Bash call times out at 2 min and chained `sleep`s get blocked.
+Any `run` worker accepts messages while it runs — no special spawn form. Spawn with `--stay` when the worker *should* outlive its first answer (monitors, babysitters, anything you may cancel or redirect); without `--stay` you can still steer, but the run closes once every message it received has been answered.
 
-## Talk to a running worker (mid-run steering) — for jobs that may need redirecting
-
-**Use this form when plans might change while the worker runs** (e.g. the target job gets cancelled, a monitor, external state); with a one-shot worker your only options are to let it finish work you no longer want or kill it and lose its progress. Three Bash calls (re-set `WDIR` in each — see Spawning):
-
-```bash
-rm -f "$WDIR/<slug>.in" && mkfifo "$WDIR/<slug>.in"
-tail -f /dev/null > "$WDIR/<slug>.in" & echo $! > "$WDIR/<slug>.keeper"   # holds the pipe open
-
-# separate call, run_in_background, NO trailing '&' — the harness then tracks the
-# worker and notifies you when the session ends or dies:
-cd <target-repo> && claude-api -p --input-format stream-json --output-format stream-json --verbose \
-  < "$WDIR/<slug>.in" > "$WDIR/<slug>.ndjson" 2> "$WDIR/<slug>.err"
-
-claude-api send <slug> "<initial task>"
-```
-
-If `send` right after the spawn reports "nothing is reading", the worker is still booting — retry after a few seconds before concluding it died.
-
-**The worker is turn-based.** Each message starts a turn; the turn ends with a `"type":"result"` line in the `.ndjson` — one **per turn**, so a result does *not* mean the session ended (that's the FIFO closing or process death) — and the worker then idles until the next message. It cannot wake itself, but task notifications from its own background Bash, Monitor, and subagent completions do start new turns. Consequences:
+**The worker is turn-based.** Each message starts a turn; the turn ends with a `"type":"result"` line in the `.ndjson` — one **per turn**, so a result does *not* mean the session ended — and the worker then idles until the next message. It cannot wake itself, but task notifications from its own background Bash, Monitor, and subagent completions do start new turns. Consequences:
 
 - **A monitor/babysitter worker goes idle after answering unless a wake source is armed.** Put in its initial prompt: "You are steerable — I may send follow-up instructions; finish each, then continue your standing task. Never end a turn while <watched thing> is unfinished unless a wake source is armed that is guaranteed to fire — poll job *state* with a timeout; a queued job writes no logs, so log-tailing alone sleeps forever." If it goes quiet anyway, nudge: `claude-api send <slug> "status? resume monitoring"`.
-- **One outstanding instruction at a time:** a message sent mid-turn may be folded into the in-flight turn and answered in the same result instead of getting its own turn — a `send --wait` can therefore return a merged (or even earlier) reply.
+- **One outstanding instruction at a time:** a message sent mid-turn may be folded into the in-flight turn and answered in the same result instead of getting its own turn — a `send --wait` can therefore return a merged (or even earlier) reply. (A non-`--stay` run notices the shortfall, waits 120 s, then closes with a loud "unaccounted" warning rather than hanging.)
 
-Messaging — use the helpers (`<slug>` resolves in this session's `$WDIR`; explicit paths also work). They JSON-encode for you and fail loudly instead of blocking forever when the worker is dead:
+Messaging — use the helpers (`<slug>` resolves in this session's worker dir; explicit paths also work). They JSON-encode for you and fail loudly instead of blocking forever when the worker is dead:
 
-- `claude-api send <slug> "<msg>"` — deliver and confirm: `delivered` = the worker read it; `queued (N bytes unread)` = still in the pipe (read at the next turn boundary at the latest). Sent messages are **not echoed into the `.ndjson`**, so this is the only delivery check.
+- `claude-api send <slug> "<msg>"` — deliver and confirm: `delivered` = the worker read it; `queued (N bytes unread)` = still in the pipe (read at the next turn boundary at the latest). Sent messages are **not echoed into the `.ndjson`**, so this is the only delivery check. A send racing the run's own close either lands (the run stays open for its turn) or fails loudly — never a silent loss. If `send` right after the spawn reports "nothing is reading", the worker is still booting — retry after a few seconds. Messages over 48 KB are refused — write the content to a file and send the path.
 - `claude-api send <slug> "<msg>" --wait [secs]` — additionally block until the reply (the next `result` event) and print it; exit 124 on timeout (default 600 s). **Run it via `run_in_background` unless you expect an answer within ~a minute** — foreground Bash times out at 2 min and hand-rolled `sleep`-poll loops get blocked by the harness. Never write your own wait loop.
 - `claude-api reply <slug>` — print the last completed reply (stderr note if a newer turn is mid-flight).
+- `claude-api end <slug>` — graceful end: the worker finishes its current turn, then the `run` call returns with the last answer on stdout. Works on `--stay` workers (the normal way to finish them) and as a cancel for normal ones (you get the answer-so-far). `claude-api kill <pid>` is the immediate version.
 
-End the session with `kill "$(cat "$WDIR/<slug>.keeper")"` (stdin EOF → worker finishes its turn and exits cleanly; the spawn's completion notification confirms it) or `claude-api kill <pid>` (immediate; also reaps the keeper on Linux — on macOS follow with `clean --all`). Then `claude-api clean` sweeps the FIFO artifacts.
+**File layout (debugging):** everything lives in `~/.claude-api/run/workers/<session>/` — `<slug>.ndjson` (stream, one `result` line per turn), `<slug>.err` (worker stderr), and while the run is live: `<slug>.in` (the FIFO), `.keeper` (supervisor pid — TERM = graceful end), `.state` (busy/idle), `.sent`/`.lock` (send↔close accounting). The live files disappear when the run ends; `.ndjson`/`.err` stay until `claude-api clean`.
 
 ## Worker questions (worker → you → the user)
 
@@ -150,11 +116,11 @@ A worker at a genuine decision point can escalate to the human instead of guessi
 
 > If you hit a genuine decision point — ambiguous requirement, irreversible or costly action, a fork only the user can decide — ask the human: run `claude-api ask --from <slug> --timeout 540 "<question — state what you will do by default if unanswered>"` as a single foreground Bash call with the tool timeout set to 600000 ms. Do not `&`-background it or poll for it. Its stdout is the answer. On NO_ANSWER, a denial, or a tool error, take your stated default if safe, otherwise stop and report the open decision. Never ask for status updates, confirmations of your own analysis, or anything you can determine yourself — every question stalls you and interrupts the human. This is the only `claude-api` command you may run.
 
-Answer within the worker's `--timeout` (default 540 s); after that `answer` fails cleanly — the worker has moved on and takes its stated default. A FIFO worker can still be reached via `send`; a one-shot (`run`/`-p`) worker cannot be reached mid-run at all. A FIFO worker blocked mid-`ask` cannot act on `send` until the ask returns; to redirect it immediately, answer its pending question.
+Answer within the worker's `--timeout` (default 540 s); after that `answer` fails cleanly — the worker has moved on and takes its stated default. A running worker can still be reached via `send` (a finished one only via `--resume`). A worker blocked mid-`ask` cannot act on `send` until the ask returns; to redirect it immediately, answer its pending question.
 
 ## Follow-ups after completion
 
-Workers stay resumable — steer turn-by-turn without a FIFO:
+Workers stay resumable after they finish — follow up turn-by-turn:
 
 ```bash
 cd <target-repo> && claude-api --resume <session_id> -p "<follow-up>" --output-format json
@@ -174,8 +140,8 @@ Give the lead an explicit team size and work split. Agent teams are experimental
 
 **Scoping: `ps`, `kill --all`, and `clean` act on THIS session's workers only** — other main sessions on the machine may be running their own fleets, and you must not touch theirs. The wrapper tags every spawn with the parent session ID, so scoping is automatic. Add `--global` only when the user explicitly asks about the whole machine. `kill <pid>` is always literal.
 
-- `claude-api ps [--global]` — spawned workers with liveness/exit status; FIFO workers additionally show `(busy)` vs `(idle Nm)` (Linux).
-- `claude-api kill <pid>|--all [--global]` — stop runaway workers (Linux: reaps their FIFO keepers too; macOS: run `clean --all` after).
-- `claude-api send <slug> "<msg>" [--wait [secs]]` / `claude-api reply <slug>` — message a FIFO worker / read its last reply (steering section); `questions [--wait]` / `answer <qid> "<text>"` — the question relay (above).
-- `claude-api clean [--all] [--global]` — sweep dead FIFO keepers, stale artifacts, and old questions in the session's worker dir (`--all` also kills live keepers, ending FIFO workers).
+- `claude-api ps [--global]` — spawned workers with liveness/exit status; running `run` workers show `(busy)` vs `(idle Nm)`.
+- `claude-api kill <pid>|--all [--global]` — stop runaway workers immediately (Linux: reaps their supervisors too; macOS: run `clean --all` after); `claude-api end <slug>` is the graceful version.
+- `claude-api send <slug> "<msg>" [--wait [secs]]` / `claude-api reply <slug>` / `claude-api end <slug>` — steer, read, and finish running workers (steering section); `questions [--wait]` / `answer <qid> "<text>"` — the question relay (above).
+- `claude-api clean [--all] [--global]` — sweep dead keepers, stale artifacts, and old questions in the session's worker dir (`--all` also kills live keepers, ending their workers).
 - `claude-api doctor [--ping]` — when spawning misbehaves: checks key, config, hook, symlinks (`--ping` does one live run). `claude-api selftest` — after Claude Code upgrades: re-validates the behaviors this skill depends on (spends a few sonnet runs).
