@@ -16,6 +16,7 @@
 #   3. Floor default: acceptEdits
 #
 # Framework subcommands (handled here, not passed to claude):
+#   claude-api run <slug> "<prompt>" [flags] → one-shot worker; prints the answer on stdout
 #   claude-api ps | kill | clean | send | reply → bin/worker-ctl (worker lifecycle + FIFO I/O)
 #   claude-api ask | questions | answer → bin/worker-ctl (worker→human Q&A relay)
 #   claude-api doctor [--ping]        → bin/doctor       (install health check)
@@ -44,6 +45,63 @@ case "${1:-}" in
   doctor)        shift; exec "$BIN_DIR/doctor" "$@" ;;
   selftest)      shift; exec "$BIN_DIR/selftest" "$@" ;;
   worktree)      shift; exec "$BIN_DIR/worker-worktree" "$@" ;;
+  run)
+    # One-shot worker with Agent-tool ergonomics: a single (background) Bash
+    # call; stdout of the finished command IS the worker's answer, so the
+    # harness completion notification delivers it. Full JSON + stderr are kept
+    # in the session worker dir for debugging/resume.
+    shift
+    slug="${1:?usage: claude-api run <slug> \"<prompt>\" [extra claude flags]}"; shift
+    prompt="${1:?usage: claude-api run <slug> \"<prompt>\" [extra claude flags]}"; shift || true
+    case "$slug" in
+      *[!A-Za-z0-9._-]*) echo "claude-api run: slug must match [A-Za-z0-9._-]" >&2; exit 2 ;;
+    esac
+    if [ "$PWD" = "$HOME" ]; then
+      echo "claude-api run: refusing to spawn from \$HOME (the worker sandbox would cover your whole home dir) — cd into the target repo or a scratch dir" >&2
+      exit 2
+    fi
+    WDIR="${CLAUDE_API_CONFIG_DIR:-$HOME/.claude-api}/run/workers/${CLAUDE_CODE_SESSION_ID:-manual}"
+    mkdir -p "$WDIR"
+    rc=0
+    "$SRC" -p "$prompt" --output-format json "$@" \
+      > "$WDIR/$slug.json" 2> "$WDIR/$slug.err" < /dev/null || rc=$?
+    exec python3 - "$WDIR/$slug.json" "$WDIR/$slug.err" "$slug" "$rc" <<'PYEOF'
+import json, sys, time, os
+out, err, slug, rc = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+try:
+    with open(out) as f:
+        d = json.load(f)
+except Exception:
+    d = None
+ok = rc == 0 and d is not None and not d.get("is_error") and d.get("subtype") == "success"
+if ok:
+    print(d.get("result") or "")
+    sid, cost = d.get("session_id", "?"), d.get("total_cost_usd")
+    coststr = f"${cost:.2f}" if isinstance(cost, (int, float)) else "?"
+    print(f'[worker {slug}: {coststr} · resume: claude-api --resume {sid} -p "<follow-up>" --output-format json · json: {out}]',
+          file=sys.stderr)
+    try:
+        with open(os.path.expanduser("~/.claude-api/cost-log.jsonl"), "a") as f:
+            f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                                "task": slug, "cost": cost, "session": sid}) + "\n")
+    except OSError:
+        pass
+    sys.exit(0)
+subtype = d.get("subtype") if d else "unparseable-or-empty-json"
+print(f"worker {slug} FAILED (exit {rc}, subtype: {subtype}) — respin with a sharper prompt or resume; see {out}",
+      file=sys.stderr)
+if d and d.get("result"):
+    print(f"partial result:\n{d['result']}", file=sys.stderr)
+try:
+    with open(err) as f:
+        tail = f.read()[-2000:]
+    if tail.strip():
+        print(f"stderr tail:\n{tail}", file=sys.stderr)
+except OSError:
+    pass
+sys.exit(1)
+PYEOF
+    ;;
 esac
 
 # Meta calls pass through without mode injection, ledger, or a hard key requirement.

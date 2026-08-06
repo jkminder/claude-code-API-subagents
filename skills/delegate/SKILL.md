@@ -13,13 +13,20 @@ description: Delegate work to API-billed Claude Code workers or swarms. Worker t
 
 ## When to delegate
 
-**Default to yes for anything nontrivial:** multi-file work, long build/test/fix loops, bulk research or generation, independent verification passes, exploratory spikes — and fan out in parallel whenever subtasks are independent. If the task is too big or too vague to split up front, delegate the splitting as well (see *Delegate the decomposition too*). Keep in the main session only: quick single-file edits, tasks needing the user's input mid-flight, and work so context-coupled that briefing a worker costs more than doing it. The built-in Task tool remains for fast in-context fan-out — it bills the subscription, so prefer workers when either would do and the job is sizable.
+**Default to yes for anything nontrivial:** multi-file work, long build/test/fix loops, bulk research or generation, independent verification passes, exploratory spikes — and fan out in parallel whenever subtasks are independent. If the task is too big or too vague to split up front, delegate the splitting as well (see *Delegate the decomposition too*). Keep in the main session only: quick single-file edits, tasks needing the user's input mid-flight, and work so context-coupled that briefing a worker costs more than doing it. The built-in Task/Agent tool bills the subscription — reserve it for quick context-coupled lookups (e.g. Explore searches in the current repo); for sizable self-contained jobs use a worker. **Convenience is not a reason to pick the Agent tool: `claude-api run` (below) is the same effort — one background Bash call, and the answer arrives in the completion notification.**
 
 ## Spawning workers
 
 **Always spawn via background Bash** (`run_in_background`) so this session stays free — you'll be notified when the command completes. Run **from the target repo directory** (cwd defines the worker's project and its sandbox-writable workspace). For non-repo work (research, generation), create and `cd` into a scratch directory — never spawn from `$HOME`, which would make the whole home dir writable under `acceptEdits`.
 
-Worker outputs live in **this session's private worker dir** — set it once per Bash call:
+**Default form — `run` (one-shot):** a single background Bash call; the worker's answer is the command's stdout, so it arrives in the completion notification with no files to parse:
+
+```bash
+cd <target-repo> && claude-api run <slug> "<self-contained task prompt>"
+```
+
+- Exit 0 → stdout is the answer (a stderr footer gives cost, the resume handle, and the raw-JSON path). Exit 1 → a `FAILED` line with the failure subtype, any partial result, and the worker's stderr tail; respin or resume. Extra flags pass through after the prompt: `claude-api run <slug> "<task>" --model sonnet --allowedTools "Bash(git push *)"`.
+- The plumbing form behind `run` — use it only for the streaming/FIFO variants below, which need explicit redirection:
 
 ```bash
 WDIR="$HOME/.claude-api/run/workers/${CLAUDE_CODE_SESSION_ID:-manual}" && mkdir -p "$WDIR"
@@ -68,9 +75,11 @@ After collecting and merging results: `claude-api worktree clean` removes merged
 
 ## Collecting results
 
-You'll be notified when the background spawn exits. **Check for failure before trusting the output** — any of these means the run failed: nonzero exit code of the background command, empty or unparseable `$WDIR/<slug>.json`, or `.is_error == true` / `.subtype != "success"` in it. On failure, read `$WDIR/<slug>.err` — but know a worker can die mid-stream with `subtype: "error_during_execution"`, `result: null`, and an *empty* `.err`; that's a connection drop, not your prompt. Either way, respin with a sharper prompt or resume (below) — respinning is cheap, don't hesitate.
+You'll be notified when the background spawn exits.
 
-On success, summarize `.result` for the user. **`.session_id` is the resume handle** (for stream-json workers it's in the initial `system`/`init` line of the `.ndjson`). Best-effort log (skip if `jq` is absent):
+**`run` workers:** the notification's output already contains the answer (stdout) or a `FAILED` diagnosis (stderr) — nothing to fetch or parse. Success is also logged to `~/.claude-api/cost-log.jsonl` automatically; the stderr footer has the resume handle.
+
+**Plumbing-form workers (`-p` with redirection):** check for failure before trusting the output — any of these means the run failed: nonzero exit code of the background command, empty or unparseable `$WDIR/<slug>.json`, or `.is_error == true` / `.subtype != "success"` in it. On failure, read `$WDIR/<slug>.err` — but know a worker can die mid-stream with `subtype: "error_during_execution"`, `result: null`, and an *empty* `.err`; that's a connection drop, not your prompt. Either way, respin with a sharper prompt or resume (below) — respinning is cheap, don't hesitate. On success, summarize `.result` for the user. **`.session_id` is the resume handle** (for stream-json workers it's in the initial `system`/`init` line of the `.ndjson`). Best-effort log (skip if `jq` is absent):
 
 ```bash
 jq -c '{ts: now|todate, task: "<slug>", cost: .total_cost_usd, session: .session_id}' \
