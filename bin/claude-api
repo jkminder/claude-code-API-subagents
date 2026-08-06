@@ -67,13 +67,34 @@ case "${1:-}" in
       echo "claude-api run: refusing to spawn from \$HOME (the worker sandbox would cover your whole home dir) — cd into the target repo or a scratch dir" >&2
       exit 2
     fi
-    stay=0; rest=()
+    stay=0; allow_dirty=0; rest=()
     for a in "$@"; do
       case "$a" in
         --stay) stay=1 ;;
+        --allow-dirty) allow_dirty=1 ;;
         *) rest+=("$a") ;;
       esac
     done
+    # Dirty-tree guard: a worker spawned into a repo with uncommitted changes
+    # can collide with another session's in-flight work. Refuse and point at
+    # the worktree helper; --allow-dirty overrides (e.g. the changes are the
+    # worker's own input).
+    if [ "$allow_dirty" -eq 0 ] && command -v git >/dev/null 2>&1 \
+       && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      dirty="$(git status --porcelain 2>/dev/null || true)"
+      if [ -n "$dirty" ]; then
+        {
+          echo "claude-api run: refusing to spawn — $(git rev-parse --show-toplevel) has uncommitted changes (another session may be working here):"
+          printf '%s\n' "$dirty" | head -5 | sed 's/^/  /'
+          n=$(printf '%s\n' "$dirty" | wc -l)
+          [ "$n" -gt 5 ] && echo "  ... and $((n - 5)) more"
+          echo "either spawn in an isolated worktree:"
+          echo "  WT=\$(claude-api worktree add $slug) && cd \"\$WT\" && claude-api run $slug \"<task>\""
+          echo "or pass --allow-dirty to run in this tree anyway."
+        } >&2
+        exit 2
+      fi
+    fi
     WDIR="$CONFIG_DIR/run/workers/${CLAUDE_CODE_SESSION_ID:-manual}"
     mkdir -p "$WDIR"
     if [ -e "$WDIR/$slug.ndjson" ] || [ -e "$WDIR/$slug.json" ]; then
@@ -348,25 +369,55 @@ if last_result is not None and isinstance(last_result.get("session_id"), str):
     sid = last_result["session_id"]
 sid = sid or "?"
 
-ok = rc == 0 and last_result is not None and not last_result.get("is_error") and last_result.get("subtype") == "success"
+subtype = "no-result-line" if last_result is None else (last_result.get("subtype") or "?")
+cost = last_result.get("total_cost_usd") if last_result is not None else None
+coststr = "$%.2f" % cost if isinstance(cost, (int, float)) else "?"
+result_text = last_result.get("result") if last_result is not None else None
+
+# An empty result with subtype "success" is never a real success: the CLI
+# ended the run without the model producing a final answer. Seen when the
+# worker parks itself (ScheduleWakeup / waiting on background tasks — headless
+# workers get no wakeups; stop_reason "tool_use") or a limit stops the run.
+ok = (rc == 0 and last_result is not None and not last_result.get("is_error")
+      and last_result.get("subtype") == "success" and bool(result_text))
+
+cause = None
+stl = subtype.lower()
+stop_reason = last_result.get("stop_reason") if last_result is not None else None
+if "budget" in stl or "max_cost" in stl or "cost_limit" in stl:
+    cause = "BUDGET CAP HIT — --max-budget-usd / CLAUDE_API_MAX_BUDGET_USD ended the run at %s" % coststr
+elif "max_turn" in stl:
+    cause = "TURN LIMIT HIT (--max-turns)"
+elif not ok and subtype == "success" and not result_text:
+    if stop_reason == "tool_use":
+        cause = ("WORKER PARKED ITSELF (stop_reason tool_use) — it ended its turn on "
+                 "ScheduleWakeup or an unfinished background task; headless workers are "
+                 "never re-invoked. Respin with: do the work in this turn, no wakeups.")
+    else:
+        cause = ("EMPTY RESULT despite subtype success — possibly a limit stop "
+                 "(--max-budget-usd/CLAUDE_API_MAX_BUDGET_USD or --max-turns); cost was %s" % coststr)
+
+try:
+    with open(os.path.join(cfg, "cost-log.jsonl"), "a", encoding="utf-8") as f:
+        entry = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                 "task": slug, "cost": cost, "session": sid}
+        if not ok:
+            entry["failed"] = "empty-result" if subtype == "success" else subtype
+        f.write(json.dumps(entry) + "\n")
+except OSError:
+    pass
+
 if ok:
-    print(last_result.get("result") or "")
-    cost = last_result.get("total_cost_usd")  # cumulative across turns — last line is the total
-    coststr = "$%.2f" % cost if isinstance(cost, (int, float)) else "?"
+    print(result_text)
     print('[worker %s: %s · %d turn(s) · resume: claude-api --resume %s -p "<follow-up>" --output-format json · ndjson: %s]'
           % (slug, coststr, n_results, sid, nd), file=sys.stderr)
-    try:
-        with open(os.path.join(cfg, "cost-log.jsonl"), "a", encoding="utf-8") as f:
-            f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                                "task": slug, "cost": cost, "session": sid}) + "\n")
-    except OSError:
-        pass
     sys.exit(0)
-subtype = "no-result-line" if last_result is None else (last_result.get("subtype") or "?")
-print("worker %s FAILED (exit %s, subtype: %s, session: %s) — respin with a sharper prompt or resume; see %s"
-      % (slug, rc, subtype, sid, nd), file=sys.stderr)
-if last_result is not None and last_result.get("result"):
-    print("partial result:\n%s" % last_result["result"], file=sys.stderr)
+print("worker %s FAILED (exit %s, subtype: %s, cost: %s, %d turn(s), session: %s) — respin with a sharper prompt or resume; see %s"
+      % (slug, rc, subtype, coststr, n_results, sid, nd), file=sys.stderr)
+if cause:
+    print("cause: %s" % cause, file=sys.stderr)
+if result_text:
+    print("partial result:\n%s" % result_text, file=sys.stderr)
 try:
     with open(errf, encoding="utf-8", errors="replace") as f:
         tail = f.read()[-2000:]
@@ -462,6 +513,30 @@ for a in "$@"; do
 done
 if [ "$has_settings" -eq 0 ] && [ "$has_model" -eq 0 ]; then
   set -- --settings '{"model": "claude-fable-5"}' "$@"
+fi
+
+# Headless briefing: ScheduleWakeup never fires for a `claude -p` process, and
+# a run closes once its messages are answered — a worker that parks itself on a
+# wakeup or an unfinished background task dies with an empty result. Warn the
+# model up front and hard-deny the tool. Applies to every headless spawn (the
+# run path re-enters here with -p, --stay included; --resume ... -p too), never
+# to interactive ones. A caller-supplied --append-system-prompt or
+# --disallowedTools suppresses the matching injection (no merging).
+headless=0 has_sysprompt=0 has_disallowed=0
+for a in "$@"; do
+  case "$a" in
+    -p|--print) headless=1 ;;
+    --append-system-prompt|--append-system-prompt=*) has_sysprompt=1 ;;
+    --disallowedTools|--disallowedTools=*) has_disallowed=1 ;;
+  esac
+done
+if [ "$headless" -eq 1 ]; then
+  if [ "$has_disallowed" -eq 0 ]; then
+    set -- --disallowedTools ScheduleWakeup "$@"
+  fi
+  if [ "$has_sysprompt" -eq 0 ]; then
+    set -- --append-system-prompt 'You are a headless worker (claude -p). ScheduleWakeup never fires for you — never call it. Notifications from your own background Bash tasks and subagents reach you only while this run is alive; never end your turn with work pending on a wakeup or an unfinished background task. Finish the job within your turn; wait on external state with bounded foreground polls, in short chunks (~60 s per tool call, a loop of short sleeps rather than one long one) — messages sent to you mid-run surface at each tool-result boundary, so short calls keep you steerable. Your final message is the run result — end with the concrete answer or report.' "$@"
+  fi
 fi
 
 # No default spend cap: the key bills a flat pool, so a cap would only abort

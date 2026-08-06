@@ -17,7 +17,7 @@ description: Delegate work to API-billed Claude Code workers or swarms. Worker t
 
 ## Spawning workers
 
-**Always spawn via background Bash** (`run_in_background`) so this session stays free — you'll be notified when the command completes. Run **from the target repo directory** (cwd defines the worker's project and its sandbox-writable workspace). For non-repo work (research, generation), create and `cd` into a scratch directory — never spawn from `$HOME`, which would make the whole home dir writable under `acceptEdits`.
+**Always spawn via background Bash** (`run_in_background`) so this session stays free — you'll be notified when the command completes. Run **from the target repo directory** (cwd defines the worker's project and its sandbox-writable workspace). For non-repo work (research, generation), create and `cd` into a scratch directory — never spawn from `$HOME`, which would make the whole home dir writable under `acceptEdits`. If the target tree has uncommitted changes, `run` refuses (exit 2) — another session may be working there; spawn in a worktree (below) or pass `--allow-dirty` when the dirty state is intentional (e.g. the worker's own input).
 
 **The one form — `run`:** a single background Bash call; the worker's answer is the command's stdout, so it arrives in the completion notification with no files to parse:
 
@@ -27,7 +27,7 @@ cd <target-repo> && claude-api run <slug> "<self-contained task prompt>"
 
 Every `run` worker is **steerable while it runs**: `claude-api send <slug> "<follow-up>"` injects messages mid-run (see *Steering a running worker* below). With nothing sent it behaves one-shot — one turn, then it closes and reports.
 
-- Exit 0 → stdout is the answer (a stderr footer gives cost, turn count, the resume handle, and the `.ndjson` path). Exit 1 → a `FAILED` line with the failure subtype, any partial result, and the worker's stderr tail; respin or resume. Extra flags pass through after the prompt: `claude-api run <slug> "<task>" --model sonnet --allowedTools "Bash(git push *)"`.
+- Exit 0 → stdout is the answer, never empty (a stderr footer gives cost, turn count, the resume handle, and the `.ndjson` path). Exit 1 → a `FAILED` line with the failure subtype, cost, a `cause:` line when the cause is known (budget cap, turn limit, worker parked itself), any partial result, and the worker's stderr tail; respin or resume. Exit 2 → refused before spawning (bad usage, `$HOME` cwd, or a dirty tree — see above). Extra flags pass through after the prompt: `claude-api run <slug> "<task>" --model sonnet --allowedTools "Bash(git push *)"`.
 - `--stay` keeps the worker alive between turns — it idles waiting for the next `send` until `claude-api end <slug>` or death. Use it for monitors, babysitters, and any standing worker. Without `--stay` the run closes once every message it received has been answered.
 - No default spend cap (the key bills a flat pool). For a run you want bounded — e.g. an experimental loop that could spin — pass `--max-budget-usd <n>` yourself, or set `CLAUDE_API_MAX_BUDGET_USD` to give every headless run a default ceiling.
 - Pick a slug unique **within this session** (the dir is per-session, so no cross-session collisions; `run` warns before overwriting a reused slug, and refuses a slug whose worker is still alive).
@@ -59,7 +59,7 @@ Make the mandate explicit in the worker's prompt:
 
 ### Parallel workers on the same repo → worktrees
 
-If more than one worker will modify the same repo (or the tree is dirty), isolate each in its own worktree — **created by this session before spawning** (workers can't: `git worktree add` writes outside their sandbox):
+If more than one worker will modify the same repo, or the tree is dirty (where `run` refuses to spawn by default), isolate each worker in its own worktree — **created by this session before spawning** (workers can't: `git worktree add` writes outside their sandbox):
 
 ```bash
 WT=$(claude-api worktree add <slug>)   # prints the worktree path; branch worker/<slug>
@@ -70,9 +70,9 @@ After collecting and merging results: `claude-api worktree clean` removes merged
 
 ## Collecting results
 
-You'll be notified when the background spawn exits. The notification's output already contains the answer (stdout) or a `FAILED` diagnosis (stderr) — nothing to fetch or parse. Success is also logged to `~/.claude-api/cost-log.jsonl` automatically; the stderr footer has the resume handle and the `.ndjson` path.
+You'll be notified when the background spawn exits. The notification's output already contains the answer (stdout) or a `FAILED` diagnosis (stderr) — nothing to fetch or parse. Every finished run is logged to `~/.claude-api/cost-log.jsonl` automatically (failures carry a `"failed"` field); the stderr footer has the resume handle and the `.ndjson` path.
 
-On failure, know that a worker can die mid-stream with subtype `error_during_execution` and an empty `.err` — that's a connection drop, not your prompt (`no-result-line` means it died before finishing even one turn). Respin with a sharper prompt or resume (below) — respinning is cheap, don't hesitate.
+On failure, know that a worker can die mid-stream with subtype `error_during_execution` and an empty `.err` — that's a connection drop, not your prompt (`no-result-line` means it died before finishing even one turn). A `cause: WORKER PARKED ITSELF` failure means the worker ended its turn on a scheduled wakeup or an unfinished background task — headless workers are never re-invoked; respin telling it to finish in one turn without wakeups. The wrapper already guards against this at spawn: every headless run gets a briefing via `--append-system-prompt` (no wakeups, finish within the turn) plus `--disallowedTools ScheduleWakeup`; passing either flag yourself suppresses the matching injection. Respin with a sharper prompt or resume (below) — respinning is cheap, don't hesitate.
 
 ## Permissions
 
@@ -94,7 +94,7 @@ Any `run` worker accepts messages while it runs — no special spawn form. Spawn
 
 **The worker is turn-based.** Each message starts a turn; the turn ends with a `"type":"result"` line in the `.ndjson` — one **per turn**, so a result does *not* mean the session ended — and the worker then idles until the next message. It cannot wake itself, but task notifications from its own background Bash, Monitor, and subagent completions do start new turns. Consequences:
 
-- **A monitor/babysitter worker goes idle after answering unless a wake source is armed.** Put in its initial prompt: "You are steerable — I may send follow-up instructions; finish each, then continue your standing task. Never end a turn while <watched thing> is unfinished unless a wake source is armed that is guaranteed to fire — poll job *state* with a timeout; a queued job writes no logs, so log-tailing alone sleeps forever." If it goes quiet anyway, nudge: `claude-api send <slug> "status? resume monitoring"`.
+- **A monitor/babysitter worker goes idle after answering unless a wake source is armed.** Put in its initial prompt: "You are steerable — I may send follow-up instructions; finish each, then continue your standing task. Never end a turn while <watched thing> is unfinished unless a wake source is armed that is guaranteed to fire — poll job *state* with a timeout; a queued job writes no logs, so log-tailing alone sleeps forever. Poll in short chunks (~60 s per tool call) — my messages reach you at each tool-result boundary, so one long call makes you unsteerable for its whole duration." If it goes quiet anyway, nudge: `claude-api send <slug> "status? resume monitoring"`.
 - **One outstanding instruction at a time:** a message sent mid-turn may be folded into the in-flight turn and answered in the same result instead of getting its own turn — a `send --wait` can therefore return a merged (or even earlier) reply. (A non-`--stay` run notices the shortfall, waits 120 s, then closes with a loud "unaccounted" warning rather than hanging.)
 
 Messaging — use the helpers (`<slug>` resolves in this session's worker dir; explicit paths also work). They JSON-encode for you and fail loudly instead of blocking forever when the worker is dead:
