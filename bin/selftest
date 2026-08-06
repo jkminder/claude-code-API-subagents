@@ -33,7 +33,7 @@ step() { echo; echo "== $1"; }
 ok()   { echo "   PASS"; }
 bad()  { echo "   FAIL: $1"; fails=$((fails + 1)); }
 
-step "1/4 basic headless run + JSON output"
+step "1/5 basic headless run + JSON output"
 SID=""
 if "$CA" -p 'Reply with exactly: SELFTEST OK' --model sonnet --output-format json > t1.json 2> t1.err \
    && python3 -c 'import json;d=json.load(open("t1.json"));assert not d.get("is_error");assert "SELFTEST OK" in d["result"]' 2>/dev/null; then
@@ -43,7 +43,7 @@ else
   bad "basic run (t1.err)"
 fi
 
-step "2/4 --resume continuity"
+step "2/5 --resume continuity"
 if [ -n "$SID" ] \
    && "$CA" --resume "$SID" -p 'What exact phrase did you reply with earlier? Answer with just the phrase.' --model sonnet --output-format json > t2.json 2> t2.err \
    && python3 -c 'import json;assert "SELFTEST OK" in json.load(open("t2.json"))["result"]' 2>/dev/null; then
@@ -52,20 +52,21 @@ else
   bad "resume (t2.err)"
 fi
 
-step "3/4 acceptEdits floor: file creation"
+step "3/5 acceptEdits floor: file creation"
 mkdir -p edit && ( cd edit && "$CA" -p 'Create a file named hello.txt in the current directory containing exactly: selftest file
 Then reply DONE.' --model sonnet --output-format json > ../t3.json 2> ../t3.err )
 if [ "$(cat edit/hello.txt 2>/dev/null)" = "selftest file" ]; then ok; else bad "file not created (t3.err)"; fi
 
-step "4/4 FIFO streaming: envelope + mid-run input + clean shutdown"
+step "4/5 FIFO streaming: envelope + send helper + clean shutdown"
 mkfifo w.in
 tail -f /dev/null > w.in & keeper=$!
 touch w.ndjson
 "$CA" -p --input-format stream-json --output-format stream-json --verbose --model sonnet < w.in > w.ndjson 2> w.err & worker=$!
 printf '%s\n' '{"type":"user","message":{"role":"user","content":"Reply with exactly: FIRST"}}' > w.in
 if wait_for w.ndjson '"type":"assistant".*FIRST' 180; then
-  printf '%s\n' '{"type":"user","message":{"role":"user","content":"Now reply with exactly: SECOND"}}' > w.in
-  if wait_for w.ndjson '"type":"assistant".*SECOND' 180; then
+  # mid-run injection via the send helper (validates envelope, ENXIO check, delivery probe)
+  if "$CA" send ./w.in 'Now reply with exactly: SECOND' > /dev/null 2>&1 \
+     && wait_for w.ndjson '"type":"assistant".*SECOND' 180; then
     kill "$keeper" 2>/dev/null
     if wait_for w.ndjson '"type":"result"' 60; then ok; else bad "no result event after closing stdin (w.err)"; fi
   else
@@ -79,9 +80,34 @@ fi
 kill "$worker" 2>/dev/null
 wait 2>/dev/null
 
+step "5/5 worker→human question relay (ask grant + questions + answer)"
+"$CA" -p 'Run exactly this shell command with your Bash tool (set the tool call timeout to 120000 ms) and wait for it: claude-api ask --from selftest --timeout 90 "Reply with exactly: GRANTED". Then reply with exactly: GOT=<its stdout>.' \
+  --model sonnet --allowedTools 'Bash(claude-api ask:*)' --output-format json > t5.json 2> t5.err & qworker=$!
+qid=""
+i=0
+while [ "$i" -lt 90 ]; do
+  qid="$("$CA" questions 2>/dev/null | sed -n 's/^\[\(.*\)\] from=selftest.*/\1/p' | head -1)"
+  [ -n "$qid" ] && break
+  sleep 1; i=$((i + 1))
+done
+if [ -n "$qid" ] && "$CA" answer "$qid" "GRANTED" > /dev/null \
+   && wait "$qworker" \
+   && python3 -c 'import json;r=json.load(open("t5.json"))["result"];assert "GOT" in r and "GRANTED" in r' 2>/dev/null; then
+  ok
+else
+  [ -z "$qid" ] && bad "no question arrived — ask grant syntax may have changed (t5.err)" \
+                || bad "answer did not flow back (t5.json / t5.err)"
+fi
+kill "$qworker" 2>/dev/null
+wait 2>/dev/null
+# Never leave selftest questions behind — a stale .q re-fires the runner's watcher.
+QD="${CLAUDE_API_CONFIG_DIR:-$HOME/.claude-api}/run/workers/${CLAUDE_CODE_SESSION_ID:-}/questions"
+[ -n "${CLAUDE_CODE_SESSION_ID:-}" ] || QD="${CLAUDE_API_CONFIG_DIR:-$HOME/.claude-api}/run/questions"
+rm -f "$QD"/selftest-*.q "$QD"/selftest-*.a 2>/dev/null || true
+
 echo
 if [ "$fails" -eq 0 ]; then
-  echo "selftest: all 4 checks passed"
+  echo "selftest: all 5 checks passed"
 else
   echo "selftest: $fails check(s) FAILED"
 fi

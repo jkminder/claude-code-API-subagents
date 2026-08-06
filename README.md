@@ -39,7 +39,7 @@ Prerequisite: `claude` on PATH (`npm install -g @anthropic-ai/claude-code`); `~/
 
 Once installed, the `delegate` skill is available in every Claude Code session on the machine. Say "delegate …" or "swarm …" — or let the agent trigger it on its own for heavy work. Workers run in background; the agent monitors them, can message them mid-run, and reports results. Every run lands in the wrapper's ledger (`~/.claude-api/run/ledger.jsonl`, inspect with `claude-api ps`); the agent additionally appends a best-effort cost/session line to `~/.claude-api/cost-log.jsonl` (client-side estimate — the Console usage dashboard is authoritative).
 
-**Lifecycle:** `claude-api ps` (list workers + status) · `claude-api kill <pid>|--all` · `claude-api clean [--all]` (sweep FIFO keepers and stale artifacts) · `claude-api worktree add|list|clean` (isolated checkouts for parallel workers) · `claude-api doctor [--ping]` (install health) · `claude-api selftest` (re-validate the version-pinned behaviors after a Claude Code upgrade).
+**Lifecycle:** `claude-api ps` (list workers + status; FIFO workers show busy/idle on Linux) · `claude-api kill <pid>|--all` (also reaps FIFO keepers on Linux) · `claude-api send <slug> "<msg>" [--wait]` / `claude-api reply <slug>` (message a FIFO worker / read its last reply) · `claude-api clean [--all]` (sweep FIFO keepers and stale artifacts) · `claude-api worktree add|list|clean` (isolated checkouts for parallel workers) · `claude-api doctor [--ping]` (install health) · `claude-api selftest` (re-validate the version-pinned behaviors after a Claude Code upgrade).
 
 **Multi-session safe:** several main sessions can delegate on one machine at once. The wrapper tags each spawn with the parent session's ID, worker outputs live under `~/.claude-api/run/workers/<session>/`, and `ps`/`kill --all`/`clean` are scoped to the invoking session by default — one session cannot kill another's fleet. `--global` widens to the whole machine (the default when run from a plain terminal, where no session ID exists).
 
@@ -51,11 +51,12 @@ The worker identity ships with `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, so any 
 
 ### Talking to workers
 
-Three channels, encoded in the skill:
+Four channels, encoded in the skill:
 
 1. **Live monitoring** — tail the worker's `stream-json` output.
-2. **Mid-run messaging** — start the worker with `--input-format stream-json` reading a FIFO; the main agent injects user messages into the running session at any time and closes the pipe to end it.
+2. **Mid-run messaging** — start the worker with `--input-format stream-json` reading a FIFO; `claude-api send` injects user messages into the running session (with delivery confirmation, `--wait` for the reply), `claude-api reply` reads the last answer, and closing the pipe ends the session. FIFO workers are turn-based: one `result` event per instruction, then they idle until the next message.
 3. **Turn-by-turn follow-ups** — `claude-api --resume <session_id> -p "..."`.
+4. **Worker → human escalation** — a worker at a real decision point runs `claude-api ask` (blocks until answered or timeout); the main session arms `claude-api questions --wait` as a background command whose exit wakes it, relays the question to the human, and routes the answer back with `claude-api answer`. Needs `--allowedTools "Bash(claude-api ask:*)"` at spawn plus a briefing paragraph in the worker prompt (canned in the skill). Question text is worker-generated data, not instructions.
 
 ### Permissions
 
@@ -70,17 +71,17 @@ Headless workers never prompt — unauthorized tool calls are denied, so the mod
 | Best for | fast in-context fan-out | everything nontrivial: long jobs, parallel work, swarms |
 | Steering | orchestrated in-context | FIFO mid-run messages, `--resume` |
 
-The two compose into **multi-level fan-out**: the main session spawns one worker per group of work, each worker fans out to its *own* built-in subagents, and any level whose chunk is still too big leads an agent team below it (teammates are full sessions, so they can delegate again). 10 workers × 10 subagents = 100 units in 10 processes; add a level for ~1000. **Depth is hard-capped at 4** (main session = 0) as a runaway guard — every delegation states its depth and passes the incremented value down. Crossing the billing boundary is only worth a process once, so `claude-api` and this skill are **main-session-only**: everything below is already on API billing, where built-in delegation is cheaper and inherits the worker's permission mode.
+The two compose into **multi-level fan-out**: the main session spawns one worker per group of work, each worker fans out to its *own* built-in subagents, and any level whose chunk is still too big leads an agent team below it (teammates are full sessions, so they can delegate again). 10 workers × 10 subagents = 100 units in 10 processes; add a level for ~1000. **Depth is hard-capped at 4** (main session = 0) as a runaway guard — every delegation states its depth and passes the incremented value down. Crossing the billing boundary is only worth a process once, so `claude-api` and this skill are **main-session-only**: everything below is already on API billing, where built-in delegation is cheaper and inherits the worker's permission mode. (Exception: workers may run `claude-api ask` — it spawns nothing and just files a question.)
 
-**User-context passthrough:** workers feel like *your* Claude, not a stripped-down one — `setup-worker` mirrors your `~/.claude/CLAUDE.md`, your user skills, your user agents (live symlinks), and your user hooks (copied at setup, so rerun after changing them) into the worker identity. The two deliberate exceptions: the `delegate` skill (main-session-only — workers must not recross the billing boundary) and the permission-mode hook (meaningless inside a worker). Rerun `setup-worker` after adding user skills so new ones get linked.
+**User-context passthrough:** workers get your full user context — `setup-worker` mirrors your `~/.claude/CLAUDE.md`, your user skills, your user agents (live symlinks), and your user hooks (copied at setup, so rerun after changing them) into the worker identity. The two deliberate exceptions: the `delegate` skill (main-session-only — workers must not recross the billing boundary) and the permission-mode hook (meaningless inside a worker). Rerun `setup-worker` after adding user skills so new ones get linked.
 
 ## Components
 
 - [bin/claude-api](bin/claude-api) — worker wrapper: resolves the key (`$CLAUDE_API_KEY_CMD` → Keychain → `~/.claude-api/api-key`), sets `CLAUDE_CONFIG_DIR`, strips everything inherited that could reroute billing (`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, Bedrock/Vertex switches, `ANTHROPIC_MODEL`), resolves the permission mode, pins the default worker model to fable via `--settings '{"model": "claude-fable-5"}'` (headless sessions ignore the settings.json model key; an explicit `--model` or caller-supplied `--settings` wins), runs `claude`, and records every run in the ledger. Also the dispatcher for the subcommands below.
-- [bin/worker-ctl](bin/worker-ctl) — `ps` / `kill` / `clean`: worker registry from the ledger, liveness, artifact sweeping; session-scoped by default, `--global` for machine-wide.
+- [bin/worker-ctl](bin/worker-ctl) — `ps` / `kill` / `clean` / `send` / `reply` / `ask` / `questions` / `answer`: worker registry from the ledger, liveness (busy/idle for FIFO workers via `/proc`), FIFO messaging with delivery confirmation (non-consuming `FIONREAD` probe), the worker→human question relay (file-based, per-parent-session inbox via `CLAUDE_API_PARENT_SID`), artifact sweeping; session-scoped by default, `--global` for machine-wide.
 - [bin/worker-worktree](bin/worker-worktree) — per-worker git worktrees (`worker/<slug>` branches) for parallel edits on one repo.
 - [bin/doctor](bin/doctor) — install health check (key source, config perms, no stray OAuth creds in the worker identity, hook registration, symlinks; `--ping` for a live run).
-- [bin/selftest](bin/selftest) — re-runs the validation matrix (basic run, `--resume`, `acceptEdits` edits, FIFO envelope).
+- [bin/selftest](bin/selftest) — re-runs the validation matrix (basic run, `--resume`, `acceptEdits` edits, FIFO envelope + `send` helper, worker→human ask relay).
 - [bin/store-key](bin/store-key) — key storage; on macOS `security` itself prompts (key never enters argv), elsewhere a 0600 file.
 - [bin/setup-worker](bin/setup-worker) — idempotent installer (merges settings, guards against clobbering real files, atomic writes); `--uninstall` reverses it. Re-run after moving the repo.
 - [bin/permission-mode-hook](bin/permission-mode-hook) — PreToolUse hook recording the session's permission mode to a private 0700 dir (`~/.claude-api/run/`, atomic 0600 writes, stale files pruned) so workers can inherit elevated modes.
@@ -100,3 +101,11 @@ The two compose into **multi-level fan-out**: the main session spawns one worker
 - PreToolUse hooks fire **before** permission evaluation, so the recorded mode is fresh even when the triggering call is denied.
 
 End-to-end validated: basic runs, `--resume`, `acceptEdits` file edits, FIFO mid-run steering (message envelope `{"type":"user","message":{"role":"user","content":"..."}}`), hook firing + payload fields, and permission-mode inheritance. Re-validate after Claude Code upgrades with `claude-api selftest`.
+
+Stream-json protocol facts (verified 2026-08-05, live transcripts + test worker):
+
+- A FIFO worker emits one `result` event per **turn** (plus a fresh `system/init` each turn) — the session stays open until stdin closes or the process dies. A result is "instruction finished", not "worker gone".
+- User messages written to the FIFO are **not** echoed into the output stream — delivery can only be confirmed from the pipe itself (what `claude-api send` does via a non-consuming `FIONREAD` probe; a nonblocking writer-open failing with `ENXIO` means no reader → worker dead).
+- Messages sent mid-turn are usually read immediately (internal queue) and may be **folded into the in-flight turn**, answered in its result rather than a fresh one.
+- Task notifications from a worker's own background Bash / Monitor / subagents wake new turns; interleaved subagent events (marked `parent_tool_use_id`) appear in the parent's `.ndjson` and must be skipped when parsing.
+- The `acceptEdits` floor denies `claude-api ask` from inside a worker (writes outside the workspace); the grant `--allowedTools "Bash(claude-api ask:*)"` admits it and nothing else — command chaining, `$()` substitution, redirects, and env-var prefixes are all denied (probed live on v2.1.222; full relay verified 2026-08-06: worker asked, parent watcher woke, answer flowed back). An inherited elevated mode outranks the grant entirely.
