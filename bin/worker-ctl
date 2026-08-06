@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Worker lifecycle manager (dispatched as: claude-api ps | kill | clean | send |
-# reply | ask | questions | answer). Reads the run ledger written by bin/claude-api.
+# reply | end | ask | questions | answer). Reads the run ledger written by bin/claude-api.
 #
 # Q&A relay (worker → human): a worker runs `ask` (blocks until answered or
 # timeout); the parent session arms `questions --wait` as a harness-tracked
@@ -111,8 +111,9 @@ reap_keeper() { # worker-pid
 case "$cmd" in
 ps)
   if [ ! -f "$LEDGER" ]; then echo "no workers recorded yet"; exit 0; fi
-  python3 - "$LEDGER" <<'PY'
+  python3 - "$LEDGER" "$WORKERS_BASE" <<'PY'
 import json, os, stat, sys, time
+workers_base = sys.argv[2]
 scope = os.environ.get("WCTL_SCOPE_SID", "")
 entries, order = {}, []
 for line in open(sys.argv[1]):
@@ -138,6 +139,21 @@ def alive(pid):
         return True
     except OSError:
         return False
+def state_file(e):
+    # run workers maintain <slug>.state (busy/idle + change timestamp) — works
+    # on any platform; legacy FIFO workers fall back to /proc below.
+    slug = e.get("slug")
+    if not slug:
+        return None
+    p = os.path.join(workers_base, e.get("sid") or "manual", slug + ".state")
+    try:
+        st, ts = open(p).read().split()[:2]
+        ts = float(ts)
+    except (OSError, ValueError, IndexError):
+        return None
+    if st == "idle":
+        return "idle %dm" % ((time.time() - ts) / 60)
+    return "busy" if st == "busy" else None
 def fifo_state(pid):
     # FIFO (stream-json stdin) workers only, Linux only: idle = last top-level
     # event in the output file is a per-turn `result` (worker awaits input).
@@ -175,13 +191,16 @@ for key in order[-25:]:
         status = "exit %-3s %4ss" % (x.get("exit"), x.get("secs"))
     elif alive(s["pid"]):
         status = "RUNNING  %3dm" % ((now - s["ts"]) / 60)
-        state = fifo_state(s["pid"])
+        state = state_file(s) or fifo_state(s["pid"])
         if state:
             status += " (%s)" % state
     else:
         status = "DIED (no exit record)"
     sid_col = "" if scope else " [%s]" % (s.get("sid", "")[:8] or "manual")
-    print("%s  pid %-7s %-22s%s %s" % (ts, s["pid"], status, sid_col, s.get("cmd", "")[:80]))
+    label = s.get("cmd", "")[:80]
+    if s.get("slug"):
+        label = "[%s] %s" % (s["slug"], label[:64])
+    print("%s  pid %-7s %-22s%s %s" % (ts, s["pid"], status, sid_col, label))
 PY
   echo
   if [ -n "$WCTL_SCOPE_SID" ]; then
@@ -218,13 +237,14 @@ send)
   fi
   fifo="$(resolve "$slug" .in)"
   if [ ! -p "$fifo" ]; then
-    echo "claude-api send: $fifo is not a FIFO — worker not spawned in steerable form, or already cleaned" >&2
+    echo "claude-api send: $fifo is not a FIFO — worker finished (follow up with --resume), or never spawned via run" >&2
     exit 1
   fi
   WCTL_TEXT="$text" python3 - "$fifo" "${fifo%.in}.ndjson" "$wait_s" <<'PY'
-import array, fcntl, json, os, sys, time
+import array, errno, fcntl, json, os, sys, time
 
 fifo, nd, wait_s = sys.argv[1], sys.argv[2], float(sys.argv[3])
+base = fifo[:-3] if fifo.endswith(".in") else fifo
 text = os.environ["WCTL_TEXT"]
 
 def top_results(path):
@@ -248,26 +268,51 @@ def top_results(path):
 
 anchor, _ = top_results(nd)
 
-# Nonblocking writer-open fails with ENXIO when no process has the read end —
-# i.e. the worker is gone (the keeper holds the WRITE end, so it doesn't mask this).
+payload = (json.dumps(
+    {"type": "user", "message": {"role": "user", "content": text}}) + "\n").encode()
+if len(payload) > 48 * 1024:
+    sys.exit("claude-api send: message too large (%dKB > 48KB) — write it to a file and send the path instead" % (len(payload) // 1024))
+
+# The lock (shared with run's close path) makes existence-check → open → write
+# atomic against run's probe → unlink → close: either this send lands before
+# run's probe (and the accounting keeps the pipe open for its turn), or it runs
+# after the unlink and fails loudly with ENOENT. Never a silent loss.
+lock_fd = os.open(base + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(lock_fd, fcntl.LOCK_EX)
 try:
-    fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
-except OSError:
-    sys.exit("claude-api send: nothing is reading %s — worker dead? (claude-api ps)" % fifo)
-import signal
-def _wtimeout(*_):
-    raise TimeoutError
-signal.signal(signal.SIGALRM, _wtimeout)
-fcntl.fcntl(fd, fcntl.F_SETFL, 0)
-signal.alarm(15)
-try:
-    os.write(fd, (json.dumps(
-        {"type": "user", "message": {"role": "user", "content": text}}) + "\n").encode())
-except TimeoutError:
-    sys.exit("claude-api send: pipe still full after 15s — worker wedged? (claude-api ps)")
+    if not os.path.exists(fifo):
+        sys.exit("claude-api send: %s is gone — worker finished; follow up with: claude-api --resume <sid> -p" % fifo)
+    # Nonblocking writer-open fails with ENXIO when no process has the read end
+    # — i.e. the worker is gone (legacy keepers hold the WRITE end, so they
+    # don't mask this; a run supervisor unlinks the fifo on every exit path).
+    try:
+        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as e:
+        if e.errno == errno.ENXIO:
+            sys.exit("claude-api send: nothing is reading %s — worker dead? (claude-api ps)" % fifo)
+        raise
+    # Nonblocking write loop: abort cleanly only while nothing is written yet;
+    # once the first byte is out, a partial message must be completed (an
+    # abandoned fragment would poison the stream). The long stop is loud.
+    done = 0
+    deadline = time.time() + 15
+    while done < len(payload):
+        try:
+            done += os.write(fd, payload[done:])
+        except BlockingIOError:
+            if done == 0 and time.time() > deadline:
+                sys.exit("claude-api send: pipe full for 15s — worker wedged? nothing was written, message NOT delivered (claude-api ps)")
+            if done > 0 and time.time() > deadline + 105:
+                sys.exit("claude-api send: PARTIAL message stuck in the pipe for 120s — worker wedged; the stream may be corrupted, kill and respin the worker")
+            time.sleep(0.05)
+        except BrokenPipeError:
+            sys.exit("claude-api send: worker closed the pipe mid-write — message lost (worker dying?)")
+    os.close(fd)
+    with open(base + ".sent", "a") as f:
+        f.write("1\n")  # accounting: run closes only after results >= 1 + these
 finally:
-    signal.alarm(0)
-os.close(fd)
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    os.close(lock_fd)
 
 # Non-consuming delivery probe: FIONREAD on a second read-end reports bytes
 # still buffered in the pipe without stealing them (we never call read()).
@@ -336,6 +381,29 @@ print(r if r is not None else json.dumps(last_result))
 if last_top is not last_result:
     print("[worker is mid-turn — a newer reply is in progress]", file=sys.stderr)
 PY
+  ;;
+end)
+  # Graceful end: TERM the pid in <slug>.keeper (the run supervisor — or the
+  # legacy tail-keeper), which closes the worker's stdin; the worker finishes
+  # its current turn and exits, and run postprocesses the answer-so-far.
+  slug="${1:-}"
+  if [ -z "$slug" ]; then echo 'usage: claude-api end <slug|keeper-path>' >&2; exit 1; fi
+  keeper="$(resolve "$slug" .keeper)"
+  if [ ! -f "$keeper" ]; then
+    echo "claude-api end: no keeper file $keeper — worker already finished, or was not spawned via run" >&2
+    exit 1
+  fi
+  kpid="$(tr -dc '0-9' < "$keeper" 2>/dev/null)"
+  if [ -z "$kpid" ]; then
+    echo "claude-api end: malformed keeper file $keeper" >&2
+    exit 1
+  fi
+  if kill -TERM "$kpid" 2>/dev/null; then
+    echo "graceful end signalled (pid $kpid) — the worker finishes its current turn; the answer arrives in the run call's completion notification"
+  else
+    echo "claude-api end: pid $kpid is gone — stale keeper; claude-api clean sweeps it" >&2
+    exit 1
+  fi
   ;;
 ask)
   # Worker side. Blocks until answered; prints the answer on stdout.
@@ -464,7 +532,7 @@ clean)
       base="${k%.keeper}"
       if [ "$f" = "--all" ] && [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
       if [ "$f" = "--all" ] || [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-        rm -f "$k" "$base.in"
+        rm -f "$k" "$base.in" "$base.lock" "$base.sent" "$base.state"
         echo "cleaned $(basename "$base") keeper/FIFO"
       fi
     done
@@ -508,7 +576,7 @@ clean)
   fi
   ;;
 *)
-  echo 'usage: claude-api ps [--global] | kill <pid>|--all [--global] | clean [--all] [--global] | send <slug> "<msg>" [--wait [secs]] | reply <slug> | ask [--from <name>] [--timeout <secs>] "<q>" | questions [--wait [secs]] | answer <qid> "<text>"' >&2
+  echo 'usage: claude-api ps [--global] | kill <pid>|--all [--global] | clean [--all] [--global] | send <slug> "<msg>" [--wait [secs]] | reply <slug> | end <slug> | ask [--from <name>] [--timeout <secs>] "<q>" | questions [--wait [secs]] | answer <qid> "<text>"' >&2
   exit 1
   ;;
 esac

@@ -16,8 +16,8 @@
 #   3. Floor default: acceptEdits
 #
 # Framework subcommands (handled here, not passed to claude):
-#   claude-api run <slug> "<prompt>" [flags] → one-shot worker; prints the answer on stdout
-#   claude-api ps | kill | clean | send | reply → bin/worker-ctl (worker lifecycle + FIFO I/O)
+#   claude-api run <slug> "<task>" [--stay] [flags] → spawn a worker (steerable; one-shot by default)
+#   claude-api ps | kill | clean | send | reply | end → bin/worker-ctl (worker lifecycle + messaging)
 #   claude-api ask | questions | answer → bin/worker-ctl (worker→human Q&A relay)
 #   claude-api doctor [--ping]        → bin/doctor       (install health check)
 #   claude-api selftest               → bin/selftest     (validation matrix; spends credits)
@@ -41,18 +41,25 @@ export CLAUDE_CONFIG_DIR="$CONFIG_DIR"
 
 # Framework subcommands.
 case "${1:-}" in
-  ps|kill|clean|send|reply|ask|questions|answer) exec "$BIN_DIR/worker-ctl" "$@" ;;
+  ps|kill|clean|send|reply|end|ask|questions|answer) exec "$BIN_DIR/worker-ctl" "$@" ;;
   doctor)        shift; exec "$BIN_DIR/doctor" "$@" ;;
   selftest)      shift; exec "$BIN_DIR/selftest" "$@" ;;
   worktree)      shift; exec "$BIN_DIR/worker-worktree" "$@" ;;
   run)
-    # One-shot worker with Agent-tool ergonomics: a single (background) Bash
-    # call; stdout of the finished command IS the worker's answer, so the
-    # harness completion notification delivers it. Full JSON + stderr are kept
-    # in the session worker dir for debugging/resume.
+    # Worker spawn with Agent-tool ergonomics: a single (background) Bash call;
+    # stdout of the finished command IS the worker's answer, so the harness
+    # completion notification delivers it. The worker runs stream-json over a
+    # FIFO that this process creates, holds open, and supervises — so the same
+    # worker is steerable mid-run with `claude-api send` and stays one-shot in
+    # behavior when nothing is sent (one turn, then run closes the pipe and
+    # postprocesses). --stay disables the auto-close: the worker idles between
+    # messages until `claude-api end <slug>` (TERMs this pid, recorded in
+    # <slug>.keeper) or worker death. Close protocol against send (silent-loss
+    # race): flock on <slug>.lock + result-vs-sent accounting + unlink-before-
+    # close; see bin/worker-ctl send for the other half.
     shift
-    slug="${1:?usage: claude-api run <slug> \"<prompt>\" [extra claude flags]}"; shift
-    prompt="${1:?usage: claude-api run <slug> \"<prompt>\" [extra claude flags]}"; shift || true
+    slug="${1:?usage: claude-api run <slug> \"<task>\" [--stay] [extra claude flags]}"; shift
+    prompt="${1:?usage: claude-api run <slug> \"<task>\" [--stay] [extra claude flags]}"; shift || true
     case "$slug" in
       *[!A-Za-z0-9._-]*) echo "claude-api run: slug must match [A-Za-z0-9._-]" >&2; exit 2 ;;
     esac
@@ -60,34 +67,294 @@ case "${1:-}" in
       echo "claude-api run: refusing to spawn from \$HOME (the worker sandbox would cover your whole home dir) — cd into the target repo or a scratch dir" >&2
       exit 2
     fi
+    stay=0; rest=()
+    for a in "$@"; do
+      case "$a" in
+        --stay) stay=1 ;;
+        *) rest+=("$a") ;;
+      esac
+    done
     WDIR="$CONFIG_DIR/run/workers/${CLAUDE_CODE_SESSION_ID:-manual}"
     mkdir -p "$WDIR"
-    if [ -e "$WDIR/$slug.json" ]; then
+    if [ -e "$WDIR/$slug.ndjson" ] || [ -e "$WDIR/$slug.json" ]; then
       echo "claude-api run: note — slug '$slug' was used before in this session; overwriting its artifacts (concurrent same-slug runs would corrupt each other)" >&2
     fi
-    rc=0
-    "$SRC" -p "$prompt" --output-format json ${1+"$@"} \
-      > "$WDIR/$slug.json" 2> "$WDIR/$slug.err" < /dev/null || rc=$?
-    exec python3 - "$WDIR/$slug.json" "$WDIR/$slug.err" "$slug" "$rc" "$CONFIG_DIR" <<'PYEOF'
-import json, sys, time, os
-out, err, slug, rc, cfg = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
+    export CLAUDE_API_RUN_SLUG="$slug"
+    CLAUDE_API_RUN_TASK="$prompt" exec python3 - "$SRC" "$WDIR" "$slug" "$CONFIG_DIR" "$stay" ${rest[@]+"${rest[@]}"} <<'PYEOF'
+import array, errno, fcntl, json, os, signal, stat, subprocess, sys, termios, time
+
+src, wdir, slug, cfg = sys.argv[1:5]
+stay = sys.argv[5] == "1"
+extra = sys.argv[6:]
+task = os.environ.pop("CLAUDE_API_RUN_TASK")
+
+base = os.path.join(wdir, slug)
+fifo, nd, errf = base + ".in", base + ".ndjson", base + ".err"
+lockp, sentp, keeperp, statep = base + ".lock", base + ".sent", base + ".keeper", base + ".state"
+
 for s in (sys.stdout, sys.stderr):
     s.reconfigure(errors="replace")
+def note(msg):
+    print("worker %s: %s" % (slug, msg), file=sys.stderr, flush=True)
+
+# Exclusive FIFO creation. EEXIST → probe: a writable-open succeeding means a
+# live worker reads it (abort — force-creating would cross-wire two runs);
+# ENXIO means a stale leftover from a dead run (safe to replace).
 try:
-    with open(out, encoding="utf-8") as f:
-        d = json.load(f)
-    if not isinstance(d, dict):
-        d = None
-except Exception:
-    d = None
-ok = rc == 0 and d is not None and not d.get("is_error") and d.get("subtype") == "success"
-sid = d.get("session_id", "?") if d else "?"
+    os.mkfifo(fifo)
+except FileExistsError:
+    if not stat.S_ISFIFO(os.stat(fifo).st_mode):
+        sys.exit("claude-api run: %s exists and is not a FIFO — refusing to touch it" % fifo)
+    try:
+        pfd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as e:
+        if e.errno != errno.ENXIO:
+            sys.exit("claude-api run: cannot probe existing %s: %s" % (fifo, e))
+        os.unlink(fifo)
+        os.mkfifo(fifo)
+    else:
+        os.close(pfd)
+        sys.exit("claude-api run: slug '%s' already has a LIVE worker on %s — pick another slug, or end that worker first (claude-api end %s)" % (slug, fifo, slug))
+
+# Open order matters: the nonblocking read probe first (never blocks), then the
+# write end (succeeds because the probe is a reader), then the worker's blocking
+# read open (succeeds because the write end exists). The probe fd is only ever
+# read at the final drain; send's liveness comes from the lock+unlink protocol,
+# not from ENXIO, so holding it persistently is safe — as long as every exit
+# path below unlinks the FIFO promptly.
+probe_rfd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+wfd = os.open(fifo, os.O_WRONLY)
+fcntl.fcntl(wfd, fcntl.F_SETFL, os.O_NONBLOCK)
+lock_fd = os.open(lockp, os.O_RDWR | os.O_CREAT, 0o600)
+
+# .keeper = the pid whose TERM ends the worker gracefully. That is us now:
+# kill/clean/end all compose through it.
+with open(keeperp, "w") as f:
+    f.write("%d\n" % os.getpid())
+open(sentp, "w").close()  # send appends one line per delivered message
+
+cur_state = None
+def set_state(st):
+    global cur_state
+    if st == cur_state:
+        return
+    cur_state = st
+    tmp = statep + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            f.write("%s %d\n" % (st, int(time.time())))
+        os.replace(tmp, statep)
+    except OSError:
+        pass
+
+def sent_count():
+    try:
+        with open(sentp, "rb") as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+
+def fionread():
+    buf = array.array("i", [0])
+    fcntl.ioctl(probe_rfd, termios.FIONREAD, buf)
+    return buf[0]
+
+def lock(timeout=180):
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if time.time() > deadline:
+                return False
+            time.sleep(0.1)
+
+# Turn accounting from complete (newline-terminated) top-level ndjson lines.
+offset, results, last_top = 0, 0, None
+def scan_new():
+    global offset, results, last_top
+    try:
+        with open(nd, "rb") as f:
+            f.seek(offset)
+            data = f.read()
+    except OSError:
+        return
+    cut = data.rfind(b"\n")
+    if cut < 0:
+        return
+    offset += cut + 1
+    for line in data[:cut + 1].splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(e, dict) or e.get("parent_tool_use_id") or not e.get("type"):
+            continue
+        last_top = e["type"]
+        if last_top == "result":
+            results += 1
+    if last_top:
+        set_state("idle" if last_top == "result" else "busy")
+
+fifo_gone = pipe_closed = False
+def close_pipe(force=False):
+    """Locked close handoff. Normal path: close only when every message has its
+    result line AND the pipe is empty. unlink FIRST so a racing send fails with
+    ENOENT instead of writing into a pipe nobody will read; then drain the probe
+    fd and report anything found (must be empty on the normal path)."""
+    global fifo_gone, pipe_closed
+    if pipe_closed:
+        return True
+    got = lock()
+    if not got:
+        note("WARNING: could not take %s within 180s — closing without the lock (a concurrent send may be lost; check its exit status)" % lockp)
+    try:
+        if not force:
+            scan_new()
+            if results < 1 + sent_count() or fionread() != 0:
+                return False
+        else:
+            missing = 1 + sent_count() - results
+            if missing > 0 and not stay:
+                note("WARNING: %d sent message(s) unaccounted at close (no result line for them)" % missing)
+        try:
+            os.unlink(fifo)
+        except OSError:
+            pass
+        fifo_gone = True
+        try:
+            os.close(wfd)
+        except OSError:
+            pass
+        left = b""
+        while True:
+            try:
+                c = os.read(probe_rfd, 65536)
+            except OSError:
+                break
+            if not c:
+                break
+            left += c
+        try:
+            os.close(probe_rfd)
+        except OSError:
+            pass
+        pipe_closed = True
+        if left:
+            note("WARNING: %d bytes of sent message(s) were queued in the pipe and never read by the worker:\n%s"
+                 % (len(left), left.decode("utf-8", "replace")[:2000]))
+        return True
+    finally:
+        if got:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
+shutdown = False
+def _term(signum, frame):
+    global shutdown
+    shutdown = True
+signal.signal(signal.SIGTERM, _term)
+signal.signal(signal.SIGINT, _term)
+
+rc = 1
+try:
+    set_state("busy")
+    # Spawn first, then write the task: the worker's stdout goes DIRECTLY to
+    # the ndjson (ps busy/idle readlinks its fd/1 — no interposed pipe).
+    rfd_child = os.open(fifo, os.O_RDONLY)
+    nd_fd = os.open(nd, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    err_fd = os.open(errf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    child = subprocess.Popen(
+        [src, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"] + extra,
+        stdin=rfd_child, stdout=nd_fd, stderr=err_fd)
+    for fd in (rfd_child, nd_fd, err_fd):
+        os.close(fd)
+
+    # Initial task: nonblocking write loop with a child-alive check — a worker
+    # that crashes at startup must not wedge us in a blocking write. (No EPIPE
+    # can fire while probe_rfd is open, so poll() is the only death signal.)
+    payload = (json.dumps({"type": "user", "message": {"role": "user", "content": task}}) + "\n").encode()
+    done = 0
+    while done < len(payload) and not shutdown:
+        try:
+            done += os.write(wfd, payload[done:])
+        except BlockingIOError:
+            if child.poll() is not None:
+                break
+            time.sleep(0.05)
+
+    # Supervision: poll the ndjson for complete lines (tail --pid -F semantics,
+    # portable) — worker death MUST end this loop; there is deliberately no
+    # inactivity timeout (an `ask` legitimately stalls a turn for many minutes).
+    committed = False
+    hedge_since = None
+    while True:
+        scan_new()
+        child_rc = child.poll()
+        if shutdown and not committed:
+            committed = close_pipe(force=True)  # graceful end: EOF, worker finishes its turn
+        if not committed and not stay and not shutdown and last_top == "result" and results >= 1:
+            committed = close_pipe()
+        if committed:
+            rc = child.wait()
+            break
+        if child_rc is not None:
+            # Worker died without a committed close — make sends fail fast and
+            # report anything stranded in the pipe.
+            close_pipe(force=True)
+            rc = child_rc
+            break
+        # Hedge: idle, pipe empty, but accounting short (a message folded into
+        # an earlier turn, or a result line never came) — after 120s close
+        # anyway; close_pipe(force) prints the loud unaccounted footer.
+        if (not stay and not shutdown and last_top == "result" and results >= 1
+                and fionread() == 0 and results < 1 + sent_count()):
+            if hedge_since is None:
+                hedge_since = time.time()
+            elif time.time() - hedge_since > 120:
+                committed = close_pipe(force=True)
+                continue
+        else:
+            hedge_since = None
+        time.sleep(0.5)
+finally:
+    if not pipe_closed:
+        close_pipe(force=True)  # crash path of run itself: unlink promptly, drain, report
+    for p in (keeperp, statep, sentp, lockp):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+# Postprocess: re-read the ndjson AFTER worker exit (a raced-in message may
+# have produced one more turn than the line that triggered the close).
+last_result, sid, n_results = None, None, 0
+try:
+    with open(nd, "rb") as f:
+        for line in f:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(e, dict) or e.get("parent_tool_use_id"):
+                continue
+            if sid is None and isinstance(e.get("session_id"), str):
+                sid = e["session_id"]
+            if e.get("type") == "result":
+                last_result, n_results = e, n_results + 1
+except OSError:
+    pass
+if last_result is not None and isinstance(last_result.get("session_id"), str):
+    sid = last_result["session_id"]
+sid = sid or "?"
+
+ok = rc == 0 and last_result is not None and not last_result.get("is_error") and last_result.get("subtype") == "success"
 if ok:
-    print(d.get("result") or "")
-    cost = d.get("total_cost_usd")
-    coststr = f"${cost:.2f}" if isinstance(cost, (int, float)) else "?"
-    print(f'[worker {slug}: {coststr} · resume: claude-api --resume {sid} -p "<follow-up>" --output-format json · json: {out}]',
-          file=sys.stderr)
+    print(last_result.get("result") or "")
+    cost = last_result.get("total_cost_usd")  # cumulative across turns — last line is the total
+    coststr = "$%.2f" % cost if isinstance(cost, (int, float)) else "?"
+    print('[worker %s: %s · %d turn(s) · resume: claude-api --resume %s -p "<follow-up>" --output-format json · ndjson: %s]'
+          % (slug, coststr, n_results, sid, nd), file=sys.stderr)
     try:
         with open(os.path.join(cfg, "cost-log.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -95,16 +362,16 @@ if ok:
     except OSError:
         pass
     sys.exit(0)
-subtype = d.get("subtype") if d else "unparseable-or-empty-json"
-print(f"worker {slug} FAILED (exit {rc}, subtype: {subtype}, session: {sid}) — respin with a sharper prompt or resume; see {out}",
-      file=sys.stderr)
-if d and d.get("result"):
-    print(f"partial result:\n{d['result']}", file=sys.stderr)
+subtype = "no-result-line" if last_result is None else (last_result.get("subtype") or "?")
+print("worker %s FAILED (exit %s, subtype: %s, session: %s) — respin with a sharper prompt or resume; see %s"
+      % (slug, rc, subtype, sid, nd), file=sys.stderr)
+if last_result is not None and last_result.get("result"):
+    print("partial result:\n%s" % last_result["result"], file=sys.stderr)
 try:
-    with open(err, encoding="utf-8", errors="replace") as f:
+    with open(errf, encoding="utf-8", errors="replace") as f:
         tail = f.read()[-2000:]
     if tail.strip():
-        print(f"stderr tail:\n{tail}", file=sys.stderr)
+        print("stderr tail:\n%s" % tail, file=sys.stderr)
 except OSError:
     pass
 sys.exit(1)
@@ -197,6 +464,20 @@ if [ "$has_settings" -eq 0 ] && [ "$has_model" -eq 0 ]; then
   set -- --settings '{"model": "claude-fable-5"}' "$@"
 fi
 
+# Cost ceiling: headless workers run unattended — cap the per-run spend unless
+# the caller passes their own --max-budget-usd. The flag only works with
+# --print, so interactive invocations (tmux swarm fallback) are left alone.
+has_budget=0 has_print=0
+for a in "$@"; do
+  case "$a" in
+    --max-budget-usd|--max-budget-usd=*) has_budget=1 ;;
+    -p|--print) has_print=1 ;;
+  esac
+done
+if [ "$has_budget" -eq 0 ] && [ "$has_print" -eq 1 ]; then
+  set -- --max-budget-usd "${CLAUDE_API_MAX_BUDGET_USD:-5}" "$@"
+fi
+
 # Run ledger (read by claude-api ps). Values sanitized to JSON-safe characters.
 mkdir -p "$RUN_DIR" 2>/dev/null || true
 chmod 700 "$RUN_DIR" 2>/dev/null || true
@@ -209,8 +490,9 @@ start_ts="$(date +%s)"
 claude "$@" <&0 &
 child=$!
 trap 'kill -TERM "$child" 2>/dev/null || true' TERM INT
-printf '{"event":"spawn","ts":%s,"pid":%s,"sid":"%s","cwd":"%s","cmd":"%s"}\n' \
-  "$start_ts" "$child" "$(san "${CLAUDE_CODE_SESSION_ID:-}")" "$(san "$PWD")" "$(san "$*")" >> "$LEDGER" 2>/dev/null || true
+# run workers pass the task through the FIFO, not argv — the slug is the label.
+printf '{"event":"spawn","ts":%s,"pid":%s,"sid":"%s","slug":"%s","cwd":"%s","cmd":"%s"}\n' \
+  "$start_ts" "$child" "$(san "${CLAUDE_CODE_SESSION_ID:-}")" "$(san "${CLAUDE_API_RUN_SLUG:-}")" "$(san "$PWD")" "$(san "$*")" >> "$LEDGER" 2>/dev/null || true
 rc=0
 wait "$child" || rc=$?
 printf '{"event":"exit","ts":%s,"pid":%s,"exit":%s,"secs":%s}\n' \
