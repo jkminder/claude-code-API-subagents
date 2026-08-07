@@ -476,6 +476,21 @@ if [ -z "${CLAUDE_API_PARENT_SID:-}" ] && [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; 
   export CLAUDE_API_PARENT_SID="$CLAUDE_CODE_SESSION_ID"
 fi
 
+# Native discovery: name the worker session after its run slug so it shows up
+# in ListAgents and is addressable with SendMessage (requires the shared
+# sessions registry — see setup-worker). An explicit -n/--name wins.
+if [ -n "${CLAUDE_API_RUN_SLUG:-}" ]; then
+  has_name=0
+  for a in "$@"; do
+    case "$a" in
+      -n|--name|--name=*) has_name=1 ;;
+    esac
+  done
+  if [ "$has_name" -eq 0 ]; then
+    set -- -n "$CLAUDE_API_RUN_SLUG" "$@"
+  fi
+fi
+
 # Permission mode: explicit flag > inherited elevated parent mode > acceptEdits.
 explicit=0
 for a in "$@"; do

@@ -145,6 +145,28 @@ JSON
   echo "wrote $CONFIG_DIR/settings.json (python3 absent: created, will not merge on rerun)"
 fi
 
+# Shared session registry: workers register their live session (pid, name,
+# messaging socket) in $CONFIG_DIR/sessions; interactive sessions read
+# ~/.claude/sessions. Symlinking the former to the latter makes workers show
+# up in ListAgents and addressable by slug with SendMessage (bin/claude-api
+# names run workers after their slug). Entries are per-pid files that each
+# session removes on exit, so sharing the dir is safe.
+if [ ! -L "$CONFIG_DIR/sessions" ]; then
+  mkdir -p "$HOME/.claude/sessions"
+  if [ -d "$CONFIG_DIR/sessions" ]; then
+    for f in "$CONFIG_DIR/sessions"/*.json; do
+      [ -e "$f" ] && mv "$f" "$HOME/.claude/sessions/" 2>/dev/null
+    done
+    rmdir "$CONFIG_DIR/sessions" 2>/dev/null || true
+  fi
+  if [ -e "$CONFIG_DIR/sessions" ]; then
+    echo "WARNING: $CONFIG_DIR/sessions could not be replaced with a symlink — native worker discovery disabled" >&2
+  else
+    ln -s "$HOME/.claude/sessions" "$CONFIG_DIR/sessions"
+    echo "worker session registry shared with ~/.claude/sessions (workers appear in ListAgents)"
+  fi
+fi
+
 # Skip first-run onboarding so headless -p runs work out of the box.
 if [ ! -f "$CONFIG_DIR/.claude.json" ]; then
   printf '{"hasCompletedOnboarding": true}\n' > "$CONFIG_DIR/.claude.json"

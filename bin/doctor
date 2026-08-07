@@ -62,6 +62,12 @@ else
   ok "no OAuth credentials in the worker identity"
 fi
 
+if [ -L "$CONFIG_DIR/sessions" ] && [ "$(readlink "$CONFIG_DIR/sessions")" = "$HOME/.claude/sessions" ]; then
+  ok "session registry shared — workers appear in ListAgents by slug"
+else
+  warn "session registry not shared — native worker discovery disabled (rerun setup-worker)"
+fi
+
 if grep -qs "permission-mode-hook" "$HOME/.claude/settings.json"; then
   ok "permission-mode hook registered"
 else
