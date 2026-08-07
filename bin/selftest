@@ -2,8 +2,8 @@
 # Validation matrix (dispatched as: claude-api selftest). Re-verifies the
 # version-pinned behaviors the framework depends on — run after Claude Code
 # upgrades. Spends a few API-billed sonnet/haiku runs; the supervision-protocol
-# checks (7-9) and the guard/shim checks (11-13) use stub workers and are free.
-# SELFTEST_SKIP_LIVE=1 skips checks 1-10 and runs only 11-13, which need no API
+# checks (7-9) and the guard/shim checks (11-14) use stub workers and are free.
+# SELFTEST_SKIP_LIVE=1 skips checks 1-10 and runs only 11-14, which need no API
 # key and never spawn a real claude — use it to iterate on the shim checks.
 set -uo pipefail
 
@@ -36,11 +36,11 @@ step() { echo; echo "== $1"; }
 ok()   { echo "   PASS"; }
 bad()  { echo "   FAIL: $1"; fails=$((fails + 1)); }
 
-[ -n "${SELFTEST_SKIP_LIVE:-}" ] && echo "SELFTEST_SKIP_LIVE set — running only the guard/shim checks (11-13)"
+[ -n "${SELFTEST_SKIP_LIVE:-}" ] && echo "SELFTEST_SKIP_LIVE set — running only the guard/shim checks (11-14)"
 
 if [ -z "${SELFTEST_SKIP_LIVE:-}" ]; then
 
-step "1/13 basic headless run + JSON output"
+step "1/14 basic headless run + JSON output"
 SID=""
 if "$CA" -p 'Reply with exactly: SELFTEST OK' --model sonnet --output-format json > t1.json 2> t1.err \
    && python3 -c 'import json;d=json.load(open("t1.json"));assert not d.get("is_error");assert "SELFTEST OK" in d["result"]' 2>/dev/null; then
@@ -50,7 +50,7 @@ else
   bad "basic run (t1.err)"
 fi
 
-step "2/13 --resume continuity"
+step "2/14 --resume continuity"
 if [ -n "$SID" ] \
    && "$CA" --resume "$SID" -p 'What exact phrase did you reply with earlier? Answer with just the phrase.' --model sonnet --output-format json > t2.json 2> t2.err \
    && python3 -c 'import json;assert "SELFTEST OK" in json.load(open("t2.json"))["result"]' 2>/dev/null; then
@@ -59,12 +59,12 @@ else
   bad "resume (t2.err)"
 fi
 
-step "3/13 acceptEdits floor: file creation"
+step "3/14 acceptEdits floor: file creation"
 mkdir -p edit && ( cd edit && "$CA" -p 'Create a file named hello.txt in the current directory containing exactly: selftest file
 Then reply DONE.' --model sonnet --output-format json > ../t3.json 2> ../t3.err )
 if [ "$(cat edit/hello.txt 2>/dev/null)" = "selftest file" ]; then ok; else bad "file not created (t3.err)"; fi
 
-step "4/13 legacy manual FIFO: envelope + send helper + clean shutdown"
+step "4/14 legacy manual FIFO: envelope + send helper + clean shutdown"
 mkfifo w.in
 tail -f /dev/null > w.in & keeper=$!
 touch w.ndjson
@@ -87,7 +87,7 @@ fi
 kill "$worker" 2>/dev/null
 wait 2>/dev/null
 
-step "5/13 worker→human question relay from a run worker (ask grant + questions + answer)"
+step "5/14 worker→human question relay from a run worker (ask grant + questions + answer)"
 "$CA" run st-ask 'Run exactly this shell command with your Bash tool (set the tool call timeout to 120000 ms) and wait for it: claude-api ask --from selftest --timeout 90 "Reply with exactly: GRANTED". Then reply with exactly: GOT=<its stdout>.' \
   --model sonnet --allowedTools 'Bash(claude-api ask:*)' > t5.out 2> t5.err & qworker=$!
 qid=""
@@ -127,7 +127,7 @@ send_retry() { # fifo-path message [extra send args...]
   return 1
 }
 
-step "6/13 run: one-shot answer on stdout"
+step "6/14 run: one-shot answer on stdout"
 if "$CA" run st-one 'Reply with exactly: RUN OK' --model haiku > t6.out 2> t6.err \
    && [ "$(cat t6.out)" = "RUN OK" ] && grep -q 'resume:' t6.err \
    && [ ! -e "$RWDIR/st-one.in" ]; then
@@ -145,13 +145,19 @@ cat > fakebin/claude <<'EOF'
 #!/usr/bin/env bash
 # selftest stub: stream-json worker, one result per input line; FAKE_MODE=crash
 # dies mid-turn without a result; FAKE_MODE=parked ends the turn with an empty
-# success result and stop_reason tool_use (a worker parked on a wakeup).
+# success result and stop_reason tool_use (a worker parked on a wakeup);
+# FAKE_MODE=linger delivers its result but then never exits (the post-close
+# wedge a native peer message can cause).
 n=0
 while IFS= read -r _; do
   n=$((n+1))
   if [ "${FAKE_MODE:-}" = crash ]; then
     printf '{"type":"assistant","session_id":"fake-sid"}\n'
     exit 3
+  fi
+  if [ "${FAKE_MODE:-}" = linger ]; then
+    printf '{"type":"result","subtype":"success","is_error":false,"result":"TURN %s","session_id":"fake-sid","total_cost_usd":0}\n' "$n"
+    exec sleep 1000
   fi
   if [ "${FAKE_MODE:-}" = parked ]; then
     printf '{"type":"result","subtype":"success","is_error":false,"result":"","stop_reason":"tool_use","session_id":"fake-sid","total_cost_usd":0}\n'
@@ -165,7 +171,7 @@ chmod +x fakebin/claude
 
 if [ -z "${SELFTEST_SKIP_LIVE:-}" ]; then
 
-step "7/13 run: two sends queued during a slow turn — both drained before close (EOF drain)"
+step "7/14 run: two sends queued during a slow turn — both drained before close (EOF drain)"
 # The stub's slow first turn (FAKE_DELAY) guarantees both sends are queued in
 # the pipe at the first result boundary; the close protocol must then give
 # each its own turn instead of closing. (A live model can't test this
@@ -184,7 +190,7 @@ else
   bad "a queued message was lost at close (t7.out / $RWDIR/st-drain.ndjson)"
 fi
 
-step "8/13 run: close handoff vs a racing send (fake reader)"
+step "8/14 run: close handoff vs a racing send (fake reader)"
 PATH="$PWD/fakebin:$PATH" "$CA" run st-race 'task one' > t8.out 2> t8.err & rcpid=$!
 i=0; while ! grep -q '"TURN 1"' "$RWDIR/st-race.ndjson" 2>/dev/null && [ "$i" -lt 200 ]; do sleep 0.05; i=$((i + 1)); done
 "$CA" send "$RWDIR/st-race.in" 'task two' > t8.send 2>&1; srrc=$?
@@ -201,7 +207,7 @@ else
   if grep -q 'gone\|not a FIFO\|nothing is reading' t8.send; then ok; else bad "racing send failed without a loud diagnostic (t8.send)"; fi
 fi
 
-step "9/13 run: worker crash mid-turn fails loudly"
+step "9/14 run: worker crash mid-turn fails loudly"
 FAKE_MODE=crash PATH="$PWD/fakebin:$PATH" "$CA" run st-crash 'boom' > t9.out 2> t9.err; crc=$?
 if [ "$crc" -ne 0 ] && grep -q 'FAILED' t9.err && grep -q 'no-result-line' t9.err \
    && [ ! -e "$RWDIR/st-crash.in" ]; then
@@ -210,17 +216,22 @@ else
   bad "crash: rc=$crc, want nonzero + FAILED/no-result-line diagnostics + fifo removed (t9.err)"
 fi
 
-step "10/13 run --stay: steer mid-run, then graceful end"
+step "10/14 run --stay: steer mid-run, session named after slug, then graceful end"
 "$CA" run st-steer 'Reply with exactly: FIRST' --stay --model haiku > t10.out 2> t10.err & stpid=$!
 if wait_for "$RWDIR/st-steer.ndjson" '"type":"result"' 180; then
+  # -n injection reached a real claude: the live session registered under the slug.
+  named=0
+  grep -qs '"name":"st-steer"' "${CLAUDE_API_CONFIG_DIR:-$HOME/.claude-api}/sessions"/*.json && named=1
   if send_retry "$RWDIR/st-steer.in" 'Reply with exactly: SECOND' --wait 180 > /dev/null 2>&1 \
      && "$CA" end "$RWDIR/st-steer.keeper" > /dev/null \
      && wait "$stpid" \
      && [ "$(cat t10.out)" = "SECOND" ] \
+     && [ "$named" -eq 1 ] \
      && [ "$(grep -c '"type":"result"' "$RWDIR/st-steer.ndjson")" -ge 2 ]; then
     ok
   else
-    bad "steer/end (t10.out / t10.err)"
+    [ "$named" -eq 0 ] && bad "worker session not registered as 'st-steer' (-n injection or registry broke)" \
+                       || bad "steer/end (t10.out / t10.err)"
   fi
 else
   kill "$stpid" 2>/dev/null
@@ -234,7 +245,7 @@ rm -f "$RWDIR"/st-ask.ndjson "$RWDIR"/st-one.ndjson "$RWDIR"/st-drain.ndjson \
 
 fi # SELFTEST_SKIP_LIVE (checks 7-10)
 
-# Checks 11-13 spawn no real claude and need no API key: the dirty-tree guard
+# checks 11-14 spawn no real claude and need no API key: the dirty-tree guard
 # fires before any process is created, and the rest run against stub `claude`
 # binaries. An isolated config dir with a dummy key keeps them off ~/.claude-api
 # even if a guard regresses.
@@ -244,7 +255,7 @@ printf 'sk-dummy-selftest\n' > "$ISO/api-key"
 chmod 600 "$ISO/api-key"
 IRWDIR="$ISO/run/workers/${CLAUDE_CODE_SESSION_ID:-manual}"
 
-step "11/13 run: dirty-tree guard — refuses in a dirty repo, skipped outside a repo"
+step "11/14 run: dirty-tree guard — refuses in a dirty repo, skipped outside a repo"
 git init -q dirtyrepo
 echo x > dirtyrepo/uncommitted.txt
 ( cd dirtyrepo && CLAUDE_API_CONFIG_DIR="$ISO" PATH="$WORK/fakebin:$PATH" "$CA" run st-dirty 'x' ) > t11.out 2> t11.err
@@ -260,7 +271,7 @@ else
   bad "dirty guard: dirty rc=$drc want 2 + refusal + no worker artifacts; non-repo rc=$nrc want 0 (t11.err / t11b.err)"
 fi
 
-step "12/13 run: empty success result (parked worker) fails loudly + cost-log entry"
+step "12/14 run: empty success result (parked worker) fails loudly + cost-log entry"
 FAKE_MODE=parked PATH="$WORK/fakebin:$PATH" CLAUDE_API_CONFIG_DIR="$ISO" "$CA" run st-parked 'x' > t12.out 2> t12.err
 prc=$?
 if [ "$prc" -eq 1 ] && grep -q 'cause: WORKER PARKED ITSELF' t12.err \
@@ -270,7 +281,7 @@ else
   bad "parked worker: rc=$prc want 1 + 'cause: WORKER PARKED ITSELF' + cost-log failed=empty-result (t12.err / $ISO/cost-log.jsonl)"
 fi
 
-step "13/13 headless injections: ScheduleWakeup denial + briefing on -p only"
+step "13/14 headless injections: ScheduleWakeup denial, briefing, -n slug on run spawns only"
 mkdir -p argbin
 cat > argbin/claude <<'EOF'
 #!/usr/bin/env bash
@@ -278,28 +289,48 @@ cat > argbin/claude <<'EOF'
 printf '%s\n' "$@" > "${FAKE_ARGV_OUT:?}"
 EOF
 chmod +x argbin/claude
-# run spawn re-enters claude-api with -p → both injections must reach argv.
+# run spawn re-enters claude-api with -p → all injections must reach argv.
 FAKE_ARGV_OUT="$WORK/t13run.argv" PATH="$WORK/argbin:$PATH" CLAUDE_API_CONFIG_DIR="$ISO" \
   "$CA" run st-argv 'x' > /dev/null 2>&1 || true
-# interactive (no -p) → neither injection.
+# caller-supplied -n suppresses the slug-name injection.
+FAKE_ARGV_OUT="$WORK/t13nam.argv" PATH="$WORK/argbin:$PATH" CLAUDE_API_CONFIG_DIR="$ISO" \
+  "$CA" run st-argv2 'x' -n myname > /dev/null 2>&1 || true
+# interactive (no -p) → no injections.
 FAKE_ARGV_OUT="$WORK/t13int.argv" PATH="$WORK/argbin:$PATH" CLAUDE_API_CONFIG_DIR="$ISO" \
   "$CA" < /dev/null > /dev/null 2>&1 || true
 if grep -x -A1 -- '--disallowedTools' t13run.argv | grep -qx 'ScheduleWakeup' \
    && grep -x -A1 -- '--append-system-prompt' t13run.argv | grep -q 'ScheduleWakeup never fires' \
+   && grep -x -A1 -- '-n' t13run.argv | grep -qx 'st-argv' \
+   && [ "$(grep -cx -- '-n' t13nam.argv)" -eq 1 ] \
+   && grep -x -A1 -- '-n' t13nam.argv | grep -qx 'myname' \
    && [ -s t13int.argv ] \
+   && ! grep -qx -- '-n' t13int.argv \
    && ! grep -qx -- '--disallowedTools' t13int.argv \
    && ! grep -qx -- '--append-system-prompt' t13int.argv; then
   ok
 else
-  bad "headless injections: missing on the run spawn, or present interactively (t13run.argv / t13int.argv)"
+  bad "headless injections: missing/duplicated on the run spawn, or present interactively (t13run.argv / t13nam.argv / t13int.argv)"
+fi
+
+step "14/14 run: close-linger guard — post-close wedge terminated, run still succeeds"
+lstart="$(date +%s)"
+FAKE_MODE=linger PATH="$WORK/fakebin:$PATH" CLAUDE_API_CONFIG_DIR="$ISO" CLAUDE_API_CLOSE_GRACE=3 \
+  "$CA" run st-linger 'x' > t14.out 2> t14.err
+lrc=$?
+lsecs=$(( $(date +%s) - lstart ))
+if [ "$lrc" -eq 0 ] && [ "$(cat t14.out)" = "TURN 1" ] \
+   && grep -q 'terminating it' t14.err && [ "$lsecs" -lt 60 ]; then
+  ok
+else
+  bad "linger guard: rc=$lrc after ${lsecs}s — want rc 0, stdout TURN 1, 'terminating it' warning within 60s (t14.err)"
 fi
 
 echo
 if [ "$fails" -eq 0 ]; then
   if [ -n "${SELFTEST_SKIP_LIVE:-}" ]; then
-    echo "selftest: checks 11-13 passed (live checks 1-10 SKIPPED)"
+    echo "selftest: checks 11-14 passed (live checks 1-10 SKIPPED)"
   else
-    echo "selftest: all 13 checks passed"
+    echo "selftest: all 14 checks passed"
   fi
 else
   echo "selftest: $fails check(s) FAILED"
