@@ -597,7 +597,30 @@ if [ "$headless" -eq 1 ]; then
     set -- --disallowedTools ScheduleWakeup "$@"
   fi
   if [ "$has_sysprompt" -eq 0 ]; then
-    set -- --append-system-prompt 'You are a headless worker (claude -p). ScheduleWakeup never fires for you — never call it. Notifications from your own background Bash tasks and subagents reach you only while this run is alive; never end your turn with work pending on a wakeup or an unfinished background task. Finish the job within your turn; wait on external state with bounded foreground polls, in short chunks (~60 s per tool call, a loop of short sleeps rather than one long one) — messages sent to you mid-run surface at each tool-result boundary, so short calls keep you steerable. Your final message is the run result — end with the concrete answer or report.' "$@"
+    brief='You are a headless worker (claude -p). ScheduleWakeup never fires for you — never call it. Notifications from your own background Bash tasks and subagents reach you only while this run is alive; never end your turn with work pending on a wakeup or an unfinished background task. Finish the job within your turn; wait on external state with bounded foreground polls, in short chunks (~60 s per tool call, a loop of short sleeps rather than one long one) — messages sent to you mid-run surface at each tool-result boundary, so short calls keep you steerable. Your final message is the run result — end with the concrete answer or report.'
+    # Tell the worker who spawned it, so it can notify the parent session
+    # natively (SendMessage) — e.g. as a wake-up ping right before blocking in
+    # `claude-api ask`. Best-effort: skipped when the parent has no registry
+    # entry (session ended, old CLI version).
+    if [ -n "${CLAUDE_API_PARENT_SID:-}" ] && command -v python3 >/dev/null 2>&1; then
+      pname="$(python3 - "$HOME/.claude/sessions" "$CLAUDE_API_PARENT_SID" 2>/dev/null <<'PY' || true
+import glob, json, sys
+d, sid = sys.argv[1], sys.argv[2]
+for f in glob.glob(d + "/*.json"):
+    try:
+        e = json.load(open(f))
+    except Exception:
+        continue
+    if e.get("sessionId") == sid:
+        print(e.get("name", ""))
+        break
+PY
+)"
+      if [ -n "$pname" ]; then
+        brief="$brief The session that spawned you is the agent named '$pname'; you may notify it with your SendMessage tool (when SendMessage asks you to confirm with a ref, re-send using the exact ref it shows)."
+      fi
+    fi
+    set -- --append-system-prompt "$brief" "$@"
   fi
 fi
 
