@@ -34,13 +34,13 @@ elif [ "$(uname)" = Darwin ] && security find-generic-password -s "$KEYCHAIN_SER
   src="macOS Keychain ($KEYCHAIN_SERVICE)"
 elif [ -f "$CONFIG_DIR/api-key" ]; then
   src="file $CONFIG_DIR/api-key"
-  perms="$(stat -f %Lp "$CONFIG_DIR/api-key" 2>/dev/null || stat -c %a "$CONFIG_DIR/api-key" 2>/dev/null)"
+  perms="$(stat -c %a "$CONFIG_DIR/api-key" 2>/dev/null || stat -f %Lp "$CONFIG_DIR/api-key" 2>/dev/null)"
   [ "$perms" = "600" ] || warn "api-key file perms are $perms (expected 600)"
 fi
 if [ -n "$src" ]; then ok "API key available via $src"; else fail "no API key — run claude-api-store-key"; fi
 
 if [ -d "$CONFIG_DIR" ]; then
-  dperms="$(stat -f %Lp "$CONFIG_DIR" 2>/dev/null || stat -c %a "$CONFIG_DIR" 2>/dev/null)"
+  dperms="$(stat -c %a "$CONFIG_DIR" 2>/dev/null || stat -f %Lp "$CONFIG_DIR" 2>/dev/null)"
   [ "$dperms" = "700" ] && ok "config dir $CONFIG_DIR (0700)" || warn "config dir perms are $dperms (expected 700)"
 else
   fail "config dir $CONFIG_DIR missing — run setup-worker"
