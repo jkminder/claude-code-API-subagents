@@ -278,6 +278,49 @@ signal.signal(signal.SIGTERM, _term)
 signal.signal(signal.SIGINT, _term)
 
 rc = 1
+linger_killed = False
+
+def wait_after_close():
+    """Wait for the worker to exit after a committed close. A native peer
+    message (SendMessage) racing the close can start a post-EOF turn, after
+    which the CLI never exits (verified on 2.1.224) — so on the normal close
+    path (worker was idle and accounted for), TERM it once its output has been
+    silent for CLAUDE_API_CLOSE_GRACE seconds (default 120; 0 disables). The
+    shutdown path (claude-api end) keeps waiting indefinitely: the worker is
+    finishing a legitimate turn that may be silent for a long time."""
+    global linger_killed
+    try:
+        grace = float(os.environ.get("CLAUDE_API_CLOSE_GRACE", "120"))
+    except ValueError:
+        grace = 120.0
+    if shutdown or grace <= 0:
+        return child.wait()
+    def nd_size():
+        try:
+            return os.path.getsize(nd)
+        except OSError:
+            return -1
+    last_size, quiet_since = nd_size(), time.time()
+    while True:
+        try:
+            return child.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        size = nd_size()
+        if size != last_size:
+            last_size, quiet_since = size, time.time()
+        elif time.time() - quiet_since > grace:
+            note("WARNING: worker still alive %ds after close with no new output "
+                 "(a native SendMessage racing the close can wedge the CLI) — terminating it"
+                 % int(grace))
+            linger_killed = True
+            child.terminate()
+            try:
+                return child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                return child.wait()
+
 try:
     set_state("busy")
     # Spawn first, then write the task: the worker's stdout goes DIRECTLY to
@@ -317,7 +360,7 @@ try:
         if not committed and not stay and not shutdown and last_top == "result" and results >= 1:
             committed = close_pipe()
         if committed:
-            rc = child.wait()
+            rc = wait_after_close()
             break
         if child_rc is not None:
             # Worker died without a committed close — make sends fail fast and
@@ -378,7 +421,11 @@ result_text = last_result.get("result") if last_result is not None else None
 # ended the run without the model producing a final answer. Seen when the
 # worker parks itself (ScheduleWakeup / waiting on background tasks — headless
 # workers get no wakeups; stop_reason "tool_use") or a limit stops the run.
-ok = (rc == 0 and last_result is not None and not last_result.get("is_error")
+# linger_killed: we TERM'd a worker that had already delivered its result but
+# would not exit (post-close peer-message wedge) — its nonzero rc is ours, not
+# a worker failure.
+ok = ((rc == 0 or linger_killed) and last_result is not None
+      and not last_result.get("is_error")
       and last_result.get("subtype") == "success" and bool(result_text))
 
 cause = None
