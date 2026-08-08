@@ -44,7 +44,7 @@ PY
 }
 
 if [ "${1:-}" = "--uninstall" ]; then
-  for l in "$HOME/.local/bin/claude-api" "$HOME/.local/bin/claude-api-store-key" "$HOME/.claude/skills/delegate"; do
+  for l in "$HOME/.local/bin/claude-api" "$HOME/.local/bin/claude-api-store-key" "$HOME/.claude/skills/delegate" "$CONFIG_DIR/sessions"; do
     if [ -L "$l" ]; then rm -f "$l" && echo "removed $l"; fi
   done
   deregister_hook
@@ -151,11 +151,18 @@ fi
 # up in ListAgents and addressable by slug with SendMessage (bin/claude-api
 # names run workers after their slug). Entries are per-pid files that each
 # session removes on exit, so sharing the dir is safe.
+if [ -L "$CONFIG_DIR/sessions" ] && [ "$(readlink "$CONFIG_DIR/sessions")" != "$HOME/.claude/sessions" ]; then
+  rm -f "$CONFIG_DIR/sessions"   # wrong target (copied config dir, moved $HOME) — recreate below
+fi
 if [ ! -L "$CONFIG_DIR/sessions" ]; then
   mkdir -p "$HOME/.claude/sessions"
   if [ -d "$CONFIG_DIR/sessions" ]; then
     for f in "$CONFIG_DIR/sessions"/*.json; do
-      [ -e "$f" ] && mv "$f" "$HOME/.claude/sessions/" 2>/dev/null
+      [ -e "$f" ] || continue
+      # -n: never clobber an interactive session's entry if a stale worker
+      # file shares a recycled pid; failures must not errexit the installer.
+      mv -n "$f" "$HOME/.claude/sessions/" 2>/dev/null \
+        || echo "WARNING: could not migrate registry entry $(basename "$f")" >&2
     done
     rmdir "$CONFIG_DIR/sessions" 2>/dev/null || true
   fi
