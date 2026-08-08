@@ -16,6 +16,10 @@ done
 BIN_DIR="$(cd "$(dirname "$SRC")" && pwd)"
 CA="$BIN_DIR/claude-api"
 WORK="$(mktemp -d)"
+# Defense against running inside a `claude-api run` worker: the parent's slug
+# must not leak into spawns made here (it would rename registered sessions and
+# break the interactive-argv assertions in check 13).
+unset CLAUDE_API_RUN_SLUG
 fails=0
 trap '[ "$fails" -eq 0 ] && rm -rf "$WORK" || echo "artifacts kept in $WORK"' EXIT
 cd "$WORK"
@@ -139,7 +143,8 @@ fi
 fi # SELFTEST_SKIP_LIVE (checks 1-6)
 
 # Steps 7-9 exercise the supervision protocol with a fake `claude` on PATH —
-# deterministic timing, no API spend. Checks 11-12 reuse the stub.
+# deterministic timing, no API spend. Checks 11-12 and 14 reuse the stub, so
+# it must sit outside both SKIP_LIVE blocks.
 mkdir -p fakebin
 cat > fakebin/claude <<'EOF'
 #!/usr/bin/env bash
@@ -157,7 +162,7 @@ while IFS= read -r _; do
   fi
   if [ "${FAKE_MODE:-}" = linger ]; then
     printf '{"type":"result","subtype":"success","is_error":false,"result":"TURN %s","session_id":"fake-sid","total_cost_usd":0}\n' "$n"
-    exec sleep 1000
+    exec sleep 90   # long enough that only the guard's TERM ends check 14 in time, short enough to bound the hang if the guard regresses
   fi
   if [ "${FAKE_MODE:-}" = parked ]; then
     printf '{"type":"result","subtype":"success","is_error":false,"result":"","stop_reason":"tool_use","session_id":"fake-sid","total_cost_usd":0}\n'
@@ -219,9 +224,17 @@ fi
 step "10/14 run --stay: steer mid-run, session named after slug, then graceful end"
 "$CA" run st-steer 'Reply with exactly: FIRST' --stay --model haiku > t10.out 2> t10.err & stpid=$!
 if wait_for "$RWDIR/st-steer.ndjson" '"type":"result"' 180; then
-  # -n injection reached a real claude: the live session registered under the slug.
+  # -n injection reached a real claude: the live session registered under the
+  # slug. Scoped to a LIVE pid — the registry is shared and persistent, so a
+  # stale entry from an uncleanly-dead earlier run must not green this check.
   named=0
-  grep -qs '"name":"st-steer"' "${CLAUDE_API_CONFIG_DIR:-$HOME/.claude-api}/sessions"/*.json && named=1
+  for _rf in "${CLAUDE_API_CONFIG_DIR:-$HOME/.claude-api}/sessions"/*.json; do
+    [ -e "$_rf" ] || continue
+    grep -qs '"name":"st-steer"' "$_rf" || continue
+    _rp="$(basename "$_rf" .json)"
+    case "$_rp" in *[!0-9]*) continue ;; esac
+    kill -0 "$_rp" 2>/dev/null && { named=1; break; }
+  done
   if send_retry "$RWDIR/st-steer.in" 'Reply with exactly: SECOND' --wait 180 > /dev/null 2>&1 \
      && "$CA" end "$RWDIR/st-steer.keeper" > /dev/null \
      && wait "$stpid" \
@@ -298,18 +311,41 @@ FAKE_ARGV_OUT="$WORK/t13nam.argv" PATH="$WORK/argbin:$PATH" CLAUDE_API_CONFIG_DI
 # interactive (no -p) → no injections.
 FAKE_ARGV_OUT="$WORK/t13int.argv" PATH="$WORK/argbin:$PATH" CLAUDE_API_CONFIG_DIR="$ISO" \
   "$CA" < /dev/null > /dev/null 2>&1 || true
+# Parent-name briefing: assert only when this shell's session is resolvable in
+# the registry (otherwise the sentence is legitimately absent, e.g. plain
+# terminal or the parent session restarted).
+pname_ok=1
+my_name="$(python3 - "$HOME/.claude/sessions" "${CLAUDE_CODE_SESSION_ID:-}" 2>/dev/null <<'PY'
+import glob, json, sys
+d, sid = sys.argv[1], sys.argv[2]
+if sid:
+    for f in glob.glob(d + "/*.json"):
+        try:
+            e = json.load(open(f))
+        except Exception:
+            continue
+        if e.get("sessionId") == sid and e.get("name"):
+            print(e["name"])
+            break
+PY
+)"
+if [ -n "$my_name" ]; then
+  grep -x -A1 -- '--append-system-prompt' t13run.argv | grep -qF "agent named '$my_name'" || pname_ok=0
+fi
 if grep -x -A1 -- '--disallowedTools' t13run.argv | grep -qx 'ScheduleWakeup' \
    && grep -x -A1 -- '--append-system-prompt' t13run.argv | grep -q 'ScheduleWakeup never fires' \
    && grep -x -A1 -- '-n' t13run.argv | grep -qx 'st-argv' \
    && [ "$(grep -cx -- '-n' t13nam.argv)" -eq 1 ] \
    && grep -x -A1 -- '-n' t13nam.argv | grep -qx 'myname' \
+   && [ "$pname_ok" -eq 1 ] \
    && [ -s t13int.argv ] \
    && ! grep -qx -- '-n' t13int.argv \
    && ! grep -qx -- '--disallowedTools' t13int.argv \
    && ! grep -qx -- '--append-system-prompt' t13int.argv; then
   ok
 else
-  bad "headless injections: missing/duplicated on the run spawn, or present interactively (t13run.argv / t13nam.argv / t13int.argv)"
+  [ "$pname_ok" -eq 0 ] && bad "parent-name sentence missing from the briefing despite a resolvable parent ('$my_name'; t13run.argv)" \
+                        || bad "headless injections: missing/duplicated on the run spawn, or present interactively (t13run.argv / t13nam.argv / t13int.argv)"
 fi
 
 step "14/14 run: close-linger guard — post-close wedge terminated, run still succeeds"
