@@ -342,14 +342,21 @@ try:
     # that crashes at startup must not wedge us in a blocking write. (No EPIPE
     # can fire while probe_rfd is open, so poll() is the only death signal.)
     payload = (json.dumps({"type": "user", "message": {"role": "user", "content": task}}) + "\n").encode()
+    # Serialized with send via the shared lock: a task larger than the free
+    # pipe capacity (64KB) takes multiple writes, and an early send landing
+    # between them would splice its message into the middle of the task line.
     done = 0
-    while done < len(payload) and not shutdown:
-        try:
-            done += os.write(wfd, payload[done:])
-        except BlockingIOError:
-            if child.poll() is not None:
-                break
-            time.sleep(0.05)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+        while done < len(payload) and not shutdown:
+            try:
+                done += os.write(wfd, payload[done:])
+            except BlockingIOError:
+                if child.poll() is not None:
+                    break
+                time.sleep(0.05)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
     # Supervision: poll the ndjson for complete lines (tail --pid -F semantics,
     # portable) — worker death MUST end this loop; there is deliberately no
