@@ -66,6 +66,13 @@ WT=$(claude-api worktree add <slug>)   # prints the worktree path; branch worker
 cd "$WT" && claude-api run <slug> "..."
 ```
 
+**Never let a worker borrow another clone's virtualenv.** A throwaway clone with
+no venv tempts a symlink to a shared one; read-only use is fine until any
+`uv sync`, a `uv run` that resolves a lockfile, or a stray `pip install`
+mutates the shared env instead of the throwaway. Tell workers to create their
+own (`uv venv`) or to point `UV_PROJECT_ENVIRONMENT` at a scratch path — a
+couple of minutes against corrupting a clone another session is running from.
+
 After collecting and merging results: `claude-api worktree clean` removes merged worktrees and branches (`claude-api worktree list` to inspect).
 
 ## Collecting results
