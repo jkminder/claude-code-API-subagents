@@ -647,6 +647,12 @@ LEDGER="$RUN_DIR/ledger.jsonl"
 san() { printf '%s' "$1" | tr -c 'A-Za-z0-9 ._/=:,+@-' '_' | cut -c1-200; }
 start_ts="$(date +%s)"
 
+# The slug env var existed only for this re-entry's -n injection and the
+# ledger label below — un-export it so the worker's process tree doesn't
+# inherit it (a nested claude-api call inside the worker would otherwise get
+# the parent's name injected and register a duplicate agent).
+export -n CLAUDE_API_RUN_SLUG 2>/dev/null || true
+
 # `<&0` is load-bearing: bash redirects a background job's stdin to /dev/null
 # when job control is off, which would starve FIFO/stream-json workers.
 claude "$@" <&0 &
