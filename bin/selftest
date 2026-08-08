@@ -164,6 +164,10 @@ while IFS= read -r _; do
     printf '{"type":"result","subtype":"success","is_error":false,"result":"TURN %s","session_id":"fake-sid","total_cost_usd":0}\n' "$n"
     exec sleep 90   # long enough that only the guard's TERM ends check 14 in time, short enough to bound the hang if the guard regresses
   fi
+  if [ "${FAKE_MODE:-}" = dieafter ]; then
+    printf '{"type":"result","subtype":"success","is_error":false,"result":"TURN %s","session_id":"fake-sid","total_cost_usd":0}\n' "$n"
+    exit 7   # dies AFTER a successful result — the killed/died-post-result failure shape
+  fi
   if [ "${FAKE_MODE:-}" = parked ]; then
     printf '{"type":"result","subtype":"success","is_error":false,"result":"","stop_reason":"tool_use","session_id":"fake-sid","total_cost_usd":0}\n'
     continue
@@ -284,14 +288,18 @@ else
   bad "dirty guard: dirty rc=$drc want 2 + refusal + no worker artifacts; non-repo rc=$nrc want 0 (t11.err / t11b.err)"
 fi
 
-step "12/14 run: empty success result (parked worker) fails loudly + cost-log entry"
+step "12/14 run: failure shapes labeled correctly in the cost log (parked vs died-after-result)"
 FAKE_MODE=parked PATH="$WORK/fakebin:$PATH" CLAUDE_API_CONFIG_DIR="$ISO" "$CA" run st-parked 'x' > t12.out 2> t12.err
 prc=$?
+FAKE_MODE=dieafter PATH="$WORK/fakebin:$PATH" CLAUDE_API_CONFIG_DIR="$ISO" "$CA" run st-dieafter 'x' > t12b.out 2> t12b.err
+darc=$?
 if [ "$prc" -eq 1 ] && grep -q 'cause: WORKER PARKED ITSELF' t12.err \
-   && python3 -c 'import json,sys;assert any(e.get("task")=="st-parked" and e.get("failed")=="empty-result" for e in map(json.loads,open(sys.argv[1])))' "$ISO/cost-log.jsonl" 2>/dev/null; then
+   && python3 -c 'import json,sys;assert any(e.get("task")=="st-parked" and e.get("failed")=="empty-result" for e in map(json.loads,open(sys.argv[1])))' "$ISO/cost-log.jsonl" 2>/dev/null \
+   && [ "$darc" -eq 1 ] && grep -q 'FAILED' t12b.err && grep -q 'partial result' t12b.err \
+   && python3 -c 'import json,sys;assert any(e.get("task")=="st-dieafter" and e.get("failed")=="exit-7" for e in map(json.loads,open(sys.argv[1])))' "$ISO/cost-log.jsonl" 2>/dev/null; then
   ok
 else
-  bad "parked worker: rc=$prc want 1 + 'cause: WORKER PARKED ITSELF' + cost-log failed=empty-result (t12.err / $ISO/cost-log.jsonl)"
+  bad "failure labels: parked rc=$prc want 1 + failed=empty-result; dieafter rc=$darc want 1 + failed=exit-7, never empty-result (t12.err / t12b.err / $ISO/cost-log.jsonl)"
 fi
 
 step "13/14 headless injections: ScheduleWakeup denial, briefing, -n slug on run spawns only"

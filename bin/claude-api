@@ -460,7 +460,16 @@ try:
         entry = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                  "task": slug, "cost": cost, "session": sid}
         if not ok:
-            entry["failed"] = "empty-result" if subtype == "success" else subtype
+            # Three distinct failure shapes; conflating them corrupts the
+            # diagnostic record the README troubleshooting section points at.
+            if subtype != "success":
+                entry["failed"] = subtype
+            elif not result_text:
+                entry["failed"] = "empty-result"
+            else:
+                # A successful turn happened but the run still failed — the
+                # worker was killed or died after its last result line.
+                entry["failed"] = "exit-%s" % rc
         f.write(json.dumps(entry) + "\n")
 except OSError:
     pass
