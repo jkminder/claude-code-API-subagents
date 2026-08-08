@@ -282,18 +282,20 @@ linger_killed = False
 
 def wait_after_close():
     """Wait for the worker to exit after a committed close. A native peer
-    message (SendMessage) racing the close can start a post-EOF turn, after
-    which the CLI never exits (verified on 2.1.224) — so on the normal close
-    path (worker was idle and accounted for), TERM it once its output has been
-    silent for CLAUDE_API_CLOSE_GRACE seconds (default 120; 0 disables). The
-    shutdown path (claude-api end) keeps waiting indefinitely: the worker is
-    finishing a legitimate turn that may be silent for a long time."""
+    message (SendMessage) arriving around the close can start a post-EOF turn,
+    after which the CLI never exits (verified on 2.1.224). The wedge signature
+    is idle-with-EOF: stdin closed, last top-level event a per-turn result, yet
+    the process stays alive producing nothing — TERM it once it has been idle
+    AND silent for CLAUDE_API_CLOSE_GRACE seconds (default 120; 0 disables).
+    Keying on idleness makes the guard safe on every close path: after
+    `claude-api end`, a worker finishing a long silent tool call has a
+    non-result last event and is never touched."""
     global linger_killed
     try:
         grace = float(os.environ.get("CLAUDE_API_CLOSE_GRACE", "120"))
     except ValueError:
         grace = 120.0
-    if shutdown or grace <= 0:
+    if grace <= 0:
         return child.wait()
     def nd_size():
         try:
@@ -309,8 +311,10 @@ def wait_after_close():
         size = nd_size()
         if size != last_size:
             last_size, quiet_since = size, time.time()
-        elif time.time() - quiet_since > grace:
-            note("WARNING: worker still alive %ds after close with no new output "
+            continue
+        scan_new()
+        if last_top == "result" and time.time() - quiet_since > grace:
+            note("WARNING: worker still alive and idle %ds after close "
                  "(a native SendMessage racing the close can wedge the CLI) — terminating it"
                  % int(grace))
             linger_killed = True
