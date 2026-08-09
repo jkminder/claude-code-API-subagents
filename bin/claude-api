@@ -58,8 +58,33 @@ case "${1:-}" in
     # race): flock on <slug>.lock + result-vs-sent accounting + unlink-before-
     # close; see bin/worker-ctl send for the other half.
     shift
-    slug="${1:?usage: claude-api run <slug> \"<task>\" [--stay] [extra claude flags]}"; shift
-    prompt="${1:?usage: claude-api run <slug> \"<task>\" [--stay] [extra claude flags]}"; shift || true
+    slug="${1:?usage: claude-api run <slug> \"<task>\" OR --prompt-file <path>, then [--stay] [extra claude flags]}"; shift
+    # --prompt-file keeps the brief out of the shell. A prompt passed as an
+    # argument goes through the caller's quoting: backticks and $( ) inside a
+    # double-quoted string are executed by that shell, and what reaches the
+    # worker is a brief with holes where the code examples used to be — no
+    # error here, because this process only ever sees the mangled result.
+    # Anything containing code, backticks or $ belongs in a file.
+    prompt=""; prompt_file=""; args=()
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --prompt-file)
+          prompt_file="${2:?claude-api run: --prompt-file needs a path}"; shift 2 ;;
+        --prompt-file=*) prompt_file="${1#*=}"; shift ;;
+        *) args+=("$1"); shift ;;
+      esac
+    done
+    if [ -n "$prompt_file" ]; then
+      [ -r "$prompt_file" ] || { echo "claude-api run: cannot read prompt file '$prompt_file'" >&2; exit 2; }
+      prompt="$(cat -- "$prompt_file")"
+      [ -n "${prompt//[[:space:]]/}" ] || { echo "claude-api run: prompt file '$prompt_file' is empty" >&2; exit 2; }
+    else
+      set -- ${args[@]+"${args[@]}"}
+      prompt="${1:?usage: claude-api run <slug> \"<task>\" OR --prompt-file <path>, then [--stay] [extra claude flags]}"
+      shift || true
+      args=(${@+"$@"})
+    fi
+    set -- ${args[@]+"${args[@]}"}
     case "$slug" in
       *[!A-Za-z0-9._-]*) echo "claude-api run: slug must match [A-Za-z0-9._-]" >&2; exit 2 ;;
     esac

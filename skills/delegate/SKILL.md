@@ -25,6 +25,23 @@ description: Delegate work to API-billed Claude Code workers or swarms. Worker t
 cd <target-repo> && claude-api run <slug> "<self-contained task prompt>"
 ```
 
+**If the brief contains code, backticks or `$`, put it in a file instead:**
+
+```bash
+cat > /tmp/brief-<slug>.txt <<'EOF'
+<the task, with `code`, $vars and $(examples) written normally>
+EOF
+cd <target-repo> && claude-api run <slug> --prompt-file /tmp/brief-<slug>.txt
+```
+
+The quoted heredoc (`<<'EOF'`) and `--prompt-file` both keep the text away from
+the shell. Passing such a brief as a `"quoted argument"` does not work: your
+own shell executes backticks and `$( )` inside double quotes before `run` is
+ever called, so the worker receives a brief with holes where the code examples
+were, and nothing downstream can detect it. The only tell is a stray
+`command not found: <word>` line in output that otherwise looked fine. The
+same trap applies to `git commit -m "…"` — use `git commit -F <file>`.
+
 Every `run` worker is **steerable while it runs**: `claude-api send <slug> "<follow-up>"` injects messages mid-run (see *Steering a running worker* below). With nothing sent it behaves one-shot — one turn, then it closes and reports.
 
 - Exit 0 → stdout is the answer, never empty (a stderr footer gives cost, turn count, the resume handle, and the `.ndjson` path). Exit 1 → a `FAILED` line with the failure subtype, cost, a `cause:` line when the cause is known (budget cap, turn limit, worker parked itself), any partial result, and the worker's stderr tail; respin or resume. Exit 2 → refused before spawning (bad usage, `$HOME` cwd, or a dirty tree — see above). Extra flags pass through after the prompt: `claude-api run <slug> "<task>" --model sonnet --allowedTools "Bash(git push *)"`.
