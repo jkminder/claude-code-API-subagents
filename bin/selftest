@@ -370,7 +370,7 @@ else
 fi
 
 echo
-step "15/15 run: --prompt-file keeps a brief with backticks and $ out of the shell"
+step "15/15 file-based text args: run/send/ask/answer keep backticks and $ out of the shell"
 # A brief passed as a quoted argument is mangled by the CALLER's shell before
 # run sees it, so the durable fix is to read it from a file. Guard both the
 # file reading and the argument parsing around it: an earlier version of this
@@ -386,12 +386,23 @@ CLAUDE_API_CONFIG_DIR="$ISO" PATH="$WORK/fakebin:$PATH" "$CA" run st-pf-empty --
 emprc=$?
 # the dirty-tree refusal proves the slug survived parsing intact and the file
 # was accepted; a mangled slug would have been rejected by the slug check first
+# the same class one step to the side: send/ask/answer carry agent-written text
+# too, so each takes a file flag and refuses a missing or empty one loudly
+sendmiss=0; sendempty=0; askmiss=0; ansmiss=0
+CLAUDE_API_CONFIG_DIR="$ISO" "$CA" send st-nope --message-file "$WORK/nope.txt"   > /dev/null 2> t15d.err || sendmiss=$?
+CLAUDE_API_CONFIG_DIR="$ISO" "$CA" send st-nope --message-file "$WORK/brief-empty.txt" > /dev/null 2> t15e.err || sendempty=$?
+CLAUDE_API_CONFIG_DIR="$ISO" "$CA" ask --question-file "$WORK/nope.txt"          > /dev/null 2> t15f.err || askmiss=$?
+CLAUDE_API_CONFIG_DIR="$ISO" "$CA" answer abc --answer-file "$WORK/nope.txt"     > /dev/null 2> t15g.err || ansmiss=$?
 if [ "$pfrc" -eq 2 ] && grep -q 'uncommitted changes' t15.err && ! grep -q 'slug must match' t15.err \
    && [ "$misrc" -eq 2 ] && grep -q 'cannot read prompt file' t15b.err \
-   && [ "$emprc" -eq 2 ] && grep -q 'is empty' t15c.err; then
+   && [ "$emprc" -eq 2 ] && grep -q 'is empty' t15c.err \
+   && [ "$sendmiss" -eq 2 ] && grep -q 'cannot read file' t15d.err \
+   && [ "$sendempty" -eq 2 ] && grep -q 'is empty' t15e.err \
+   && [ "$askmiss" -eq 2 ] && grep -q 'cannot read file' t15f.err \
+   && [ "$ansmiss" -eq 2 ] && grep -q 'cannot read file' t15g.err; then
   ok
 else
-  bad "--prompt-file: dirty rc=$pfrc want 2 via dirty-guard not slug-guard; missing rc=$misrc want 2; empty rc=$emprc want 2 (t15.err / t15b.err / t15c.err)"
+  bad "file text args: run dirty rc=$pfrc/missing $misrc/empty $emprc; send $sendmiss/$sendempty; ask $askmiss; answer $ansmiss — all want 2 (t15*.err)"
 fi
 
 if [ "$fails" -eq 0 ]; then

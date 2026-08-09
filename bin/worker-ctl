@@ -69,6 +69,20 @@ PY
 }
 
 # Resolve a worker slug to a file in this session's worker dir; paths pass through.
+# Text arguments that agents write — a steering message, a question, an answer
+# — routinely contain code, backticks and $. Passed as a quoted argument they
+# go through the caller's shell first, which executes the backticks and $( )
+# and delivers text with holes; nothing downstream can tell. Every command
+# taking such text accepts a <thing>-file flag instead, which never touches a
+# shell. Same reasoning as `claude-api run --prompt-file`.
+text_from_file() { # path label
+  local p="$1" label="$2" t
+  [ -r "$p" ] || { echo "claude-api $label: cannot read file '$p'" >&2; exit 2; }
+  t="$(cat -- "$p")"
+  [ -n "${t//[[:space:]]/}" ] || { echo "claude-api $label: file '$p' is empty" >&2; exit 2; }
+  printf '%s' "$t"
+}
+
 resolve() { # slug-or-path suffix
   case "$1" in
     */*) printf '%s' "$1" ;;
@@ -230,10 +244,27 @@ kill)
   esac
   ;;
 send)
-  slug="${1:-}"; text="${2:-}"; wait_s=0
-  if [ "${3:-}" = "--wait" ]; then wait_s="${4:-600}"; fi
-  if [ -z "$slug" ] || [ -z "$text" ]; then
-    echo 'usage: claude-api send <slug|fifo-path> "<message>" [--wait [secs]]' >&2; exit 1
+  slug=""; text=""; text_file=""; wait_s=0; got_text=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --message-file)   text_file="${2:?claude-api send: --message-file needs a path}"; shift 2 ;;
+      --message-file=*) text_file="${1#*=}"; shift ;;
+      --wait)
+        shift
+        case "${1:-}" in
+          ''|*[!0-9]*) wait_s=600 ;;
+          *) wait_s="$1"; shift ;;
+        esac ;;
+      *)
+        if [ -z "$slug" ]; then slug="$1"
+        elif [ "$got_text" -eq 0 ]; then text="$1"; got_text=1
+        fi
+        shift ;;
+    esac
+  done
+  [ -n "$text_file" ] && { text="$(text_from_file "$text_file" send)"; got_text=1; }
+  if [ -z "$slug" ] || [ "$got_text" -eq 0 ]; then
+    echo 'usage: claude-api send <slug|fifo-path> "<message>" OR --message-file <path>, then [--wait [secs]]' >&2; exit 1
   fi
   fifo="$(resolve "$slug" .in)"
   if [ ! -p "$fifo" ]; then
@@ -407,17 +438,20 @@ end)
   ;;
 ask)
   # Worker side. Blocks until answered; prints the answer on stdout.
-  from="worker"; tmo=540; q=""
+  from="worker"; tmo=540; q=""; q_file=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --from)    from="${2:-worker}"; shift 2 ;;
       --timeout) tmo="${2:-540}"; shift 2 ;;
+      --question-file)   q_file="${2:?claude-api ask: --question-file needs a path}"; shift 2 ;;
+      --question-file=*) q_file="${1#*=}"; shift ;;
       *)         q="$1"; shift ;;
     esac
   done
+  [ -n "$q_file" ] && q="$(text_from_file "$q_file" ask)"
   case "$tmo" in ''|*[!0-9]*) echo "claude-api ask: --timeout must be a number of seconds" >&2; exit 1 ;; esac
   if [ -z "$q" ]; then
-    echo 'usage: claude-api ask [--from <name>] [--timeout <secs>] "<question>"' >&2; exit 1
+    echo 'usage: claude-api ask [--from <name>] [--timeout <secs>] "<question>" OR --question-file <path>' >&2; exit 1
   fi
   QDIR="$(qdir_for "${CLAUDE_API_PARENT_SID:-}")"
   mkdir -p "$QDIR"
@@ -498,9 +532,21 @@ PY
   fi
   ;;
 answer)
-  qid="${1:-}"; text="${2:-}"
-  if [ -z "$qid" ] || [ -z "$text" ]; then
-    echo 'usage: claude-api answer <qid> "<answer text>"' >&2; exit 1
+  qid=""; text=""; text_file=""; got_text=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --answer-file)   text_file="${2:?claude-api answer: --answer-file needs a path}"; shift 2 ;;
+      --answer-file=*) text_file="${1#*=}"; shift ;;
+      *)
+        if [ -z "$qid" ]; then qid="$1"
+        elif [ "$got_text" -eq 0 ]; then text="$1"; got_text=1
+        fi
+        shift ;;
+    esac
+  done
+  [ -n "$text_file" ] && { text="$(text_from_file "$text_file" answer)"; got_text=1; }
+  if [ -z "$qid" ] || [ "$got_text" -eq 0 ]; then
+    echo 'usage: claude-api answer <qid> "<answer text>" OR --answer-file <path>' >&2; exit 1
   fi
   # qid becomes a filename — same charset ask generates; rejects traversal.
   case "$qid" in *[!A-Za-z0-9_-]*) echo "claude-api answer: malformed qid" >&2; exit 1 ;; esac
@@ -576,7 +622,7 @@ clean)
   fi
   ;;
 *)
-  echo 'usage: claude-api ps [--global] | kill <pid>|--all [--global] | clean [--all] [--global] | send <slug> "<msg>" [--wait [secs]] | reply <slug> | end <slug> | ask [--from <name>] [--timeout <secs>] "<q>" | questions [--wait [secs]] | answer <qid> "<text>"' >&2
+  echo 'usage: claude-api ps [--global] | kill <pid>|--all [--global] | clean [--all] [--global] | send <slug> "<msg>"|--message-file <path> [--wait [secs]] | reply <slug> | end <slug> | ask [--from <name>] [--timeout <secs>] "<q>"|--question-file <path> | questions [--wait [secs]] | answer <qid> "<text>"|--answer-file <path>' >&2
   exit 1
   ;;
 esac

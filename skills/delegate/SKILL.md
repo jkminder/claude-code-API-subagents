@@ -42,6 +42,8 @@ were, and nothing downstream can detect it. The only tell is a stray
 `command not found: <word>` line in output that otherwise looked fine. The
 same trap applies to `git commit -m "…"` — use `git commit -F <file>`.
 
+The same applies to every other command that carries text you wrote: `claude-api send <slug> --message-file <path>`, `claude-api ask --question-file <path>`, and `claude-api answer <qid> --answer-file <path>`. Steering messages quote code and paths constantly, so this is not a corner case.
+
 Every `run` worker is **steerable while it runs**: `claude-api send <slug> "<follow-up>"` injects messages mid-run (see *Steering a running worker* below). With nothing sent it behaves one-shot — one turn, then it closes and reports.
 
 - Exit 0 → stdout is the answer, never empty (a stderr footer gives cost, turn count, the resume handle, and the `.ndjson` path). Exit 1 → a `FAILED` line with the failure subtype, cost, a `cause:` line when the cause is known (budget cap, turn limit, worker parked itself), any partial result, and the worker's stderr tail; respin or resume. Exit 2 → refused before spawning (bad usage, `$HOME` cwd, or a dirty tree — see above). Extra flags pass through after the prompt: `claude-api run <slug> "<task>" --model sonnet --allowedTools "Bash(git push *)"`.
