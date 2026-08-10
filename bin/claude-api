@@ -77,7 +77,6 @@ case "${1:-}" in
     if [ -n "$prompt_file" ]; then
       [ -r "$prompt_file" ] || { echo "claude-api run: cannot read prompt file '$prompt_file'" >&2; exit 2; }
       prompt="$(cat -- "$prompt_file")"
-      [ -n "${prompt//[[:space:]]/}" ] || { echo "claude-api run: prompt file '$prompt_file' is empty" >&2; exit 2; }
     else
       set -- ${args[@]+"${args[@]}"}
       prompt="${1:?usage: claude-api run <slug> \"<task>\" OR --prompt-file <path>, then [--stay] [extra claude flags]}"
@@ -85,6 +84,17 @@ case "${1:-}" in
       args=(${@+"$@"})
     fi
     set -- ${args[@]+"${args[@]}"}
+    # Both paths, one rule. A blank brief used to spawn a real worker and bill
+    # a turn for nothing: the run is charged, the worker replies that it was
+    # given no task, and only the cost log shows anything happened.
+    if [ -z "${prompt//[[:space:]]/}" ]; then
+      if [ -n "$prompt_file" ]; then
+        echo "claude-api run: prompt file '$prompt_file' is empty" >&2
+      else
+        echo "claude-api run: refusing an empty task — it would spawn a worker and bill a turn for nothing" >&2
+      fi
+      exit 2
+    fi
     case "$slug" in
       *[!A-Za-z0-9._-]*) echo "claude-api run: slug must match [A-Za-z0-9._-]" >&2; exit 2 ;;
     esac

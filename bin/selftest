@@ -396,7 +396,10 @@ CLAUDE_API_CONFIG_DIR="$ISO" "$CA" answer abc --answer-file "$WORK/nope.txt"    
 # an empty positional must be refused too: the file path checks for it, and the
 # parsing rewrite that added these flags briefly let "" through, which delivers
 # a turn with nothing in it and looks like success on both sides
-sendblank=0; sendws=0; ansblank=0; askws=0
+sendblank=0; sendws=0; ansblank=0; askws=0; runws=0; askempty=0; ansempty=0
+( cd dirtyrepo && CLAUDE_API_CONFIG_DIR="$ISO" PATH="$WORK/fakebin:$PATH" "$CA" run st-ws "   " ) > /dev/null 2> t15l.err || runws=$?
+CLAUDE_API_CONFIG_DIR="$ISO" "$CA" ask --question-file "$WORK/brief-empty.txt"     > /dev/null 2> t15m.err || askempty=$?
+CLAUDE_API_CONFIG_DIR="$ISO" "$CA" answer abc --answer-file "$WORK/brief-empty.txt" > /dev/null 2> t15n.err || ansempty=$?
 CLAUDE_API_CONFIG_DIR="$ISO" "$CA" send st-nope ""    > /dev/null 2> t15h.err || sendblank=$?
 CLAUDE_API_CONFIG_DIR="$ISO" "$CA" send st-nope "   " > /dev/null 2> t15i.err || sendws=$?
 CLAUDE_API_CONFIG_DIR="$ISO" "$CA" answer abc ""      > /dev/null 2> t15j.err || ansblank=$?
@@ -409,10 +412,13 @@ if [ "$pfrc" -eq 2 ] && grep -q 'uncommitted changes' t15.err && ! grep -q 'slug
    && [ "$askmiss" -eq 2 ] && grep -q 'cannot read file' t15f.err \
    && [ "$ansmiss" -eq 2 ] && grep -q 'cannot read file' t15g.err \
    && grep -q 'refusing an empty message' t15h.err && grep -q 'refusing an empty message' t15i.err \
-   && grep -q 'refusing an empty answer' t15j.err && grep -q 'usage: claude-api ask' t15k.err; then
+   && grep -q 'refusing an empty answer' t15j.err && grep -q 'usage: claude-api ask' t15k.err \
+   && [ "$runws" -eq 2 ] && grep -q 'refusing an empty task' t15l.err \
+   && [ "$askempty" -eq 2 ] && grep -q 'is empty' t15m.err \
+   && [ "$ansempty" -eq 2 ] && grep -q 'is empty' t15n.err; then
   ok
 else
-  bad "text args: files run=$pfrc/$misrc/$emprc send=$sendmiss/$sendempty ask=$askmiss answer=$ansmiss (want 2); empty positional send=$sendblank/$sendws answer=$ansblank ask=$askws (want nonzero) (t15*.err)"
+  bad "text args: files run=$pfrc/$misrc/$emprc send=$sendmiss/$sendempty ask=$askmiss answer=$ansmiss (want 2); empty text run=$runws send=$sendblank/$sendws answer=$ansblank ask=$askws/$askempty answer-file=$ansempty (t15*.err)"
 fi
 
 if [ "$fails" -eq 0 ]; then
