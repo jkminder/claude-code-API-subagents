@@ -52,7 +52,14 @@ Every `run` worker is **steerable while it runs**: `claude-api send <slug> "<fol
 - Pick a slug unique **within this session** (the dir is per-session, so no cross-session collisions; `run` warns before overwriting a reused slug, and refuses a slug whose worker is still alive). The worker also registers as a native agent named `<slug>` (visible in `ListAgents`; see *Native messaging* below) — pass your own `-n <name>` to override.
 - Prompt must be self-contained: goal, constraints, a verification step ("run the tests and include the output"), and what to report.
 - **Commit policy:** tell workers to leave changes uncommitted (or commit only on their own worktree branch, below) — integration and committing is this session's job. Nothing else stops parallel workers from committing over each other.
-- Model: defaults to fable (pinned by the wrapper via `--settings '{"model": "claude-fable-5"}'` — headless runs ignore the settings.json model key). An explicit `--model` wins: `--model sonnet` for lighter work, `--model opus` when fable is overkill but the task still needs strong reasoning.
+- Model: **always fable — do not pass `--model` (Julian, 2026-08-10).** The
+  wrapper pins it via `--settings '{"model": "claude-fable-5"}'` (headless runs
+  ignore the settings.json model key), so the default is already right. Fable is
+  the strongest model available; `opus` and `sonnet` are steps *down*, so
+  reaching for `--model opus` on a hard job — which reads like an upgrade — gets
+  you a weaker worker on the task that least deserves one. Only override when
+  the work is genuinely trivial and you are optimising cost, which worker
+  credits do not require.
 - Concurrency: **spawn as many workers as the work decomposes into** — one per independent subtask; dozens in parallel is fine. Real limits: machine resources (stagger the next batch if the box gets sluggish) and API rate limits (a 429 in a worker's `.err` means back off and retry that worker, not that you over-delegated). For very wide work, prefer fewer workers that each fan out internally (see below) over hundreds of processes.
 
 ### Let workers decompose further
