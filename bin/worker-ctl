@@ -68,21 +68,27 @@ for pid in spawns:
 PY
 }
 
-# Resolve a worker slug to a file in this session's worker dir; paths pass through.
 # Text arguments that agents write — a steering message, a question, an answer
 # — routinely contain code, backticks and $. Passed as a quoted argument they
 # go through the caller's shell first, which executes the backticks and $( )
 # and delivers text with holes; nothing downstream can tell. Every command
 # taking such text accepts a <thing>-file flag instead, which never touches a
 # shell. Same reasoning as `claude-api run --prompt-file`.
+# Empty or whitespace-only text is never a real message: delivering it burns a
+# worker turn on nothing and looks like success to both sides. A variable that
+# expanded to nothing is the usual way it happens, so both the file path and
+# the positional path check it.
+blank() { [ -z "${1//[[:space:]]/}" ]; }
+
 text_from_file() { # path label
   local p="$1" label="$2" t
   [ -r "$p" ] || { echo "claude-api $label: cannot read file '$p'" >&2; exit 2; }
   t="$(cat -- "$p")"
-  [ -n "${t//[[:space:]]/}" ] || { echo "claude-api $label: file '$p' is empty" >&2; exit 2; }
+  if blank "$t"; then echo "claude-api $label: file '$p' is empty" >&2; exit 2; fi
   printf '%s' "$t"
 }
 
+# Resolve a worker slug to a file in this session's worker dir; paths pass through.
 resolve() { # slug-or-path suffix
   case "$1" in
     */*) printf '%s' "$1" ;;
@@ -265,6 +271,9 @@ send)
   [ -n "$text_file" ] && { text="$(text_from_file "$text_file" send)"; got_text=1; }
   if [ -z "$slug" ] || [ "$got_text" -eq 0 ]; then
     echo 'usage: claude-api send <slug|fifo-path> "<message>" OR --message-file <path>, then [--wait [secs]]' >&2; exit 1
+  fi
+  if blank "$text"; then
+    echo 'claude-api send: refusing an empty message — it would burn a worker turn on nothing' >&2; exit 1
   fi
   fifo="$(resolve "$slug" .in)"
   if [ ! -p "$fifo" ]; then
@@ -450,7 +459,7 @@ ask)
   done
   [ -n "$q_file" ] && q="$(text_from_file "$q_file" ask)"
   case "$tmo" in ''|*[!0-9]*) echo "claude-api ask: --timeout must be a number of seconds" >&2; exit 1 ;; esac
-  if [ -z "$q" ]; then
+  if blank "$q"; then
     echo 'usage: claude-api ask [--from <name>] [--timeout <secs>] "<question>" OR --question-file <path>' >&2; exit 1
   fi
   QDIR="$(qdir_for "${CLAUDE_API_PARENT_SID:-}")"
@@ -547,6 +556,9 @@ answer)
   [ -n "$text_file" ] && { text="$(text_from_file "$text_file" answer)"; got_text=1; }
   if [ -z "$qid" ] || [ "$got_text" -eq 0 ]; then
     echo 'usage: claude-api answer <qid> "<answer text>" OR --answer-file <path>' >&2; exit 1
+  fi
+  if blank "$text"; then
+    echo 'claude-api answer: refusing an empty answer — the worker would resume with nothing' >&2; exit 1
   fi
   # qid becomes a filename — same charset ask generates; rejects traversal.
   case "$qid" in *[!A-Za-z0-9_-]*) echo "claude-api answer: malformed qid" >&2; exit 1 ;; esac

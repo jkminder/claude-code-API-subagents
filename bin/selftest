@@ -370,7 +370,7 @@ else
 fi
 
 echo
-step "15/15 file-based text args: run/send/ask/answer keep backticks and $ out of the shell"
+step "15/15 text args: file flags keep backticks out of the shell, and empty text is refused"
 # A brief passed as a quoted argument is mangled by the CALLER's shell before
 # run sees it, so the durable fix is to read it from a file. Guard both the
 # file reading and the argument parsing around it: an earlier version of this
@@ -393,16 +393,26 @@ CLAUDE_API_CONFIG_DIR="$ISO" "$CA" send st-nope --message-file "$WORK/nope.txt" 
 CLAUDE_API_CONFIG_DIR="$ISO" "$CA" send st-nope --message-file "$WORK/brief-empty.txt" > /dev/null 2> t15e.err || sendempty=$?
 CLAUDE_API_CONFIG_DIR="$ISO" "$CA" ask --question-file "$WORK/nope.txt"          > /dev/null 2> t15f.err || askmiss=$?
 CLAUDE_API_CONFIG_DIR="$ISO" "$CA" answer abc --answer-file "$WORK/nope.txt"     > /dev/null 2> t15g.err || ansmiss=$?
+# an empty positional must be refused too: the file path checks for it, and the
+# parsing rewrite that added these flags briefly let "" through, which delivers
+# a turn with nothing in it and looks like success on both sides
+sendblank=0; sendws=0; ansblank=0; askws=0
+CLAUDE_API_CONFIG_DIR="$ISO" "$CA" send st-nope ""    > /dev/null 2> t15h.err || sendblank=$?
+CLAUDE_API_CONFIG_DIR="$ISO" "$CA" send st-nope "   " > /dev/null 2> t15i.err || sendws=$?
+CLAUDE_API_CONFIG_DIR="$ISO" "$CA" answer abc ""      > /dev/null 2> t15j.err || ansblank=$?
+CLAUDE_API_CONFIG_DIR="$ISO" "$CA" ask "   "          > /dev/null 2> t15k.err || askws=$?
 if [ "$pfrc" -eq 2 ] && grep -q 'uncommitted changes' t15.err && ! grep -q 'slug must match' t15.err \
    && [ "$misrc" -eq 2 ] && grep -q 'cannot read prompt file' t15b.err \
    && [ "$emprc" -eq 2 ] && grep -q 'is empty' t15c.err \
    && [ "$sendmiss" -eq 2 ] && grep -q 'cannot read file' t15d.err \
    && [ "$sendempty" -eq 2 ] && grep -q 'is empty' t15e.err \
    && [ "$askmiss" -eq 2 ] && grep -q 'cannot read file' t15f.err \
-   && [ "$ansmiss" -eq 2 ] && grep -q 'cannot read file' t15g.err; then
+   && [ "$ansmiss" -eq 2 ] && grep -q 'cannot read file' t15g.err \
+   && grep -q 'refusing an empty message' t15h.err && grep -q 'refusing an empty message' t15i.err \
+   && grep -q 'refusing an empty answer' t15j.err && grep -q 'usage: claude-api ask' t15k.err; then
   ok
 else
-  bad "file text args: run dirty rc=$pfrc/missing $misrc/empty $emprc; send $sendmiss/$sendempty; ask $askmiss; answer $ansmiss — all want 2 (t15*.err)"
+  bad "text args: files run=$pfrc/$misrc/$emprc send=$sendmiss/$sendempty ask=$askmiss answer=$ansmiss (want 2); empty positional send=$sendblank/$sendws answer=$ansblank ask=$askws (want nonzero) (t15*.err)"
 fi
 
 if [ "$fails" -eq 0 ]; then
