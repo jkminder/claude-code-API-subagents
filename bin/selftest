@@ -393,10 +393,17 @@ CLAUDE_API_CONFIG_DIR="$ISO" "$CA" send st-nope --message-file "$WORK/nope.txt" 
 CLAUDE_API_CONFIG_DIR="$ISO" "$CA" send st-nope --message-file "$WORK/brief-empty.txt" > /dev/null 2> t15e.err || sendempty=$?
 CLAUDE_API_CONFIG_DIR="$ISO" "$CA" ask --question-file "$WORK/nope.txt"          > /dev/null 2> t15f.err || askmiss=$?
 CLAUDE_API_CONFIG_DIR="$ISO" "$CA" answer abc --answer-file "$WORK/nope.txt"     > /dev/null 2> t15g.err || ansmiss=$?
+# MEASURED, not asserted: 8/8 guards in this family fail this check when
+# neutralised one at a time (sweep run against a throwaway worktree, never the
+# live tools — claude-api on PATH is a symlink into this repo). Re-measure
+# after adding a guard; "I mutation-test these" is a practice, the coverage
+# number is a measurement.
 # an empty positional must be refused too: the file path checks for it, and the
 # parsing rewrite that added these flags briefly let "" through, which delivers
 # a turn with nothing in it and looks like success on both sides
-sendblank=0; sendws=0; ansblank=0; askws=0; runws=0; askempty=0; ansempty=0
+sendblank=0; sendws=0; ansblank=0; askws=0; runws=0; askempty=0; ansempty=0; badslug=0
+# the slug becomes a filename, so its charset guard is what stops traversal
+( cd dirtyrepo && CLAUDE_API_CONFIG_DIR="$ISO" PATH="$WORK/fakebin:$PATH" "$CA" run ../evil 'x' ) > /dev/null 2> t15o.err || badslug=$?
 ( cd dirtyrepo && CLAUDE_API_CONFIG_DIR="$ISO" PATH="$WORK/fakebin:$PATH" "$CA" run st-ws "   " ) > /dev/null 2> t15l.err || runws=$?
 CLAUDE_API_CONFIG_DIR="$ISO" "$CA" ask --question-file "$WORK/brief-empty.txt"     > /dev/null 2> t15m.err || askempty=$?
 CLAUDE_API_CONFIG_DIR="$ISO" "$CA" answer abc --answer-file "$WORK/brief-empty.txt" > /dev/null 2> t15n.err || ansempty=$?
@@ -415,10 +422,11 @@ if [ "$pfrc" -eq 2 ] && grep -q 'uncommitted changes' t15.err && ! grep -q 'slug
    && grep -q 'refusing an empty answer' t15j.err && grep -q 'usage: claude-api ask' t15k.err \
    && [ "$runws" -eq 2 ] && grep -q 'refusing an empty task' t15l.err \
    && [ "$askempty" -eq 2 ] && grep -q 'is empty' t15m.err \
-   && [ "$ansempty" -eq 2 ] && grep -q 'is empty' t15n.err; then
+   && [ "$ansempty" -eq 2 ] && grep -q 'is empty' t15n.err \
+   && [ "$badslug" -eq 2 ] && grep -q 'slug must match' t15o.err; then
   ok
 else
-  bad "text args: files run=$pfrc/$misrc/$emprc send=$sendmiss/$sendempty ask=$askmiss answer=$ansmiss (want 2); empty text run=$runws send=$sendblank/$sendws answer=$ansblank ask=$askws/$askempty answer-file=$ansempty (t15*.err)"
+  bad "text args: files run=$pfrc/$misrc/$emprc send=$sendmiss/$sendempty ask=$askmiss answer=$ansmiss (want 2); empty text run=$runws send=$sendblank/$sendws answer=$ansblank ask=$askws/$askempty answer-file=$ansempty badslug=$badslug (t15*.err)"
 fi
 
 if [ "$fails" -eq 0 ]; then
