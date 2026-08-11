@@ -10,11 +10,19 @@ Like pod-gate, it denies once per agent and lets a deliberate re-run through:
 when Julian HAS asked for a subagent, re-running is the confirmation. It is a
 speed bump, not a lock. See ../skills/delegate/SKILL.md.
 
-Verified: the deny reason reaches the calling agent (tested against this script
-directly), and workers are unaffected (probe worker, 2026-08-11). NOT verified:
-whether a denial is visible to Julian in his own UI, or only to the agent. That
-is only measurable by triggering one gated spawn from his session, which no
-agent should do on its own initiative — so do not let "tested" cover it.
+What is actually verified, stated narrowly on purpose:
+
+- This script emits the right decision for each input, pinned by selftest check
+  16 and mutation-tested (2026-08-11).
+- Workers do not see this hook: `claude-api` sets CLAUDE_CONFIG_DIR, so they
+  read a different settings.json — a probe worker's Agent call went through
+  untouched (2026-08-11).
+
+Not verified by anyone: that Claude Code delivers permissionDecisionReason to
+the calling agent (that is the documented contract, not something measured
+here), and whether a denial is visible to Julian in his own UI at all. Both are
+only measurable by triggering a gated spawn from a live session, which no agent
+should do on its own initiative. "Tested" above means the script, not the path.
 """
 
 import hashlib

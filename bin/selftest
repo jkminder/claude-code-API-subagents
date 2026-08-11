@@ -2,8 +2,8 @@
 # Validation matrix (dispatched as: claude-api selftest). Re-verifies the
 # version-pinned behaviors the framework depends on — run after Claude Code
 # upgrades. Spends a few API-billed sonnet/haiku runs; the supervision-protocol
-# checks (7-9) and the guard/shim checks (11-15) use stub workers and are free.
-# SELFTEST_SKIP_LIVE=1 skips checks 1-10 and runs only 11-15, which need no API
+# checks (7-9) and the guard/shim checks (11-16) use stub workers and are free.
+# SELFTEST_SKIP_LIVE=1 skips checks 1-10 and runs only 11-16, which need no API
 # key and never spawn a real claude — use it to iterate on the shim checks.
 set -uo pipefail
 
@@ -40,7 +40,7 @@ step() { echo; echo "== $1"; }
 ok()   { echo "   PASS"; }
 bad()  { echo "   FAIL: $1"; fails=$((fails + 1)); }
 
-[ -n "${SELFTEST_SKIP_LIVE:-}" ] && echo "SELFTEST_SKIP_LIVE set — running only the guard/shim checks (11-15)"
+[ -n "${SELFTEST_SKIP_LIVE:-}" ] && echo "SELFTEST_SKIP_LIVE set — running only the guard/shim checks (11-16)"
 
 if [ -z "${SELFTEST_SKIP_LIVE:-}" ]; then
 
@@ -272,7 +272,7 @@ printf 'sk-dummy-selftest\n' > "$ISO/api-key"
 chmod 600 "$ISO/api-key"
 IRWDIR="$ISO/run/workers/${CLAUDE_CODE_SESSION_ID:-manual}"
 
-step "11/15 run: dirty-tree guard — refuses in a dirty repo, skipped outside a repo"
+step "11/16 run: dirty-tree guard — refuses in a dirty repo, skipped outside a repo"
 git init -q dirtyrepo
 echo x > dirtyrepo/uncommitted.txt
 ( cd dirtyrepo && CLAUDE_API_CONFIG_DIR="$ISO" PATH="$WORK/fakebin:$PATH" "$CA" run st-dirty 'x' ) > t11.out 2> t11.err
@@ -288,7 +288,7 @@ else
   bad "dirty guard: dirty rc=$drc want 2 + refusal + no worker artifacts; non-repo rc=$nrc want 0 (t11.err / t11b.err)"
 fi
 
-step "12/15 run: failure shapes labeled correctly in the cost log (parked vs died-after-result)"
+step "12/16 run: failure shapes labeled correctly in the cost log (parked vs died-after-result)"
 FAKE_MODE=parked PATH="$WORK/fakebin:$PATH" CLAUDE_API_CONFIG_DIR="$ISO" "$CA" run st-parked 'x' > t12.out 2> t12.err
 prc=$?
 FAKE_MODE=dieafter PATH="$WORK/fakebin:$PATH" CLAUDE_API_CONFIG_DIR="$ISO" "$CA" run st-dieafter 'x' > t12b.out 2> t12b.err
@@ -302,7 +302,7 @@ else
   bad "failure labels: parked rc=$prc want 1 + failed=empty-result; dieafter rc=$darc want 1 + failed=exit-7, never empty-result (t12.err / t12b.err / $ISO/cost-log.jsonl)"
 fi
 
-step "13/15 headless injections: ScheduleWakeup denial, briefing, -n slug on run spawns only"
+step "13/16 headless injections: ScheduleWakeup denial, briefing, -n slug on run spawns only"
 mkdir -p argbin
 cat > argbin/claude <<'EOF'
 #!/usr/bin/env bash
@@ -356,7 +356,7 @@ else
                         || bad "headless injections: missing/duplicated on the run spawn, or present interactively (t13run.argv / t13nam.argv / t13int.argv)"
 fi
 
-step "14/15 run: close-linger guard — post-close wedge terminated, run still succeeds"
+step "14/16 run: close-linger guard — post-close wedge terminated, run still succeeds"
 lstart="$(date +%s)"
 FAKE_MODE=linger PATH="$WORK/fakebin:$PATH" CLAUDE_API_CONFIG_DIR="$ISO" CLAUDE_API_CLOSE_GRACE=3 \
   "$CA" run st-linger 'x' > t14.out 2> t14.err
@@ -370,7 +370,7 @@ else
 fi
 
 echo
-step "15/15 text args: file flags keep backticks out of the shell, and empty text is refused"
+step "15/16 text args: file flags keep backticks out of the shell, and empty text is refused"
 # A brief passed as a quoted argument is mangled by the CALLER's shell before
 # run sees it, so the durable fix is to read it from a file. Guard both the
 # file reading and the argument parsing around it: an earlier version of this
@@ -429,11 +429,57 @@ else
   bad "text args: files run=$pfrc/$misrc/$emprc send=$sendmiss/$sendempty ask=$askmiss answer=$ansmiss (want 2); empty text run=$runws send=$sendblank/$sendws answer=$ansblank ask=$askws/$askempty answer-file=$ansempty badslug=$badslug (t15*.err)"
 fi
 
+echo
+step "16/16 subagent gate: normal types denied once, claude-code-guide only on a named cheap model"
+# Free: pipes JSON into the hook, spawns nothing. The gate is fail-open — when
+# it breaks, nothing visible happens and the only difference is which spawns
+# run — so its behaviour is pinned here rather than left to manual checks.
+GATE="$BIN_DIR/subagent-gate-hook"
+export XDG_CACHE_HOME="$WORK/gate-cache"   # never touch the real marker files
+# CLAUDE_API_PARENT_SID must be cleared per call: if selftest itself runs inside
+# a worker, the gate exempts everything and every assertion below would pass
+# without testing anything.
+g() { # tool session subagent_type model -> DENY|ALLOW
+  local out
+  out=$(printf '{"tool_name":"%s","session_id":"%s","agent_id":"","tool_input":{"subagent_type":"%s","model":"%s"}}' \
+        "$1" "$2" "$3" "$4" | env -u CLAUDE_API_PARENT_SID "$GATE" 2>/dev/null)
+  [ -n "$out" ] && echo DENY || echo ALLOW
+}
+gworker=$(printf '{"tool_name":"Agent","session_id":"gw","tool_input":{"subagent_type":"general-purpose"}}' \
+          | CLAUDE_API_PARENT_SID=parent-sid "$GATE" 2>/dev/null)
+printf 'not json at all' | env -u CLAUDE_API_PARENT_SID "$GATE" > gate-bad.out 2> gate-bad.err; gbadrc=$?
+gnorm1=$(g Agent g1 general-purpose "")      # first attempt: denied
+gnorm2=$(g Agent g1 general-purpose "")      # deliberate re-run: allowed (speed bump)
+gfork=$(g Agent g2 fork "")
+gexplore=$(g Agent g3 Explore "")            # not exempt: a worker can search a repo
+# with a cheap model too: an exempt type would ALLOW this, a gated one denies it,
+# which is what separates "Explore is gated" from "Explore needs a cheap model"
+gexplore2=$(g Agent g11 Explore sonnet)
+gtask=$(g Task g4 general-purpose "")        # the older tool name
+ggood=$(g Agent g5 claude-code-guide sonnet)
+ghaiku=$(g Agent g6 claude-code-guide haiku)
+gnomodel=$(g Agent g7 claude-code-guide "")  # the regression: omitted != cheap
+gopus=$(g Agent g8 claude-code-guide opus)
+gfable=$(g Agent g9 claude-code-guide fable)
+gfable2=$(g Agent g9 claude-code-guide fable)  # wrong argument: denied every time
+gbash=$(g Bash g10 "" "")                    # must not fire on other tools
+if [ "$gnorm1" = DENY ] && [ "$gnorm2" = ALLOW ] && [ "$gfork" = DENY ] \
+   && [ "$gexplore" = DENY ] && [ "$gexplore2" = DENY ] && [ "$gtask" = DENY ] \
+   && [ "$ggood" = ALLOW ] && [ "$ghaiku" = ALLOW ] \
+   && [ "$gnomodel" = DENY ] && [ "$gopus" = DENY ] \
+   && [ "$gfable" = DENY ] && [ "$gfable2" = DENY ] \
+   && [ "$gbash" = ALLOW ] && [ -z "$gworker" ] \
+   && [ "$gbadrc" -eq 0 ] && [ ! -s gate-bad.out ]; then
+  ok
+else
+  bad "gate: normal=$gnorm1/$gnorm2 fork=$gfork explore=$gexplore/$gexplore2 task=$gtask (want DENY/ALLOW/DENY/DENY/DENY/DENY); guide sonnet=$ggood haiku=$ghaiku nomodel=$gnomodel opus=$gopus fable=$gfable/$gfable2 (want ALLOW/ALLOW/DENY/DENY/DENY/DENY); bash=$gbash (want ALLOW); worker='$gworker' (want empty); malformed rc=$gbadrc (want 0)"
+fi
+
 if [ "$fails" -eq 0 ]; then
   if [ -n "${SELFTEST_SKIP_LIVE:-}" ]; then
-    echo "selftest: checks 11-15 passed (live checks 1-10 SKIPPED)"
+    echo "selftest: checks 11-16 passed (live checks 1-10 SKIPPED)"
   else
-    echo "selftest: all 15 checks passed"
+    echo "selftest: all 16 checks passed"
   fi
 else
   echo "selftest: $fails check(s) FAILED"
