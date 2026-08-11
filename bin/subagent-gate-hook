@@ -21,16 +21,33 @@ import sys
 # vanish silently if the tool is ever renamed back.
 SUBAGENT_TOOLS = {"Agent", "Task"}
 
+# The one type a claude-api worker cannot replace: claude-code-guide answers
+# from curated Claude Code documentation. Julian allows it (2026-08-11), but not
+# on Fable. Explore is deliberately NOT here — a worker can search a repo just as
+# well, so it goes through delegation like any other normal subagent.
+ALLOWED_TYPES = {"claude-code-guide"}
+
+FABLE_MESSAGE = (
+    "Julian, 2026-08-11: do not run {kind} on Fable. Re-run this call with "
+    "model: \"sonnet\" (or \"haiku\" for a simple lookup). Fable is the "
+    "strongest and most expensive model, and this type of subagent does not "
+    "need it — the type is allowed precisely because it is cheap."
+)
+
 MESSAGE = (
     "Built-in subagents bill Julian's subscription; claude-api workers bill a "
-    "flat API pool, so delegation should go through them. Julian's rule "
-    "(2026-08-11): only spawn a normal subagent when he asked for one in this "
-    "conversation.\n"
-    "Did he? If yes, re-run this exact call and it will go through. If no, use "
-    "`claude-api run <slug> --prompt-file <path>` instead (skills/delegate), "
-    "and if you think this particular job genuinely needs a built-in subagent "
-    "— a specialised type like claude-code-guide, or a fork that needs your "
-    "context — ask him rather than deciding it yourself."
+    "flat API pool. Julian's rule (2026-08-11): **normal subagents should never "
+    "be used** — not general-purpose, not fork, not claude — unless he asked "
+    "for one in this conversation.\n"
+    "Did he, explicitly? If yes, re-run this exact call and it will go through. "
+    "If no, delegate with `claude-api run <slug> --prompt-file <path>` "
+    "(skills/delegate) — it is the same effort, one background Bash call. "
+    "Wanting the answer in your own context is not a reason; ask him if you "
+    "think this job is the exception.\n"
+    "Only one type is allowed without asking: subagent_type "
+    "\"claude-code-guide\" (Claude Code documentation), and only with model: "
+    "\"sonnet\" or \"haiku\", never Fable. Explore is not exempt — a worker can "
+    "search a repo too."
 )
 
 
@@ -88,14 +105,27 @@ def main():
         return
     if inside_worker():
         return  # workers are told to fan out this way; see inside_worker()
+    tool_input = payload.get("tool_input") or {}
+    kind = str(tool_input.get("subagent_type") or "")
+    if kind in ALLOWED_TYPES:
+        # Allowed, but not on Fable. Denied every time rather than once: this is
+        # a wrong argument, not a decision to reconsider, so re-running it
+        # unchanged must keep failing until the model is changed.
+        if str(tool_input.get("model") or "").strip().lower() == "fable":
+            deny(FABLE_MESSAGE.format(kind=kind))
+        return
     if not first_attempt(payload):
         return  # already interrupted once; the agent re-ran it deliberately
+    deny(MESSAGE)
+
+
+def deny(reason):
     json.dump(
         {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "permissionDecisionReason": MESSAGE,
+                "permissionDecisionReason": reason,
             }
         },
         sys.stdout,
