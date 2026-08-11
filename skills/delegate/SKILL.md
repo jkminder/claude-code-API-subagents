@@ -59,10 +59,11 @@ Every `run` worker is **steerable while it runs**: `claude-api send <slug> "<fol
   reaching for `--model opus` on a hard job — which reads like an upgrade — gets
   you a weaker worker on the task that least deserves one. Only override when
   the work is genuinely trivial and you are optimising cost, which worker
-  credits do not require. This is a **convention, not a block**: `claude-api`
-  still honours an explicit `--model`, and a caller-supplied `--settings`
-  suppresses the Fable pin entirely. Whether that escape hatch should stay open
-  is Julian's call, not the wrapper's.
+  credits do not require. This is a **convention, not a block**, and Julian has
+  decided it stays that way (2026-08-11): `claude-api` still honours an explicit
+  `--model`, and a caller-supplied `--settings` suppresses the Fable pin
+  entirely. So the wrapper will not stop you passing the wrong thing — the rule
+  above is the only thing that does.
 - Concurrency: **spawn as many workers as the work decomposes into** — one per independent subtask; dozens in parallel is fine. Real limits: machine resources (stagger the next batch if the box gets sluggish) and API rate limits (a 429 in a worker's `.err` means back off and retry that worker, not that you over-delegated). For very wide work, prefer fewer workers that each fan out internally (see below) over hundreds of processes.
 
 ### Let workers decompose further
