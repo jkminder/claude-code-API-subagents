@@ -27,11 +27,16 @@ SUBAGENT_TOOLS = {"Agent", "Task"}
 # well, so it goes through delegation like any other normal subagent.
 ALLOWED_TYPES = {"claude-code-guide"}
 
+CHEAP_MODELS = {"sonnet", "haiku"}
+
 FABLE_MESSAGE = (
-    "Julian, 2026-08-11: do not run {kind} on Fable. Re-run this call with "
-    "model: \"sonnet\" (or \"haiku\" for a simple lookup). Fable is the "
-    "strongest and most expensive model, and this type of subagent does not "
-    "need it — the type is allowed precisely because it is cheap."
+    "Julian, 2026-08-11: do not run {kind} on Fable, and name the model "
+    "explicitly. Re-run with model: \"sonnet\", or \"haiku\" for a simple "
+    "lookup. {why}\n"
+    "An omitted model is refused rather than assumed cheap: it inherits "
+    "whatever this session runs, so it cannot be shown not to be Fable — a "
+    "session configured to Fable would produce one silently, which is the case "
+    "this gate exists to stop."
 )
 
 MESSAGE = (
@@ -108,11 +113,15 @@ def main():
     tool_input = payload.get("tool_input") or {}
     kind = str(tool_input.get("subagent_type") or "")
     if kind in ALLOWED_TYPES:
-        # Allowed, but not on Fable. Denied every time rather than once: this is
-        # a wrong argument, not a decision to reconsider, so re-running it
-        # unchanged must keep failing until the model is changed.
-        if str(tool_input.get("model") or "").strip().lower() == "fable":
-            deny(FABLE_MESSAGE.format(kind=kind))
+        # Allowed, but only on a named cheap model. Denied every time rather
+        # than once: a wrong model argument is not a decision to reconsider, so
+        # re-running unchanged must keep failing until the model changes.
+        model = str(tool_input.get("model") or "").strip().lower()
+        if model not in CHEAP_MODELS:
+            deny(FABLE_MESSAGE.format(
+                kind=kind,
+                why=(f"{model!r} is not one of {sorted(CHEAP_MODELS)}."
+                     if model else "No model was given.")))
         return
     if not first_attempt(payload):
         return  # already interrupted once; the agent re-ran it deliberately
