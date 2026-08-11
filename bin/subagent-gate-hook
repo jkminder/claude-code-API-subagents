@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""PreToolUse hook: interrupt the first built-in-subagent spawn per agent.
+
+The built-in Agent tool bills Julian's subscription; `claude-api run` bills a
+flat API credit pool. Julian's rule (2026-08-11): spawning a normal subagent is
+forbidden unless he asked for one in the conversation — otherwise delegate with
+`claude-api run`. This hook makes that a decision instead of a reflex.
+
+Like pod-gate, it denies once per agent and lets a deliberate re-run through:
+when Julian HAS asked for a subagent, re-running is the confirmation. It is a
+speed bump, not a lock. See ../skills/delegate/SKILL.md.
+"""
+
+import hashlib
+import json
+import os
+import sys
+
+# Both names are accepted: this harness calls the tool "Agent", older Claude
+# Code called it "Task". Matching only the current name would make the gate
+# vanish silently if the tool is ever renamed back.
+SUBAGENT_TOOLS = {"Agent", "Task"}
+
+MESSAGE = (
+    "Built-in subagents bill Julian's subscription; claude-api workers bill a "
+    "flat API pool, so delegation should go through them. Julian's rule "
+    "(2026-08-11): only spawn a normal subagent when he asked for one in this "
+    "conversation.\n"
+    "Did he? If yes, re-run this exact call and it will go through. If no, use "
+    "`claude-api run <slug> --prompt-file <path>` instead (skills/delegate), "
+    "and if you think this particular job genuinely needs a built-in subagent "
+    "— a specialised type like claude-code-guide, or a fork that needs your "
+    "context — ask him rather than deciding it yourself."
+)
+
+
+def inside_worker():
+    """True when this Claude Code process is a claude-api worker.
+
+    A worker is already on API billing, and the delegate skill tells it to fan
+    out with built-in subagents — that is the recommended pattern, not a misuse,
+    so the gate must not fire there. `claude-api` exports CLAUDE_API_PARENT_SID
+    into the worker and never un-exports it (unlike CLAUDE_API_RUN_SLUG, which
+    it deliberately drops), so its presence marks a worker process. A session
+    Julian started himself does not have it.
+    """
+    return bool(os.environ.get("CLAUDE_API_PARENT_SID", "").strip())
+
+
+def state_dir():
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "subagent-gate")
+
+
+def first_attempt(payload):
+    """Claim this agent's marker file. True only for the first claimer."""
+    session = payload.get("session_id") or ""
+    if not session:
+        return True  # no identity to key on: treat every attempt as the first
+    # Subagents share the parent's session_id but carry their own agent_id, so
+    # each one gets its own interrupt instead of spending the session's.
+    agent = payload.get("agent_id") or ""
+    key = hashlib.sha256((session + "\x00" + agent).encode()).hexdigest()[:32]
+    path = os.path.join(state_dir(), key)
+    try:
+        os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+        os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    except FileExistsError:
+        return False
+    except OSError:
+        return True  # cannot record state -> interrupt; the safe direction here
+    return True
+
+
+def main():
+    payload = json.loads(sys.stdin.read())
+    if payload.get("tool_name") not in SUBAGENT_TOOLS:
+        return
+    if inside_worker():
+        return  # workers are told to fan out this way; see inside_worker()
+    if not first_attempt(payload):
+        return  # already interrupted once; the agent re-ran it deliberately
+    json.dump(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": MESSAGE,
+            }
+        },
+        sys.stdout,
+    )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:  # noqa: BLE001 — a broken gate must not brick the tool
+        sys.exit(0)
