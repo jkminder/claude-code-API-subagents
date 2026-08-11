@@ -46,7 +46,7 @@ The same applies to every other command that carries text you wrote: `claude-api
 
 Every `run` worker is **steerable while it runs**: `claude-api send <slug> "<follow-up>"` injects messages mid-run (see *Steering a running worker* below). With nothing sent it behaves one-shot — one turn, then it closes and reports.
 
-- Exit 0 → stdout is the answer, never empty (a stderr footer gives cost, turn count, the resume handle, and the `.ndjson` path). Exit 1 → a `FAILED` line with the failure subtype, cost, a `cause:` line when the cause is known (budget cap, turn limit, worker parked itself), any partial result, and the worker's stderr tail; respin or resume. Exit 2 → refused before spawning (bad usage, `$HOME` cwd, or a dirty tree — see above). Extra flags pass through after the prompt: `claude-api run <slug> "<task>" --model sonnet --allowedTools "Bash(git push *)"`.
+- Exit 0 → stdout is the answer, never empty (a stderr footer gives cost, turn count, the resume handle, and the `.ndjson` path). Exit 1 → a `FAILED` line with the failure subtype, cost, a `cause:` line when the cause is known (budget cap, turn limit, worker parked itself), any partial result, and the worker's stderr tail; respin or resume. Exit 2 → refused before spawning (bad usage, `$HOME` cwd, or a dirty tree — see above). Extra flags pass through after the prompt: `claude-api run <slug> "<task>" --allowedTools "Bash(git push *)"` (not `--model` — see *Model* below).
 - `--stay` keeps the worker alive between turns — it idles waiting for the next `send` until `claude-api end <slug>` or death. Use it for monitors, babysitters, and any standing worker. Without `--stay` the run closes once every message it received has been answered.
 - No default spend cap (the key bills a flat pool). For a run you want bounded — e.g. an experimental loop that could spin — pass `--max-budget-usd <n>` yourself, or set `CLAUDE_API_MAX_BUDGET_USD` to give every headless run a default ceiling.
 - Pick a slug unique **within this session** (the dir is per-session, so no cross-session collisions; `run` warns before overwriting a reused slug, and refuses a slug whose worker is still alive). The worker also registers as a native agent named `<slug>` (visible in `ListAgents`; see *Native messaging* below) — pass your own `-n <name>` to override.
@@ -59,7 +59,10 @@ Every `run` worker is **steerable while it runs**: `claude-api send <slug> "<fol
   reaching for `--model opus` on a hard job — which reads like an upgrade — gets
   you a weaker worker on the task that least deserves one. Only override when
   the work is genuinely trivial and you are optimising cost, which worker
-  credits do not require.
+  credits do not require. This is a **convention, not a block**: `claude-api`
+  still honours an explicit `--model`, and a caller-supplied `--settings`
+  suppresses the Fable pin entirely. Whether that escape hatch should stay open
+  is Julian's call, not the wrapper's.
 - Concurrency: **spawn as many workers as the work decomposes into** — one per independent subtask; dozens in parallel is fine. Real limits: machine resources (stagger the next batch if the box gets sluggish) and API rate limits (a 429 in a worker's `.err` means back off and retry that worker, not that you over-delegated). For very wide work, prefer fewer workers that each fan out internally (see below) over hundreds of processes.
 
 ### Let workers decompose further
