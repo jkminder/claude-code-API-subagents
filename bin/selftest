@@ -337,7 +337,12 @@ if sid:
             break
 PY
 )"
-if [ -n "$my_name" ]; then
+# Inside a claude-api worker this shell's own session IS a worker, so the name
+# the registry returns is the worker's, not the interactive parent the briefing
+# names — the sentence is legitimately absent for the same reason as a plain
+# terminal. Without this the suite cannot run green from a worker, which check
+# 16 otherwise supports.
+if [ -n "$my_name" ] && [ -z "${CLAUDE_API_PARENT_SID:-}" ]; then
   grep -x -A1 -- '--append-system-prompt' t13run.argv | grep -qF "agent named '$my_name'" || pname_ok=0
 fi
 if grep -x -A1 -- '--disallowedTools' t13run.argv | grep -qx 'ScheduleWakeup' \
