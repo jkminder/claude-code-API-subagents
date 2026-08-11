@@ -36,6 +36,11 @@ wait_for() { # file pattern timeout_secs
   return 1
 }
 
+# Standing down a check needs the same evidence as reporting one. Three checks
+# in this file were disabled this week on justifications that were all wrong
+# (the model gate, check 16's worker safety, check 13's parent name), and every
+# one survived review because a disabled check is green either way. If a check
+# cannot run somewhere, prove what it sees there before you skip it.
 step() { echo; echo "== $1"; }
 ok()   { echo "   PASS"; }
 bad()  { echo "   FAIL: $1"; fails=$((fails + 1)); }
@@ -323,7 +328,13 @@ FAKE_ARGV_OUT="$WORK/t13int.argv" PATH="$WORK/argbin:$PATH" CLAUDE_API_CONFIG_DI
 # the registry (otherwise the sentence is legitimately absent, e.g. plain
 # terminal or the parent session restarted).
 pname_ok=1
-my_name="$(python3 - "$HOME/.claude/sessions" "${CLAUDE_CODE_SESSION_ID:-}" 2>/dev/null <<'PY'
+# The briefing names the session that SPAWNED the worker, and claude-api
+# resolves that from CLAUDE_API_PARENT_SID when it is set (line 577,
+# "never overwrite an inherited value"). Keying the expected name on this
+# session's own id is what made the check fail inside a worker: the
+# briefing said fleet-ops-handler and the test demanded the worker's own
+# slug. Same fallback claude-api uses, so an interactive run is unchanged.
+my_name="$(python3 - "$HOME/.claude/sessions" "${CLAUDE_API_PARENT_SID:-${CLAUDE_CODE_SESSION_ID:-}}" 2>/dev/null <<'PY'
 import glob, json, sys
 d, sid = sys.argv[1], sys.argv[2]
 if sid:
@@ -337,12 +348,7 @@ if sid:
             break
 PY
 )"
-# Inside a claude-api worker this shell's own session IS a worker, so the name
-# the registry returns is the worker's, not the interactive parent the briefing
-# names — the sentence is legitimately absent for the same reason as a plain
-# terminal. Without this the suite cannot run green from a worker, which check
-# 16 otherwise supports.
-if [ -n "$my_name" ] && [ -z "${CLAUDE_API_PARENT_SID:-}" ]; then
+if [ -n "$my_name" ]; then
   grep -x -A1 -- '--append-system-prompt' t13run.argv | grep -qF "agent named '$my_name'" || pname_ok=0
 fi
 if grep -x -A1 -- '--disallowedTools' t13run.argv | grep -qx 'ScheduleWakeup' \
