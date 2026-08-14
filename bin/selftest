@@ -486,11 +486,32 @@ else
   bad "gate: normal=$gnorm1/$gnorm2 fork=$gfork explore=$gexplore/$gexplore2 task=$gtask (want DENY/ALLOW/DENY/DENY/DENY/DENY); guide sonnet=$ggood haiku=$ghaiku nomodel=$gnomodel opus=$gopus fable=$gfable/$gfable2 (want ALLOW/ALLOW/DENY/DENY/DENY/DENY); bash=$gbash (want ALLOW); worker='$gworker' (want empty); malformed rc=$gbadrc (want 0)"
 fi
 
+echo
+step "17/17 claude-sub: strips API auth and the worker marker before exec"
+# claude-sub's one job is that boundary. The worker marker matters as much as
+# the key: the subagent gate stands down on its bare presence, so leaving it
+# set would let the subscription session fan out built-in subagents ungated
+# (reviewer finding, 2026-08-14). A stub claude records what crosses.
+mkdir -p subbin
+cat > subbin/claude <<'EOF'
+#!/usr/bin/env bash
+echo "SID=[${CLAUDE_API_PARENT_SID:-unset}] KEY=[${ANTHROPIC_API_KEY:-unset}] TOK=[${ANTHROPIC_AUTH_TOKEN:-unset}] URL=[${ANTHROPIC_BASE_URL:-unset}] CFG=[${CLAUDE_CONFIG_DIR:-unset}]"
+EOF
+chmod +x subbin/claude
+subout=$(CLAUDE_API_PARENT_SID=fake-worker ANTHROPIC_API_KEY=k ANTHROPIC_AUTH_TOKEN=t \
+         ANTHROPIC_BASE_URL=u CLAUDE_SUB_CONFIG_DIR="$WORK/subcfg" \
+         PATH="$WORK/subbin:$PATH" "$BIN_DIR/claude-sub" probe 2>/dev/null)
+if [ "$subout" = "SID=[unset] KEY=[unset] TOK=[unset] URL=[unset] CFG=[$WORK/subcfg]" ]; then
+  ok
+else
+  bad "claude-sub passed through: '$subout'"
+fi
+
 if [ "$fails" -eq 0 ]; then
   if [ -n "${SELFTEST_SKIP_LIVE:-}" ]; then
-    echo "selftest: checks 11-16 passed (live checks 1-10 SKIPPED)"
+    echo "selftest: checks 11-17 passed (live checks 1-10 SKIPPED)"
   else
-    echo "selftest: all 16 checks passed"
+    echo "selftest: all 17 checks passed"
   fi
 else
   echo "selftest: $fails check(s) FAILED"
