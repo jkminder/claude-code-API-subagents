@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Run a SUBSCRIPTION-auth Claude from a session that is billing the API.
+#
+# The mirror of `claude-api`, and it exists for one reason: the claude.ai-hosted
+# connectors (Notion, Todoist, Gmail, Drive) load only when the active auth is a
+# claude.ai subscription login. Measured 2026-08-14: an API-key worker has zero
+# mcp__claude_ai_* tools; a headless subscription session has the full Todoist
+# set and Notion. So under API billing, connector work is delegated here.
+#
+#   claude-sub 'How many Todoist tasks are due today? Answer with the list.'
+#   claude-sub --prompt-file /tmp/ask.txt
+#
+# Answer goes to stdout. One shot, no session, no steering — everything that
+# makes claude-api complicated exists because workers are long-lived, and a
+# connector lookup is a function call.
+#
+# WHAT IT CANNOT DO: publish artifacts. The Artifact tool is gated on the
+# session being interactive, not on billing — a headless subscription session
+# does not have it either (measured, same day). Do not reach for this to make
+# an artifact; it will quietly not have the tool.
+#
+# WHAT IT COSTS: the subscription pool, which is the thing API billing is meant
+# to spare. Keep it to connector reads. If it becomes the general escape hatch
+# from API billing, it defeats its own purpose — that is a rule, not a caution.
+set -uo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+usage: claude-sub '<prompt>'
+       claude-sub --prompt-file <path>
+
+Runs Claude on SUBSCRIPTION auth for claude.ai connector work (Notion,
+Todoist). Prints the answer on stdout. Use --prompt-file when the prompt
+contains backticks or $ — your shell would eat them inside double quotes.
+EOF
+  exit 2
+}
+
+prompt=""
+prompt_file=""
+case "${1:-}" in
+  ""|-h|--help) usage ;;
+  --prompt-file)
+    prompt_file="${2:-}"
+    [ -n "$prompt_file" ] || usage
+    [ -r "$prompt_file" ] || { echo "claude-sub: cannot read prompt file '$prompt_file'" >&2; exit 2; }
+    prompt="$(cat "$prompt_file")"
+    shift 2
+    ;;
+  *) prompt="$1"; shift ;;
+esac
+
+if [ -z "${prompt//[[:space:]]/}" ]; then
+  if [ -n "$prompt_file" ]; then
+    echo "claude-sub: prompt file '$prompt_file' is empty" >&2
+  else
+    echo "claude-sub: refusing an empty prompt — it would spend a subscription turn for nothing" >&2
+  fi
+  exit 2
+fi
+
+# The whole point of the wrapper is this boundary, so it is explicit rather than
+# assumed absent. An inherited key WINS over subscription auth, silently: the
+# session would bill the API and arrive with no connectors, which looks exactly
+# like the tool being broken. (Happy's issue #120 is a user discovering this the
+# expensive way.)
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL
+export CLAUDE_CONFIG_DIR="${CLAUDE_SUB_CONFIG_DIR:-$HOME/.claude}"
+
+exec claude -p "$prompt" "$@"
