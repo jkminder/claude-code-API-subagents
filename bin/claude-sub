@@ -65,10 +65,10 @@ fi
 # like the tool being broken. (Happy's issue #120 is a user discovering this the
 # expensive way.)
 #
-# CLAUDE_API_PARENT_SID must go too: the subagent gate reads its bare presence
-# as "I am an API-billed worker" and stands down. Left set, the subscription
-# session this spawns could fan out built-in subagents ungated — the exact case
-# the gate exists to stop (reviewer finding, 2026-08-14).
+# CLAUDE_API_PARENT_SID must go too: claude-api reads it as "the session that
+# spawned me", so leaving it set would file this session's own delegated runs and
+# questions under the wrong parent. (It also used to stand down the subagent gate,
+# which was retired 2026-08-15 when the fleet moved to API billing for good.)
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL CLAUDE_API_PARENT_SID
 export CLAUDE_CONFIG_DIR="${CLAUDE_SUB_CONFIG_DIR:-$HOME/.claude}"
 
