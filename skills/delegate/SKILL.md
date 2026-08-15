@@ -230,6 +230,7 @@ wrapper resolves the worker's mode automatically (first match wins):
 
 1. An explicit `--permission-mode …` / `--dangerously-skip-permissions` you pass at spawn.
 2. **Inherited from this session when it runs elevated** (`bypassPermissions`, `dontAsk`, `auto`): a PreToolUse hook records the session's mode before every Bash call, so workers mirror the user's current session-level choice, including mid-session toggles. The user running this session elevated *is* the opt-in — don't ask again before spawning.
+   - If this session recorded **no** mode, `claude-api` refuses to spawn and exits 3 instead of quietly using the floor (that silent drop used to strand workers on denied tool calls much later). It happens when the hook is not registered in the settings.json of the config dir this session runs with, or when the session started before it was registered. Fix: `setup-worker`, then a new session — or pass an explicit `--permission-mode` for this spawn.
 3. Floor default: `acceptEdits` — auto-approves file edits **and workspace-confined sandboxed bash** (test/build/lint loops generally work out of the box). Blocked on the floor: writes outside the workspace, network access (`curl`, `pip/npm install`), `git push`, and other unsandboxable commands.
 
 For blocked categories, grant per spawn: `--allowedTools "Bash(npm install

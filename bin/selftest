@@ -2,8 +2,8 @@
 # Validation matrix (dispatched as: claude-api selftest). Re-verifies the
 # version-pinned behaviors the framework depends on — run after Claude Code
 # upgrades. Spends a few API-billed sonnet/haiku runs; the supervision-protocol
-# checks (7-9) and the guard/shim checks (11-16) use stub workers and are free.
-# SELFTEST_SKIP_LIVE=1 skips checks 1-10 and runs only 11-16, which need no API
+# checks (7-9) and the guard/shim checks (11-18) use stub workers and are free.
+# SELFTEST_SKIP_LIVE=1 skips checks 1-10 and runs only 11-18, which need no API
 # key and never spawn a real claude — use it to iterate on the shim checks.
 set -uo pipefail
 
@@ -45,7 +45,7 @@ step() { echo; echo "== $1"; }
 ok()   { echo "   PASS"; }
 bad()  { echo "   FAIL: $1"; fails=$((fails + 1)); }
 
-[ -n "${SELFTEST_SKIP_LIVE:-}" ] && echo "SELFTEST_SKIP_LIVE set — running only the guard/shim checks (11-16)"
+[ -n "${SELFTEST_SKIP_LIVE:-}" ] && echo "SELFTEST_SKIP_LIVE set — running only the guard/shim checks (11-18)"
 
 if [ -z "${SELFTEST_SKIP_LIVE:-}" ]; then
 
@@ -272,9 +272,15 @@ fi # SELFTEST_SKIP_LIVE (checks 7-10)
 # binaries. An isolated config dir with a dummy key keeps them off ~/.claude-api
 # even if a guard regresses.
 ISO="$WORK/isoconfig"
-mkdir -p "$ISO"
+mkdir -p "$ISO" "$ISO/run"
 printf 'sk-dummy-selftest\n' > "$ISO/api-key"
 chmod 600 "$ISO/api-key"
+# claude-api refuses to spawn when the calling session recorded no permission
+# mode (see check 18). These checks are about other things and read an isolated
+# config dir the real hook never writes to, so seed the floor mode there.
+if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+  printf 'acceptEdits' > "$ISO/run/permission-mode-$CLAUDE_CODE_SESSION_ID"
+fi
 IRWDIR="$ISO/run/workers/${CLAUDE_CODE_SESSION_ID:-manual}"
 
 step "11/16 run: dirty-tree guard — refuses in a dirty repo, skipped outside a repo"
@@ -507,11 +513,102 @@ else
   bad "claude-sub passed through: '$subout'"
 fi
 
+echo
+step "18/18 permission mode: hook→worker inheritance, and a loud refusal when nothing was recorded"
+# Free: the stub `claude` from check 13 just records argv. The whole point is
+# that the failure mode here used to be SILENT — a session whose config dir has
+# no permission-mode hook (the fleet's ~/.claude-api sessions) got workers on the
+# acceptEdits floor instead of the elevated mode it was running in, and only
+# found out when a worker hit a denied tool call. So: real hook, real mode file,
+# real resolution, and an assertion that the absent-record case exits nonzero.
+PM_ISO="$WORK/pmconfig"
+mkdir -p "$PM_ISO/run"
+printf 'sk-dummy-selftest\n' > "$PM_ISO/api-key"
+chmod 600 "$PM_ISO/api-key"
+PM_SID="pm-selftest-sid"
+pm_argv() { # -> writes $WORK/pm.argv, echoes rc
+  local rc=0
+  env FAKE_ARGV_OUT="$WORK/pm.argv" PATH="$WORK/argbin:$PATH" \
+      CLAUDE_API_CONFIG_DIR="$PM_ISO" CLAUDE_CODE_SESSION_ID="$PM_SID" \
+      "$CA" "$@" -p x < /dev/null > "$WORK/pm.out" 2> "$WORK/pm.err" || rc=$?
+  echo "$rc"
+}
+pm_mode() { # -> the --permission-mode value that reached argv, or empty
+  grep -x -A1 -- '--permission-mode' "$WORK/pm.argv" 2>/dev/null | sed -n '2p'
+}
+PMF="$PM_ISO/run/permission-mode-$PM_SID"
+
+# 1. Nothing recorded for this session → refuse, name the cause, spawn nothing.
+rm -f "$PMF" "$WORK/pm.argv"
+norec_rc=$(pm_argv); norec_err="$(cat "$WORK/pm.err")"; norec_argv_exists=0
+[ -e "$WORK/pm.argv" ] && norec_argv_exists=1
+# 2. The hook records an elevated mode → the worker inherits it (real hook run).
+printf '{"session_id":"%s","permission_mode":"bypassPermissions"}' "$PM_SID" \
+  | CLAUDE_API_CONFIG_DIR="$PM_ISO" "$BIN_DIR/permission-mode-hook" > /dev/null 2>&1
+hook_wrote=0; [ -f "$PMF" ] && hook_wrote=1
+byp_rc=$(pm_argv); byp_mode="$(pm_mode)"
+# 3. A non-elevated parent mode → the documented acceptEdits floor, quietly.
+printf 'default' > "$PMF"
+def_rc=$(pm_argv); def_mode="$(pm_mode)"
+# 4. A mode this wrapper does not know → refuse rather than guess a privilege level.
+printf 'warpDrive' > "$PMF"
+unk_rc=$(pm_argv); unk_err="$(cat "$WORK/pm.err")"
+# 5. A symlinked mode file (another user pre-planting one) → refuse to read it.
+printf 'bypassPermissions' > "$WORK/planted"
+rm -f "$PMF"; ln -s "$WORK/planted" "$PMF"
+sym_rc=$(pm_argv); sym_err="$(cat "$WORK/pm.err")"
+rm -f "$PMF"
+# 6. An explicit flag is the documented escape hatch: it must work with no record.
+exp_rc=$(pm_argv --permission-mode acceptEdits); exp_mode="$(pm_mode)"
+# 7. Outside any Claude Code session there is nothing to inherit — floor, no error.
+nosid_rc=0
+env FAKE_ARGV_OUT="$WORK/pm2.argv" PATH="$WORK/argbin:$PATH" CLAUDE_API_CONFIG_DIR="$PM_ISO" \
+  env -u CLAUDE_CODE_SESSION_ID "$CA" -p x < /dev/null > /dev/null 2> "$WORK/pm2.err" || nosid_rc=$?
+nosid_mode="$(grep -x -A1 -- '--permission-mode' "$WORK/pm2.argv" 2>/dev/null | sed -n '2p')"
+# 8. setup-worker must register the hook in the worker config dir too, not only
+#    in ~/.claude — that was the actual gap: fleet sessions run with
+#    CLAUDE_CONFIG_DIR=~/.claude-api and read only that settings.json, so their
+#    mode was never recorded. Run the real installer inside a throwaway HOME
+#    (it writes only under $HOME and the config dir) and run it twice, because a
+#    registration that duplicates or fights the hook mirror on rerun is broken too.
+PM_HOME="$WORK/pmhome"
+mkdir -p "$PM_HOME"
+HOME="$PM_HOME" CLAUDE_API_CONFIG_DIR="$PM_HOME/.claude-api" \
+  "$BIN_DIR/setup-worker" > "$WORK/pm-setup1.out" 2>&1; setup1_rc=$?
+HOME="$PM_HOME" CLAUDE_API_CONFIG_DIR="$PM_HOME/.claude-api" \
+  "$BIN_DIR/setup-worker" > "$WORK/pm-setup2.out" 2>&1; setup2_rc=$?
+reg_ok=0
+if [ "$setup1_rc" -eq 0 ] && [ "$setup2_rc" -eq 0 ]; then
+  python3 - "$PM_HOME/.claude/settings.json" "$PM_HOME/.claude-api/settings.json" <<'PY' && reg_ok=1
+import json, sys
+for path in sys.argv[1:]:
+    cfg = json.load(open(path))
+    groups = cfg.get("hooks", {}).get("PreToolUse", [])
+    n = sum(1 for g in groups if isinstance(g, dict)
+            for h in g.get("hooks", [])
+            if isinstance(h, dict) and "permission-mode-hook" in h.get("command", ""))
+    assert n == 1, "%s has %d permission-mode-hook registrations, want exactly 1" % (path, n)
+PY
+fi
+if [ "$norec_rc" -eq 3 ] && [ "$norec_argv_exists" -eq 0 ] \
+   && printf '%s' "$norec_err" | grep -q 'recorded no permission mode' \
+   && [ "$hook_wrote" -eq 1 ] && [ "$byp_rc" -eq 0 ] && [ "$byp_mode" = bypassPermissions ] \
+   && [ "$def_rc" -eq 0 ] && [ "$def_mode" = acceptEdits ] \
+   && [ "$unk_rc" -eq 3 ] && printf '%s' "$unk_err" | grep -q 'warpDrive' \
+   && [ "$sym_rc" -eq 3 ] && printf '%s' "$sym_err" | grep -q 'symlink' \
+   && [ "$exp_rc" -eq 0 ] && [ "$exp_mode" = acceptEdits ] \
+   && [ "$nosid_rc" -eq 0 ] && [ "$nosid_mode" = acceptEdits ] \
+   && [ "$reg_ok" -eq 1 ]; then
+  ok
+else
+  bad "permission mode: no-record rc=$norec_rc/argv=$norec_argv_exists (want 3/0), hook_wrote=$hook_wrote, inherit rc=$byp_rc mode='$byp_mode' (want 0/bypassPermissions), default rc=$def_rc mode='$def_mode' (want 0/acceptEdits), unknown rc=$unk_rc (want 3), symlink rc=$sym_rc (want 3), explicit rc=$exp_rc mode='$exp_mode' (want 0/acceptEdits), no-session rc=$nosid_rc mode='$nosid_mode' (want 0/acceptEdits), setup-worker registers exactly once in both config dirs=$reg_ok (setup rc $setup1_rc/$setup2_rc; $WORK/pm-setup1.out, $WORK/pm-setup2.out)"
+fi
+
 if [ "$fails" -eq 0 ]; then
   if [ -n "${SELFTEST_SKIP_LIVE:-}" ]; then
-    echo "selftest: checks 11-17 passed (live checks 1-10 SKIPPED)"
+    echo "selftest: checks 11-18 passed (live checks 1-10 SKIPPED)"
   else
-    echo "selftest: all 17 checks passed"
+    echo "selftest: all 18 checks passed"
   fi
 else
   echo "selftest: $fails check(s) FAILED"

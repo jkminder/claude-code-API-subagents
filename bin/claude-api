@@ -12,8 +12,13 @@
 #   1. Explicit --permission-mode / --dangerously-skip-permissions in the args
 #   2. Inherited from the parent Claude Code session when it runs in an elevated
 #      mode (bypassPermissions / dontAsk / auto) — recorded per Bash call by
-#      bin/permission-mode-hook (registered in ~/.claude/settings.json by setup-worker)
-#   3. Floor default: acceptEdits
+#      bin/permission-mode-hook, which setup-worker registers in the settings.json
+#      of EVERY config dir a spawning session may read (~/.claude and the worker
+#      config dir, since fleet sessions run with CLAUDE_CONFIG_DIR=~/.claude-api)
+#   3. Floor default: acceptEdits — but only when the parent recorded a
+#      non-elevated mode, or there is no parent session. Inside a session that
+#      recorded nothing we EXIT 3 instead: silently dropping to the floor turns a
+#      config gap into a denied tool call deep inside the worker's task.
 #
 # Framework subcommands (handled here, not passed to claude):
 #   claude-api run <slug> "<task>" [--stay] [flags] → spawn a worker (steerable; one-shot by default)
@@ -37,6 +42,10 @@ BIN_DIR="$(cd "$(dirname "$SRC")" && pwd)"
 CONFIG_DIR="${CLAUDE_API_CONFIG_DIR:-$HOME/.claude-api}"
 KEYCHAIN_SERVICE="${CLAUDE_API_KEYCHAIN_SERVICE:-claude-api-worker}"
 RUN_DIR="$CONFIG_DIR/run"
+# The config dir of the session that called us, captured BEFORE we point
+# CLAUDE_CONFIG_DIR at the worker identity — that is the settings.json whose
+# hooks decided whether our parent's permission mode got recorded.
+PARENT_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 export CLAUDE_CONFIG_DIR="$CONFIG_DIR"
 
 # Framework subcommands.
@@ -594,6 +603,10 @@ if [ -n "${CLAUDE_API_RUN_SLUG:-}" ]; then
 fi
 
 # Permission mode: explicit flag > inherited elevated parent mode > acceptEdits.
+# Silence is not an option here: a worker that quietly lands on the acceptEdits
+# floor when it was supposed to inherit bypassPermissions fails deep inside its
+# task, on a denied tool call, long after the cause. So when we are inside a
+# Claude Code session and that session recorded no mode, we refuse to spawn.
 explicit=0
 for a in "$@"; do
   case "$a" in
@@ -604,16 +617,57 @@ if [ "$explicit" -eq 0 ]; then
   mode=""
   if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
     mode_file="$RUN_DIR/permission-mode-${CLAUDE_CODE_SESSION_ID}"
-    # Trust the file only if it's a regular, non-symlink file we own.
-    if [ -f "$mode_file" ] && [ ! -L "$mode_file" ] && [ -O "$mode_file" ]; then
-      mode="$(cat "$mode_file" 2>/dev/null || true)"
+    if [ -e "$mode_file" ] && { [ -L "$mode_file" ] || [ ! -f "$mode_file" ] || [ ! -O "$mode_file" ]; }; then
+      echo "claude-api: ERROR: $mode_file is a symlink, not a regular file, or not owned by us." >&2
+      echo "  Refusing to read a permission mode from it. Remove it and start a new session," >&2
+      echo "  or pass an explicit --permission-mode." >&2
+      exit 3
+    fi
+    if [ ! -f "$mode_file" ]; then
+      echo "claude-api: ERROR: this session ($CLAUDE_CODE_SESSION_ID) recorded no permission mode," >&2
+      echo "  so the mode a worker should inherit is unknown. Refusing to spawn at the acceptEdits" >&2
+      echo "  floor, which would fail later on a denied tool call instead of here." >&2
+      _seen=""
+      echo "  Expected record: $mode_file" >&2
+      echo "  It is written by the PreToolUse hook $BIN_DIR/permission-mode-hook, which must be" >&2
+      echo "  registered in the settings.json of the config dir THIS session runs with. Status:" >&2
+      # Both candidates are printed rather than one guessed: for a `run` spawn this
+      # process is a re-entry that already has CLAUDE_CONFIG_DIR pointed at the
+      # worker identity, so the parent's real config dir is not knowable here.
+      for _sf in "$PARENT_CONFIG_DIR/settings.json" "$HOME/.claude/settings.json"; do
+        case "$_seen" in *"|$_sf|"*) continue ;; esac
+        _seen="$_seen|$_sf|"
+        if grep -qs 'permission-mode-hook' "$_sf"; then
+          echo "    registered  $_sf" >&2
+        else
+          echo "    MISSING     $_sf" >&2
+        fi
+      done
+      echo "  Fix: run $BIN_DIR/setup-worker, then START A NEW SESSION (hooks load at startup)." >&2
+      echo "  Override for this spawn only: --permission-mode acceptEdits (or the mode you want)." >&2
+      exit 3
+    fi
+    mode="$(cat "$mode_file")"
+    if [ -z "$mode" ]; then
+      echo "claude-api: ERROR: $mode_file is empty — the recorded mode is unusable." >&2
+      echo "  Remove it and start a new session, or pass an explicit --permission-mode." >&2
+      exit 3
     fi
   fi
   case "$mode" in
     bypassPermissions|dontAsk|auto)
       echo "claude-api: inheriting permission mode '$mode' from parent session" >&2
       set -- --permission-mode "$mode" "$@" ;;
-    *) set -- --permission-mode acceptEdits "$@" ;;
+    # No parent session at all (plain shell, cron): nothing to inherit, floor applies.
+    # A parent in a non-elevated mode gets the floor too — that is the design.
+    ""|default|acceptEdits|plan)
+      set -- --permission-mode acceptEdits "$@" ;;
+    *)
+      echo "claude-api: ERROR: parent session recorded permission mode '$mode', which this" >&2
+      echo "  wrapper does not know how to map onto a worker. Refusing to guess (silently" >&2
+      echo "  choosing acceptEdits would under- or over-privilege the worker)." >&2
+      echo "  Teach bin/claude-api about the new mode, or pass --permission-mode explicitly." >&2
+      exit 3 ;;
   esac
 fi
 

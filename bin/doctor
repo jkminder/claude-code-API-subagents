@@ -68,11 +68,16 @@ else
   warn "session registry not shared — native worker discovery disabled (rerun setup-worker)"
 fi
 
-if grep -qs "permission-mode-hook" "$HOME/.claude/settings.json"; then
-  ok "permission-mode hook registered"
-else
-  warn "permission-mode hook not registered — inheritance disabled (rerun setup-worker)"
-fi
+# Both settings files matter: a session reads only the one in its own config dir,
+# and a session whose config dir lacks the hook can no longer spawn workers at all
+# (claude-api refuses rather than dropping to the acceptEdits floor).
+for s in "$HOME/.claude/settings.json" "$CONFIG_DIR/settings.json"; do
+  if grep -qs "permission-mode-hook" "$s"; then
+    ok "permission-mode hook registered in $s"
+  else
+    warn "permission-mode hook NOT registered in $s — sessions using that config dir cannot spawn workers (rerun setup-worker, then restart them)"
+  fi
+done
 if [ -x "$HOME/.claude/skills/delegate/../../bin/permission-mode-hook" ]; then
   ok "hook path resolves through the skill symlink"
 else

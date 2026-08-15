@@ -14,9 +14,9 @@ done
 REPO_DIR="$(cd "$(dirname "$SRC")/.." && pwd)"
 CONFIG_DIR="${CLAUDE_API_CONFIG_DIR:-$HOME/.claude-api}"
 
-deregister_hook() {
+deregister_hook() { # settings.json path
   command -v python3 >/dev/null 2>&1 || return 0
-  python3 - "$HOME/.claude/settings.json" <<'PY' || true
+  python3 - "$1" <<'PY' || true
 import json, os, sys, tempfile
 path = sys.argv[1]
 if not os.path.exists(path):
@@ -39,7 +39,7 @@ if len(kept) != len(pre):
         json.dump(cfg, f, indent=2)
         f.write("\n")
     os.replace(tmp, path)
-    print("permission-mode hook deregistered from ~/.claude/settings.json")
+    print("permission-mode hook deregistered from %s" % path)
 PY
 }
 
@@ -47,7 +47,8 @@ if [ "${1:-}" = "--uninstall" ]; then
   for l in "$HOME/.local/bin/claude-api" "$HOME/.local/bin/claude-api-store-key" "$HOME/.claude/skills/delegate" "$CONFIG_DIR/sessions"; do
     if [ -L "$l" ]; then rm -f "$l" && echo "removed $l"; fi
   done
-  deregister_hook
+  deregister_hook "$HOME/.claude/settings.json"
+  deregister_hook "$CONFIG_DIR/settings.json"
   echo "Left in place (contain data/credentials — remove manually if wanted):"
   echo "  $CONFIG_DIR   → rm -rf '$CONFIG_DIR'"
   if [ "$(uname)" = Darwin ]; then
@@ -65,9 +66,10 @@ mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/run"
 chmod 700 "$CONFIG_DIR" "$CONFIG_DIR/run" 2>/dev/null || true
 
 # Worker settings: MERGE managed keys, preserve user customizations, atomic write.
-# The `hooks` key is managed: mirrored from ~/.claude/settings.json on every run
-# (minus the permission-mode hook, which is main-session-only) so workers run
-# the user's hooks too. Worker-specific hooks belong in the target repo's
+# The `hooks` key is managed: mirrored verbatim from ~/.claude/settings.json on
+# every run so workers run the user's hooks too — including the permission-mode
+# hook, which any session reading this config dir needs (see the registration
+# step below). Worker-specific hooks belong in the target repo's
 # .claude/settings.json or a per-spawn --settings.
 if command -v python3 >/dev/null 2>&1; then
   python3 - "$CONFIG_DIR/settings.json" "$HOME/.claude/settings.json" <<'PY'
@@ -96,7 +98,12 @@ if env.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS") != "1":
     env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"; changed = True
 if cfg.get("skipDangerousModePermissionPrompt") is not True:
     cfg["skipDangerousModePermissionPrompt"] = True; changed = True
-# Mirror user hooks (minus permission-mode-hook) into the worker identity.
+# Mirror user hooks into the worker identity. The permission-mode hook is NOT
+# stripped any more: a session running with CLAUDE_CONFIG_DIR pointed here
+# (happy-api, a nested spawn from inside a worker) reads only this file, and
+# without the hook its permission mode is never recorded, so claude-api refuses
+# to spawn. Keeping the mirror verbatim also stops it from fighting the explicit
+# registration below on every rerun.
 try:
     with open(user_path) as f:
         user_hooks = json.load(f).get("hooks", {})
@@ -107,14 +114,7 @@ if isinstance(user_hooks, dict):
     for event, groups in user_hooks.items():
         if not isinstance(groups, list):
             continue
-        kept = []
-        for g in groups:
-            if not isinstance(g, dict):
-                continue
-            hooks = [h for h in g.get("hooks", [])
-                     if not (isinstance(h, dict) and "permission-mode-hook" in h.get("command", ""))]
-            if hooks:
-                kept.append({**g, "hooks": hooks})
+        kept = [g for g in groups if isinstance(g, dict) and g.get("hooks")]
         if kept:
             mirrored[event] = kept
     if cfg.get("hooks", {}) != mirrored:
@@ -123,7 +123,7 @@ if isinstance(user_hooks, dict):
         else:
             cfg.pop("hooks", None)
         changed = True
-        print("user hooks mirrored into worker settings (permission-mode hook excluded)")
+        print("user hooks mirrored into worker settings")
 if changed:
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
     with os.fdopen(fd, "w") as f:
@@ -220,12 +220,17 @@ for l in "$CONFIG_DIR/skills"/*; do
 done
 echo "user skills passed through to workers (delegate excluded)"
 
-# Register the permission-mode hook in the user's main settings so workers can
-# inherit an elevated permission mode from the parent session. The command path
-# routes through the skill symlink, so it survives repo moves (rerun setup after
-# moving). Idempotent merge, atomic write; takes effect for new sessions.
-if command -v python3 >/dev/null 2>&1; then
-  python3 - "$HOME/.claude/settings.json" <<'PY'
+# Register the permission-mode hook so a session can pass its elevated mode down
+# to the workers it spawns. It must go in EVERY settings.json a spawning session
+# might read: ~/.claude for normal sessions, and the worker config dir for
+# sessions that run with CLAUDE_CONFIG_DIR pointed at it (happy-api, and workers
+# that spawn nested workers). A session whose config dir lacks the hook records
+# no mode, and claude-api then refuses to spawn rather than quietly dropping to
+# the acceptEdits floor. The command path routes through the skill symlink, so it
+# survives repo moves (rerun setup after moving). Idempotent merge, atomic write;
+# takes effect for sessions started afterwards.
+register_hook() { # settings.json path
+  python3 - "$1" <<'PY'
 import json, os, sys, tempfile
 path = sys.argv[1]
 hook_cmd = '"$HOME"/.claude/skills/delegate/../../bin/permission-mode-hook'
@@ -249,7 +254,7 @@ registered = any(
     isinstance(h, dict) and "permission-mode-hook" in h.get("command", "")
     for grp in pre if isinstance(grp, dict) for h in grp.get("hooks", []))
 if registered:
-    print("permission-mode hook already registered")
+    print("permission-mode hook already registered in %s" % path)
 else:
     pre.append({"matcher": "Bash", "hooks": [{"type": "command", "command": hook_cmd}]})
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
@@ -257,13 +262,17 @@ else:
         json.dump(cfg, f, indent=2)
         f.write("\n")
     os.replace(tmp, path)
-    print("permission-mode hook registered in ~/.claude/settings.json (active for new sessions)")
+    print("permission-mode hook registered in %s (active for new sessions)" % path)
 PY
+}
+if command -v python3 >/dev/null 2>&1; then
+  register_hook "$HOME/.claude/settings.json"
+  register_hook "$CONFIG_DIR/settings.json"
   if [ ! -x "$HOME/.claude/skills/delegate/../../bin/permission-mode-hook" ]; then
     echo "WARNING: hook path does not resolve to an executable — inheritance will not work (is the skill a copy instead of a symlink?)" >&2
   fi
 else
-  echo "WARNING: python3 not found — skipped permission-mode hook registration (workers use the acceptEdits floor)." >&2
+  echo "WARNING: python3 not found — skipped permission-mode hook registration. claude-api will REFUSE to spawn from a Claude Code session until it is registered." >&2
 fi
 
 if [ "$(uname)" = Darwin ] && command -v security >/dev/null 2>&1; then
