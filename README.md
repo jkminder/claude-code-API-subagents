@@ -1,25 +1,27 @@
 # claude-code-API-subagents
 
-Run Claude Code **subagent workers billed to an Anthropic API key**, while your main interactive session stays on **claude.ai subscription auth — with Remote Control intact**.
+Run Claude Code on an **Anthropic API key** — one API-billed identity for your interactive sessions, plus a wrapper (`claude-api`) that spawns `claude -p` **worker** processes from them. Sessions, their built-in subagents and their workers all bill the same API org.
 
-## The problem
+## What it gives you
 
-- Claude Code's [Remote Control](https://code.claude.com/docs/en/remote-control.md) (steering local sessions from claude.ai / the mobile app) requires subscription OAuth. The docs are explicit: *"API keys are not supported"* — and since v2.1.139 a session that merely has `ANTHROPIC_API_KEY` set errors out of Remote Control ([#59062](https://github.com/anthropics/claude-code/issues/59062)).
-- The built-in Task/Agent subagents always inherit the session's credentials — there is no per-agent auth or billing override anywhere (frontmatter, settings, or SDK).
+- **An API-billed identity**, installed once: settings, credentials and sessions under `~/.claude-api`, with your user context (CLAUDE.md, skills, agents, hooks) mirrored in.
+- **Workers** — separate `claude` processes you spawn, steer mid-run, keep alive between turns, and run in their own git worktree. They can outlive the session that started them.
+- **A delegation skill** so an agent can do all of that itself.
 
-So out of the box you can't steer sessions from your phone *and* bill the heavy lifting to an API org. This repo adds that missing split.
+## How it works
 
-## The trick
-
-Auth is resolved per **process**: in Claude Code's [credential precedence](https://code.claude.com/docs/en/authentication.md), `ANTHROPIC_API_KEY` outranks subscription OAuth, and `CLAUDE_CONFIG_DIR` gives a process a fully isolated identity. The main session therefore spawns workers (`claude -p`) whose environment carries the key — the main session is untouched (the desktop app ignores `ANTHROPIC_API_KEY` entirely), and every worker token bills the API org.
+Auth resolves per **process**: in Claude Code's [credential precedence](https://code.claude.com/docs/en/authentication.md), `ANTHROPIC_API_KEY` outranks subscription OAuth, and `CLAUDE_CONFIG_DIR` gives a process a fully isolated identity. Every session and every worker runs with the key in its environment and `CLAUDE_CONFIG_DIR=~/.claude-api`, so all their tokens bill the API org.
 
 ```
-Phone / claude.ai ──Remote Control──▶ Main session (subscription OAuth: planning/steering)
-                                          │ spawns (env: ANTHROPIC_API_KEY, CLAUDE_CONFIG_DIR=~/.claude-api)
-                                          ▼
-                          claude -p workers · streaming workers · agent-team swarms
-                                          → all billed to the API key
+Session (ANTHROPIC_API_KEY, CLAUDE_CONFIG_DIR=~/.claude-api)
+   ├─ built-in Agent-tool subagents — in-process, same identity   ← the default
+   └─ claude-api run <slug> ─▶ separate claude -p worker processes
+                               (standing workers, isolated checkouts,
+                                work that must outlive the session)
+        everything above bills the same API key
 ```
+
+Billing is the same either way, so pick by process properties instead: built-in subagents by default, a worker when you need one to stay alive between turns (`--stay`), to work in a separate checkout, or to keep running after its caller is gone.
 
 ## Install (any machine — laptop or cluster)
 
@@ -39,17 +41,17 @@ Prerequisite: `claude` on PATH (`npm install -g @anthropic-ai/claude-code`); `~/
 
 Once installed, the `delegate` skill is available in every Claude Code session on the machine. Say "delegate …" or "swarm …" — or let the agent trigger it on its own for heavy work. Workers run in background; the agent monitors them, can message them mid-run, and reports results. Every run lands in the wrapper's ledger (`~/.claude-api/run/ledger.jsonl`, inspect with `claude-api ps`); the wrapper also appends a cost/session line to `~/.claude-api/cost-log.jsonl` for every finished run — failures carry a `"failed"` field (client-side estimate — the Console usage dashboard is authoritative).
 
-**Spawning:** `claude-api run <slug> "<task>"`, or `claude-api run <slug> --prompt-file <path>` — the one way to spawn a worker. **Use `--prompt-file` for any brief containing code, backticks or `$`:** a prompt passed as an argument goes through the caller's shell first, which executes backticks and `$( )` inside a double-quoted string, so the worker silently receives a brief with holes where the examples were. Nothing can detect this downstream — by the time `run` is called the text is already gone — so keep such briefs out of the shell entirely. The worker runs stream-json over a supervised FIFO: the answer lands on stdout (footer with cost, turn count, and resume handle on stderr), failures exit nonzero with diagnostics, cost is logged automatically — and the *same* worker can be steered mid-run with `claude-api send`. With nothing sent it behaves one-shot; `--stay` keeps it alive between turns until `claude-api end <slug>`. No default spend cap — pass `--max-budget-usd` (or set `CLAUDE_API_MAX_BUDGET_USD`) to bound a run. `run` refuses to spawn into a git tree with uncommitted changes (another session may be working there) — use `claude-api worktree add` for an isolated checkout, or override with `--allow-dirty`. One background Bash call from the agent's side — same spawn effort as the built-in Task tool, but billed to the API key (worker startup latency and up-front permission grants still differ; for quick in-repo lookups the built-in Explore agent remains the faster tool).
+**Spawning:** `claude-api run <slug> "<task>"`, or `claude-api run <slug> --prompt-file <path>` — the one way to spawn a worker. **Use `--prompt-file` for any brief containing code, backticks or `$`:** a prompt passed as an argument goes through the caller's shell first, which executes backticks and `$( )` inside a double-quoted string, so the worker silently receives a brief with holes where the examples were. Nothing can detect this downstream — by the time `run` is called the text is already gone — so keep such briefs out of the shell entirely. The worker runs stream-json over a supervised FIFO: the answer lands on stdout (footer with cost, turn count, and resume handle on stderr), failures exit nonzero with diagnostics, cost is logged automatically — and the *same* worker can be steered mid-run with `claude-api send`. With nothing sent it behaves one-shot; `--stay` keeps it alive between turns until `claude-api end <slug>`. No default spend cap — pass `--max-budget-usd` (or set `CLAUDE_API_MAX_BUDGET_USD`) to bound a run. `run` refuses to spawn into a git tree with uncommitted changes (another session may be working there) — use `claude-api worktree add` for an isolated checkout, or override with `--allow-dirty`. One background Bash call from the agent's side — same spawn effort as the built-in Agent tool, and the same billing; what differs is worker startup latency and up-front permission grants, so for quick in-repo lookups the built-in Explore agent remains the faster tool.
 
 **Lifecycle:** `claude-api ps` (list workers + status; running workers show busy/idle) · `claude-api send <slug> "<msg>" [--wait]` (or `--message-file <path>` — a steering message quoting code hits the same shell trap as a run brief; `ask` and `answer` take `--question-file` / `--answer-file` for the same reason) / `claude-api reply <slug>` (message a running worker / read its last reply) · `claude-api end <slug>` (graceful finish: the worker completes its current turn and the run returns the answer-so-far) · `claude-api kill <pid>|--all` (immediate; also reaps supervisors on Linux) · `claude-api clean [--all]` (sweep dead keepers and stale artifacts) · `claude-api worktree add|list|clean` (isolated checkouts for parallel workers) · `claude-api doctor [--ping]` (install health) · `claude-api selftest` (re-validate the version-pinned behaviors after a Claude Code upgrade).
 
-**Multi-session safe:** several main sessions can delegate on one machine at once. The wrapper tags each spawn with the parent session's ID, worker outputs live under `~/.claude-api/run/workers/<session>/`, and `ps`/`kill --all`/`clean` are scoped to the invoking session by default — one session cannot kill another's fleet. `--global` widens to the whole machine (the default when run from a plain terminal, where no session ID exists).
+**Multi-session safe:** several sessions can delegate on one machine at once. The wrapper tags each spawn with the parent session's ID, worker outputs live under `~/.claude-api/run/workers/<session>/`, and `ps`/`kill --all`/`clean` are scoped to the invoking session by default — one session cannot kill another's fleet. `--global` widens to the whole machine (the default when run from a plain terminal, where no session ID exists).
 
 **Delegation policy:** the skill assumes worker tokens come from a flat/sponsored credit pool and are therefore *effectively free* — it instructs the agent to delegate liberally and fan out in parallel, treating latency and coordination (not tokens) as the only costs. If your API usage is metered, tune [skills/delegate/SKILL.md](skills/delegate/SKILL.md).
 
 ### Swarms
 
-The worker identity ships with `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, so any worker can lead an agent-team swarm. Teammates are processes spawned by the lead and inherit its environment — **the entire swarm (lead + teammates + their subagents) bills the API key**. In-swarm communication (shared task list, lead↔teammate mailbox) is native. Never run swarms in the main session — every teammate would bill the subscription. Agent teams are experimental; the skill includes a tmux fallback for the lead.
+The worker identity ships with `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, so any worker can lead an agent-team swarm. Teammates are processes spawned by the lead and inherit its environment, so the whole swarm (lead + teammates + their subagents) runs on the same API key. In-swarm communication (shared task list, lead↔teammate mailbox) is native. The cost of a swarm is process count and coordination, not billing — a swarm is worth it when the work splits into parts that each need their own long-running session. Agent teams are experimental; the skill includes a tmux fallback for the lead.
 
 ### Talking to workers
 
@@ -65,18 +67,21 @@ Five channels, encoded in the skill:
 
 Headless workers never prompt — unauthorized tool calls are denied, so the mode is fixed at spawn. The wrapper resolves it automatically: explicit flags win; otherwise **workers inherit the main session's mode when it is elevated** (`bypassPermissions`/`dontAsk`/`auto` — recorded per Bash call by a PreToolUse hook that `setup-worker` registers in `~/.claude/settings.json`; active for sessions started after install); otherwise the `acceptEdits` floor applies — file edits and **workspace-confined sandboxed bash** auto-run (enough for test/build loops), while outside-workspace writes, network commands, and `git push` are denied. For those, the skill grants per spawn via `--allowedTools`, and the target repo's own `.claude/settings.json` rules also apply to workers running in it. The main session's own permission prompts are unaffected throughout.
 
-### Relation to the built-in Task tool
+### Relation to the built-in Agent tool
 
-| | Built-in Task subagents | Delegated workers |
+| | Built-in Agent subagents | Delegated workers |
 |---|---|---|
-| Process / billing | in-process, session auth → **subscription** | separate `claude -p` → **API key** |
+| Process | in-process, session identity | separate `claude -p` process |
+| Billing | API key | API key — same pool |
 | Startup cost | low | full session startup (seconds) |
-| Best for | fast in-context fan-out | everything nontrivial: long jobs, parallel work, swarms |
+| Lifetime | ends with the parent's turn | can stay alive (`--stay`) and outlive the parent session |
+| Working tree | the session's | its own, via `claude-api worktree add` |
 | Steering | orchestrated in-context | mid-run `send`/`end`, `--resume` |
+| Best for | the default — fan-out inside a session | standing workers, isolated checkouts, work that must outlive the caller |
 
-The two compose into **multi-level fan-out**: the main session spawns one worker per group of work, each worker fans out to its *own* built-in subagents, and any level whose chunk is still too big leads an agent team below it (teammates are full sessions, so they can delegate again). 10 workers × 10 subagents = 100 units in 10 processes; add a level for ~1000. **Depth is hard-capped at 4** (main session = 0) as a runaway guard — every delegation states its depth and passes the incremented value down. Crossing the billing boundary is only worth a process once, so `claude-api` and this skill are **main-session-only**: everything below is already on API billing, where built-in delegation is cheaper and inherits the worker's permission mode. (Exception: workers may run `claude-api ask` — it spawns nothing and just files a question.)
+The two compose into **multi-level fan-out**: a session (or worker) spawns one worker per group of work, each worker fans out to its *own* built-in subagents, and any level whose chunk is still too big leads an agent team below it (teammates are full sessions, so they can delegate again). 10 workers × 10 subagents = 100 units in 10 processes; add a level for ~1000. **Depth is hard-capped at 4** (the starting session = 0) as a runaway guard — every delegation states its depth and passes the incremented value down. Prefer built-in subagents at every level and spend a separate process only when one of the three worker cases applies (stay alive, own checkout, outlive the caller). Workers may also run `claude-api ask` — it spawns nothing and just files a question.
 
-**User-context passthrough:** workers get your full user context — `setup-worker` mirrors your `~/.claude/CLAUDE.md`, your user skills, your user agents (live symlinks), and your user hooks (copied at setup, so rerun after changing them) into the worker identity. The two deliberate exceptions: the `delegate` skill (main-session-only — workers must not recross the billing boundary) and the permission-mode hook (meaningless inside a worker). Rerun `setup-worker` after adding user skills so new ones get linked.
+**User-context passthrough:** workers get your full user context — `setup-worker` mirrors your `~/.claude/CLAUDE.md`, your user skills, your user agents (live symlinks), and your user hooks (copied at setup, so rerun after changing them) into the worker identity. The two deliberate exceptions: the `delegate` skill (not mirrored, so a worker's own fan-out stays on built-in subagents) and the permission-mode hook (meaningless inside a worker). Rerun `setup-worker` after adding user skills so new ones get linked.
 
 ## Troubleshooting
 
@@ -92,6 +97,7 @@ The two compose into **multi-level fan-out**: the main session spawns one worker
 ## Components
 
 - [bin/claude-api](bin/claude-api) — worker wrapper: resolves the key (`$CLAUDE_API_KEY_CMD` → Keychain → `~/.claude-api/api-key`), sets `CLAUDE_CONFIG_DIR`, strips everything inherited that could reroute billing (`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, Bedrock/Vertex switches, `ANTHROPIC_MODEL`), resolves the permission mode, pins the default worker model to fable via `--settings '{"model": "claude-fable-5"}'` (headless sessions ignore the settings.json model key; an explicit `--model` or caller-supplied `--settings` wins), injects `--max-budget-usd` only when `CLAUDE_API_MAX_BUDGET_USD` is set, runs `claude`, and records every run in the ledger. Also implements `run` — the FIFO supervisor that spawns the stream-json worker, keeps the pipe open, closes it under a lock when every message is answered, and turns the last `result` line into stdout/exit-code — and dispatches the subcommands below.
+- [bin/claude-sub](bin/claude-sub) — the mirror: a `claude` session on subscription auth (unsets `ANTHROPIC_API_KEY` explicitly, since an inherited key wins silently). Only for the work an API key cannot do — the claude.ai-hosted connectors (`mcp__claude_ai_*`, e.g. Notion, Todoist) load only under a subscription login. It cannot publish artifacts (that tool needs an interactive session, not a billing mode).
 - [bin/worker-ctl](bin/worker-ctl) — `ps` / `kill` / `clean` / `send` / `reply` / `end` / `ask` / `questions` / `answer`: worker registry from the ledger, liveness (busy/idle from the supervisor's `.state` file, `/proc` fallback for legacy FIFO workers), FIFO messaging with delivery confirmation (non-consuming `FIONREAD` probe) and a locked send↔close handoff, graceful end via the `.keeper` pid, the worker→human question relay (file-based, per-parent-session inbox via `CLAUDE_API_PARENT_SID`), artifact sweeping; session-scoped by default, `--global` for machine-wide.
 - [bin/worker-worktree](bin/worker-worktree) — per-worker git worktrees (`worker/<slug>` branches) for parallel edits on one repo.
 - [bin/doctor](bin/doctor) — install health check (key source, config perms, no stray OAuth creds in the worker identity, hook registration, symlinks, shared session registry; `--ping` for a live run).
@@ -106,8 +112,8 @@ The two compose into **multi-level fan-out**: the main session spawns one worker
 ## Facts this relies on (verified 2026-08-04, Claude Code v2.1.220)
 
 - Credential precedence: cloud creds → `ANTHROPIC_AUTH_TOKEN` → `ANTHROPIC_API_KEY` → `apiKeyHelper` → `CLAUDE_CODE_OAUTH_TOKEN` → subscription OAuth ([authentication.md](https://code.claude.com/docs/en/authentication.md)).
-- Remote Control is subscription-only; an API key in the session env disables it ([remote-control.md](https://code.claude.com/docs/en/remote-control.md), [#59062](https://github.com/anthropics/claude-code/issues/59062)).
-- In-process subagents have no auth override; costs roll into the parent session ([sub-agents docs](https://code.claude.com/docs/en/sub-agents.md)).
+- Remote Control (steering a local session from claude.ai or the phone app) is subscription-only; an API key in the session env disables it ([remote-control.md](https://code.claude.com/docs/en/remote-control.md), [#59062](https://github.com/anthropics/claude-code/issues/59062)). An API-billed session therefore needs some other remote UI if you want one.
+- In-process subagents have no auth override; their costs roll into the parent session ([sub-agents docs](https://code.claude.com/docs/en/sub-agents.md)) — which is why a session and its subagents always bill the same way.
 - `CLAUDE_CONFIG_DIR` relocates settings + credentials + sessions wholesale ([settings docs](https://code.claude.com/docs/en/settings.md)); nested `claude` spawning is unguarded (`CLAUDECODE=1` is a marker, not a block).
 - Headless output formats and flags: [headless.md](https://code.claude.com/docs/en/headless.md) · costs/limits: [costs.md](https://code.claude.com/docs/en/costs.md).
 
