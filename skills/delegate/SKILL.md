@@ -74,6 +74,9 @@ json,sys;d=json.load(open(sys.argv[1]));print(d["result"],d["session_id"])'
   Notion page may run on Opus (`model: "opus"`). The page text is written by
   the calling Fable session and handed over verbatim for the Opus agent to
   paste. Opus never writes or rewrites prose.
+- **The other exception:** `claude-code-guide` runs on sonnet
+  (`model: "sonnet"`, or `"haiku"` for a simple lookup) per CLAUDE.md — a
+  docs lookup does not need Fable.
 
 ## Connector work needs subscription auth
 
