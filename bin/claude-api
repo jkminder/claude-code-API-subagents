@@ -582,7 +582,10 @@ fi
 
 # Give workers a route back to this session's question inbox (claude-api ask):
 # inside a worker, CLAUDE_CODE_SESSION_ID is the worker's own session, so the
-# parent's id must travel separately. Never overwrite an inherited value.
+# parent's id must travel separately. Never overwrite an inherited value: the
+# ask inbox stays at the root session down the whole worker chain. This id is
+# lineage, not "who spawned you" — the briefing below resolves the spawner
+# from the caller's own CLAUDE_CODE_SESSION_ID instead.
 if [ -z "${CLAUDE_API_PARENT_SID:-}" ] && [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
   export CLAUDE_API_PARENT_SID="$CLAUDE_CODE_SESSION_ID"
 fi
@@ -709,10 +712,15 @@ if [ "$headless" -eq 1 ]; then
     brief='You are a headless worker (claude -p). ScheduleWakeup never fires for you — never call it. Notifications from your own background Bash tasks and subagents reach you only while this run is alive; never end your turn with work pending on a wakeup or an unfinished background task. Finish the job within your turn; wait on external state with bounded foreground polls, in short chunks (~60 s per tool call, a loop of short sleeps rather than one long one) — messages sent to you mid-run surface at each tool-result boundary, so short calls keep you steerable. Your final message is the run result — end with the concrete answer or report.'
     # Tell the worker who spawned it, so it can notify the parent session
     # natively (SendMessage) — e.g. as a wake-up ping right before blocking in
-    # `claude-api ask`. Best-effort: skipped when the parent has no registry
-    # entry (session ended, old CLI version).
-    if [ -n "${CLAUDE_API_PARENT_SID:-}" ] && command -v python3 >/dev/null 2>&1; then
-      pname="$(python3 - "$HOME/.claude/sessions" "$CLAUDE_API_PARENT_SID" 2>/dev/null <<'PY' || true
+    # `claude-api ask`. The spawner is the session executing THIS spawn — the
+    # caller's own CLAUDE_CODE_SESSION_ID. Not CLAUDE_API_PARENT_SID: that one
+    # is inherited unchanged down the worker chain (it keeps the ask inbox at
+    # the root), so at depth 2 it names the grandparent and the worker's pings
+    # would route to the wrong session. Best-effort: skipped when the spawner
+    # has no registry entry (session ended, old CLI version).
+    spawner_sid="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_API_PARENT_SID:-}}"
+    if [ -n "$spawner_sid" ] && command -v python3 >/dev/null 2>&1; then
+      pname="$(python3 - "$HOME/.claude/sessions" "$spawner_sid" 2>/dev/null <<'PY' || true
 import glob, json, sys
 d, sid = sys.argv[1], sys.argv[2]
 for f in glob.glob(d + "/*.json"):

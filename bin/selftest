@@ -337,13 +337,13 @@ FAKE_ARGV_OUT="$WORK/t13int.argv" PATH="$WORK/argbin:$PATH" CLAUDE_API_CONFIG_DI
 # the registry (otherwise the sentence is legitimately absent, e.g. plain
 # terminal or the parent session restarted).
 pname_ok=1
-# The briefing names the session that SPAWNED the worker, and claude-api
-# resolves that from CLAUDE_API_PARENT_SID when it is set (line 577,
-# "never overwrite an inherited value"). Keying the expected name on this
-# session's own id is what made the check fail inside a worker: the
-# briefing said fleet-ops-handler and the test demanded the worker's own
-# slug. Same fallback claude-api uses, so an interactive run is unchanged.
-my_name="$(python3 - "$HOME/.claude/sessions" "${CLAUDE_API_PARENT_SID:-${CLAUDE_CODE_SESSION_ID:-}}" 2>/dev/null <<'PY'
+# The briefing names the session that ACTUALLY executed the spawn — the
+# caller's own CLAUDE_CODE_SESSION_ID. Run from a worker, that is the worker
+# itself, not the CLAUDE_API_PARENT_SID it inherited (that id stays pinned to
+# the lineage root for the ask-relay inbox and, at depth 2, names the
+# grandparent — the misrouting the depth-2 assertions below pin down). Same
+# fallback order claude-api uses, so an interactive run is unchanged.
+my_name="$(python3 - "$HOME/.claude/sessions" "${CLAUDE_CODE_SESSION_ID:-${CLAUDE_API_PARENT_SID:-}}" 2>/dev/null <<'PY'
 import glob, json, sys
 d, sid = sys.argv[1], sys.argv[2]
 if sid:
@@ -360,20 +360,54 @@ PY
 if [ -n "$my_name" ]; then
   grep -x -A1 -- '--append-system-prompt' t13run.argv | grep -qF "agent named '$my_name'" || pname_ok=0
 fi
+# Depth-2 regression: a worker spawning a sub-worker carries the grandparent's
+# id in CLAUDE_API_PARENT_SID (inherited, never overwritten) and its own id in
+# CLAUDE_CODE_SESSION_ID. The briefing must name the direct spawner (the
+# caller's session), while CLAUDE_API_PARENT_SID must reach the child
+# UNCHANGED — the ask-relay inbox stays at the root. Fixed 2026-08-17: the
+# briefing used to resolve from PARENT_SID, telling a depth-2 worker its
+# grandparent spawned it and misrouting its SendMessage pings.
+d2_ok=1
+D2HOME="$WORK/d2home"
+mkdir -p "$D2HOME/.claude/sessions" envbin
+cat > "$D2HOME/.claude/sessions/gp.json" <<'EOF'
+{"sessionId": "d2-grandparent-sid", "name": "d2-grandparent"}
+EOF
+cat > "$D2HOME/.claude/sessions/parent.json" <<'EOF'
+{"sessionId": "d2-parent-sid", "name": "d2-parent"}
+EOF
+cat > envbin/claude <<'EOF'
+#!/usr/bin/env bash
+# selftest stub: record argv and the inherited parent sid, then exit
+printf '%s\n' "$@" > "${FAKE_ARGV_OUT:?}"
+printf '%s\n' "${CLAUDE_API_PARENT_SID:-unset}" > "${FAKE_ENV_OUT:?}"
+EOF
+chmod +x envbin/claude
+env FAKE_ARGV_OUT="$WORK/t13d2.argv" FAKE_ENV_OUT="$WORK/t13d2.env" \
+    HOME="$D2HOME" PATH="$WORK/envbin:$PATH" CLAUDE_API_CONFIG_DIR="$ISO" \
+    CLAUDE_API_PARENT_SID="d2-grandparent-sid" CLAUDE_CODE_SESSION_ID="d2-parent-sid" \
+    "$CA" --permission-mode acceptEdits -p x < /dev/null > /dev/null 2> t13d2.err || true
+grep -x -A1 -- '--append-system-prompt' t13d2.argv 2>/dev/null | grep -qF "agent named 'd2-parent'" || d2_ok=0
+grep -q 'd2-grandparent' t13d2.argv 2>/dev/null && d2_ok=0
+[ "$(cat t13d2.env 2>/dev/null)" = "d2-grandparent-sid" ] || d2_ok=0
 if grep -x -A1 -- '--disallowedTools' t13run.argv | grep -qx 'ScheduleWakeup' \
    && grep -x -A1 -- '--append-system-prompt' t13run.argv | grep -q 'ScheduleWakeup never fires' \
    && grep -x -A1 -- '-n' t13run.argv | grep -qx 'st-argv' \
    && [ "$(grep -cx -- '-n' t13nam.argv)" -eq 1 ] \
    && grep -x -A1 -- '-n' t13nam.argv | grep -qx 'myname' \
    && [ "$pname_ok" -eq 1 ] \
+   && [ "$d2_ok" -eq 1 ] \
    && [ -s t13int.argv ] \
    && ! grep -qx -- '-n' t13int.argv \
    && ! grep -qx -- '--disallowedTools' t13int.argv \
    && ! grep -qx -- '--append-system-prompt' t13int.argv; then
   ok
+elif [ "$pname_ok" -eq 0 ]; then
+  bad "parent-name sentence missing from the briefing despite a resolvable parent ('$my_name'; t13run.argv)"
+elif [ "$d2_ok" -eq 0 ]; then
+  bad "depth-2: briefing must name the direct spawner (d2-parent) and the child must inherit PARENT_SID=d2-grandparent-sid unchanged (t13d2.argv / t13d2.env / t13d2.err)"
 else
-  [ "$pname_ok" -eq 0 ] && bad "parent-name sentence missing from the briefing despite a resolvable parent ('$my_name'; t13run.argv)" \
-                        || bad "headless injections: missing/duplicated on the run spawn, or present interactively (t13run.argv / t13nam.argv / t13int.argv)"
+  bad "headless injections: missing/duplicated on the run spawn, or present interactively (t13run.argv / t13nam.argv / t13int.argv)"
 fi
 
 step "14/17 run: close-linger guard — post-close wedge terminated, run still succeeds"
