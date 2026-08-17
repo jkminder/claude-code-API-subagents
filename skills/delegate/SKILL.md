@@ -322,14 +322,29 @@ guessing or stalling: it pings you natively (SendMessage — its briefing names
 this session) and runs `claude-api ask` (blocks until answered); the ping wakes
 you, you put the question to the user and route the answer back with
 `claude-api answer`; `ask` prints it and the worker continues. Works for any
-worker type; several can ask at once.
+worker type; several can ask at once. The same holds at every depth: a
+sub-worker's question goes to the worker that spawned it — ping and inbox
+target the same session — so **a watcher armed here does NOT see a
+grandchild's question at first**; the intermediate worker's own `questions`
+inbox holds it. Two backstops keep a deep question from stranding: if the
+spawner's session is gone, the question is filed straight to the lineage
+root's inbox; and if a live spawner never answers within the ask's
+`--timeout`, the ask **escalates once** — it re-files the question into the
+root's inbox (filing is the wake-up: it fires any armed `--wait` watcher
+there) and waits another 180 s (`CLAUDE_API_ASK_ESCALATION_SECS`), accepting
+an answer from either inbox, before giving up with a `NO_ANSWER` that names
+both addressees. No native ping arrives for a fallback or escalated question
+— only `claude-api questions` / an armed watcher surfaces it.
 
 **Wake-up paths.** The native ping wakes this session with no setup. It is
 model-driven though — a worker can forget it, and then nothing wakes you. For
 runs where a missed question must not happen, **also arm the watcher**
 (`run_in_background`): `claude-api questions --wait 3600` — it exits when a
 question arrives (exit 124 at the timeout: just re-arm), and kill it when the
-last briefed worker finishes. On **any** wake-up — ping or watcher —
+last briefed worker finishes. The watcher covers THIS session's inbox: your
+direct workers' questions, plus any grandchild question that falls back or
+escalates here (see above) — not a grandchild's first-window question, which
+sits in the intermediate worker's inbox. On **any** wake-up — ping or watcher —
 `claude-api questions` is the ground truth: relay **all** pending questions to
 the user verbatim, `claude-api answer <qid> "<text>"` each. One race to know:
 the ping and the `ask` are separate worker steps, so a ping can arrive seconds
@@ -345,10 +360,12 @@ elevated mode, which outranks grants). Workers can't discover `ask` on their
 own, so paste this (slug filled in) into the prompt of any worker that might
 hit a decision point:
 
-> If you hit a genuine decision point — ambiguous requirement, irreversible or costly action, a fork only the user can decide — ask the human. First, if you have a SendMessage tool and your system prompt names the session that spawned you, notify that agent with a one-line message like "question incoming from <slug>"; if SendMessage asks you to confirm with a ref, re-send with the exact ref it shows; if it fails or your system prompt names no parent, skip the ping and continue. Then run `claude-api ask --from <slug> --timeout 540 "<question — state what you will do by default if unanswered>"` as a single foreground Bash call with the tool timeout set to 600000 ms. Do not `&`-background it or poll for it. Its stdout is the answer. On NO_ANSWER, a denial, or a tool error, take your stated default if safe, otherwise stop and report the open decision. Never ask for status updates, confirmations of your own analysis, or anything you can determine yourself — every question stalls you and interrupts the human. This is the only `claude-api` command you may run.
+> If you hit a genuine decision point — ambiguous requirement, irreversible or costly action, a fork only the user can decide — ask the human. First, if you have a SendMessage tool and your system prompt names the session that spawned you, notify that agent with a one-line message like "question incoming from <slug>"; if SendMessage asks you to confirm with a ref, re-send with the exact ref it shows; if it fails or your system prompt names no parent, skip the ping and continue. Then run `claude-api ask --from <slug> --timeout 400 "<question — state what you will do by default if unanswered>"` as a single foreground Bash call with the tool timeout set to 600000 ms (the ask may wait up to --timeout plus one 180 s escalation window, so 400 + 180 fits inside the 600 s tool-call cap). Do not `&`-background it or poll for it. Its stdout is the answer. On NO_ANSWER, a denial, or a tool error, take your stated default if safe, otherwise stop and report the open decision. Never ask for status updates, confirmations of your own analysis, or anything you can determine yourself — every question stalls you and interrupts the human. This is the only `claude-api` command you may run.
 
-Answer within the worker's `--timeout` (default 540 s); after that `answer`
-fails cleanly — the worker has moved on and takes its stated default. A running
+Answer within the worker's `--timeout` (default 540 s; the canned briefing
+uses 400 s so the single 180 s escalation window still fits the tool-call
+cap); after that `answer` fails cleanly — the worker has moved on and takes
+its stated default. A running
 worker can still be reached via `send` (a finished one only via `--resume`). A
 worker blocked mid-`ask` cannot act on `send` until the ask returns; to redirect
 it immediately, answer its pending question.

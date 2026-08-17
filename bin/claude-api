@@ -580,14 +580,28 @@ if [ "$meta" -eq 1 ]; then
   exec claude "$@"
 fi
 
-# Give workers a route back to this session's question inbox (claude-api ask):
-# inside a worker, CLAUDE_CODE_SESSION_ID is the worker's own session, so the
-# parent's id must travel separately. Never overwrite an inherited value: the
-# ask inbox stays at the root session down the whole worker chain. This id is
-# lineage, not "who spawned you" — the briefing below resolves the spawner
-# from the caller's own CLAUDE_CODE_SESSION_ID instead.
+# Give workers a route back to a question inbox (claude-api ask): inside a
+# worker, CLAUDE_CODE_SESSION_ID is the worker's own session, so the parent's
+# id must travel separately. Never overwrite an inherited value: this id is
+# lineage — it stays the ROOT session's id down the whole worker chain, and is
+# the ask relay's FALLBACK inbox (used when the direct spawner's session is
+# gone). Not "who spawned you" — that is CLAUDE_API_SPAWNER_SID below.
 if [ -z "${CLAUDE_API_PARENT_SID:-}" ] && [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
   export CLAUDE_API_PARENT_SID="$CLAUDE_CODE_SESSION_ID"
+fi
+
+# Direct-spawner id for the ask relay: unlike CLAUDE_API_PARENT_SID this is
+# OVERWRITTEN at every spawn, so inside any worker it names the session that
+# actually spawned it — the one with the task context, the one the briefing
+# names, and the one the worker's SendMessage ping targets. `claude-api ask`
+# files the question in THIS session's inbox (so the pinged session is the one
+# that sees it), falling back to CLAUDE_API_PARENT_SID when this session can
+# no longer receive. Outside any session there is no spawner: clear a stale
+# inherited value rather than misrouting a question to it.
+if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+  export CLAUDE_API_SPAWNER_SID="$CLAUDE_CODE_SESSION_ID"
+else
+  unset CLAUDE_API_SPAWNER_SID
 fi
 
 # Native discovery: name the worker session after its run slug so it shows up
@@ -714,10 +728,12 @@ if [ "$headless" -eq 1 ]; then
     # natively (SendMessage) — e.g. as a wake-up ping right before blocking in
     # `claude-api ask`. The spawner is the session executing THIS spawn — the
     # caller's own CLAUDE_CODE_SESSION_ID. Not CLAUDE_API_PARENT_SID: that one
-    # is inherited unchanged down the worker chain (it keeps the ask inbox at
-    # the root), so at depth 2 it names the grandparent and the worker's pings
-    # would route to the wrong session. Best-effort: skipped when the spawner
-    # has no registry entry (session ended, old CLI version).
+    # is inherited unchanged down the worker chain (it stays the lineage root,
+    # the ask relay's fallback inbox), so at depth 2 it names the grandparent
+    # and the worker's pings would route to the wrong session. `ask` routes to
+    # the same sid (via CLAUDE_API_SPAWNER_SID), so ping and inbox agree.
+    # Best-effort: skipped when the spawner has no registry entry (session
+    # ended, old CLI version).
     spawner_sid="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_API_PARENT_SID:-}}"
     if [ -n "$spawner_sid" ] && command -v python3 >/dev/null 2>&1; then
       pname="$(python3 - "$HOME/.claude/sessions" "$spawner_sid" 2>/dev/null <<'PY' || true
@@ -734,7 +750,7 @@ for f in glob.glob(d + "/*.json"):
 PY
 )"
       if [ -n "$pname" ]; then
-        brief="$brief The session that spawned you is the agent named '$pname'; you may notify it with your SendMessage tool (when SendMessage asks you to confirm with a ref, re-send using the exact ref it shows)."
+        brief="$brief The session that spawned you is the agent named '$pname'; your claude-api ask questions go to that session, and you may notify it with your SendMessage tool (when SendMessage asks you to confirm with a ref, re-send using the exact ref it shows)."
       fi
     fi
     set -- --append-system-prompt "$brief" "$@"

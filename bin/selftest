@@ -2,9 +2,10 @@
 # Validation matrix (dispatched as: claude-api selftest). Re-verifies the
 # version-pinned behaviors the framework depends on — run after Claude Code
 # upgrades. Spends a few API-billed sonnet/haiku runs; the supervision-protocol
-# checks (7-9) and the guard/shim checks (11-17) use stub workers and are free.
-# SELFTEST_SKIP_LIVE=1 skips checks 1-10 and runs only 11-17, which need no API
+# checks (7-9) and the guard/shim checks (11-18) use stub workers and are free.
+# SELFTEST_SKIP_LIVE=1 skips checks 1-10 and runs only 11-18, which need no API
 # key and never spawn a real claude — use it to iterate on the shim checks.
+# (`claude-api ask` spawns nothing either, so check 18 is in the free block.)
 # The subagent gate and its check were retired 2026-08-15 (the fleet moved to
 # API billing permanently, so there is no subscription billing left to guard).
 set -uo pipefail
@@ -48,11 +49,11 @@ step() { echo; echo "== $1"; }
 ok()   { echo "   PASS"; }
 bad()  { echo "   FAIL: $1"; fails=$((fails + 1)); }
 
-[ -n "${SELFTEST_SKIP_LIVE:-}" ] && echo "SELFTEST_SKIP_LIVE set — running only the guard/shim checks (11-17)"
+[ -n "${SELFTEST_SKIP_LIVE:-}" ] && echo "SELFTEST_SKIP_LIVE set — running only the guard/shim checks (11-18)"
 
 if [ -z "${SELFTEST_SKIP_LIVE:-}" ]; then
 
-step "1/17 basic headless run + JSON output"
+step "1/18 basic headless run + JSON output"
 SID=""
 if "$CA" -p 'Reply with exactly: SELFTEST OK' --model sonnet --output-format json > t1.json 2> t1.err \
    && python3 -c 'import json;d=json.load(open("t1.json"));assert not d.get("is_error");assert "SELFTEST OK" in d["result"]' 2>/dev/null; then
@@ -62,7 +63,7 @@ else
   bad "basic run (t1.err)"
 fi
 
-step "2/17 --resume continuity"
+step "2/18 --resume continuity"
 if [ -n "$SID" ] \
    && "$CA" --resume "$SID" -p 'What exact phrase did you reply with earlier? Answer with just the phrase.' --model sonnet --output-format json > t2.json 2> t2.err \
    && python3 -c 'import json;assert "SELFTEST OK" in json.load(open("t2.json"))["result"]' 2>/dev/null; then
@@ -71,12 +72,12 @@ else
   bad "resume (t2.err)"
 fi
 
-step "3/17 acceptEdits floor: file creation"
+step "3/18 acceptEdits floor: file creation"
 mkdir -p edit && ( cd edit && "$CA" -p 'Create a file named hello.txt in the current directory containing exactly: selftest file
 Then reply DONE.' --model sonnet --output-format json > ../t3.json 2> ../t3.err )
 if [ "$(cat edit/hello.txt 2>/dev/null)" = "selftest file" ]; then ok; else bad "file not created (t3.err)"; fi
 
-step "4/17 legacy manual FIFO: envelope + send helper + clean shutdown"
+step "4/18 legacy manual FIFO: envelope + send helper + clean shutdown"
 mkfifo w.in
 tail -f /dev/null > w.in & keeper=$!
 touch w.ndjson
@@ -99,7 +100,7 @@ fi
 kill "$worker" 2>/dev/null
 wait 2>/dev/null
 
-step "5/17 worker→human question relay from a run worker (ask grant + questions + answer)"
+step "5/18 worker→human question relay from a run worker (ask grant + questions + answer)"
 "$CA" run st-ask 'Run exactly this shell command with your Bash tool (set the tool call timeout to 120000 ms) and wait for it: claude-api ask --from selftest --timeout 90 "Reply with exactly: GRANTED". Then reply with exactly: GOT=<its stdout>.' \
   --model sonnet --allowedTools 'Bash(claude-api ask:*)' > t5.out 2> t5.err & qworker=$!
 qid=""
@@ -139,7 +140,7 @@ send_retry() { # fifo-path message [extra send args...]
   return 1
 }
 
-step "6/17 run: one-shot answer on stdout"
+step "6/18 run: one-shot answer on stdout"
 if "$CA" run st-one 'Reply with exactly: RUN OK' --model haiku > t6.out 2> t6.err \
    && [ "$(cat t6.out)" = "RUN OK" ] && grep -q 'resume:' t6.err \
    && [ ! -e "$RWDIR/st-one.in" ]; then
@@ -188,7 +189,7 @@ chmod +x fakebin/claude
 
 if [ -z "${SELFTEST_SKIP_LIVE:-}" ]; then
 
-step "7/17 run: two sends queued during a slow turn — both drained before close (EOF drain)"
+step "7/18 run: two sends queued during a slow turn — both drained before close (EOF drain)"
 # The stub's slow first turn (FAKE_DELAY) guarantees both sends are queued in
 # the pipe at the first result boundary; the close protocol must then give
 # each its own turn instead of closing. (A live model can't test this
@@ -207,7 +208,7 @@ else
   bad "a queued message was lost at close (t7.out / $RWDIR/st-drain.ndjson)"
 fi
 
-step "8/17 run: close handoff vs a racing send (fake reader)"
+step "8/18 run: close handoff vs a racing send (fake reader)"
 PATH="$PWD/fakebin:$PATH" "$CA" run st-race 'task one' > t8.out 2> t8.err & rcpid=$!
 i=0; while ! grep -q '"TURN 1"' "$RWDIR/st-race.ndjson" 2>/dev/null && [ "$i" -lt 200 ]; do sleep 0.05; i=$((i + 1)); done
 "$CA" send "$RWDIR/st-race.in" 'task two' > t8.send 2>&1; srrc=$?
@@ -224,7 +225,7 @@ else
   if grep -q 'gone\|not a FIFO\|nothing is reading' t8.send; then ok; else bad "racing send failed without a loud diagnostic (t8.send)"; fi
 fi
 
-step "9/17 run: worker crash mid-turn fails loudly"
+step "9/18 run: worker crash mid-turn fails loudly"
 FAKE_MODE=crash PATH="$PWD/fakebin:$PATH" "$CA" run st-crash 'boom' > t9.out 2> t9.err; crc=$?
 if [ "$crc" -ne 0 ] && grep -q 'FAILED' t9.err && grep -q 'no-result-line' t9.err \
    && [ ! -e "$RWDIR/st-crash.in" ]; then
@@ -233,7 +234,7 @@ else
   bad "crash: rc=$crc, want nonzero + FAILED/no-result-line diagnostics + fifo removed (t9.err)"
 fi
 
-step "10/17 run --stay: steer mid-run, session named after slug, then graceful end"
+step "10/18 run --stay: steer mid-run, session named after slug, then graceful end"
 "$CA" run st-steer 'Reply with exactly: FIRST' --stay --model haiku > t10.out 2> t10.err & stpid=$!
 if wait_for "$RWDIR/st-steer.ndjson" '"type":"result"' 180; then
   # -n injection reached a real claude: the live session registered under the
@@ -286,7 +287,7 @@ if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
 fi
 IRWDIR="$ISO/run/workers/${CLAUDE_CODE_SESSION_ID:-manual}"
 
-step "11/17 run: dirty-tree guard — refuses in a dirty repo, skipped outside a repo"
+step "11/18 run: dirty-tree guard — refuses in a dirty repo, skipped outside a repo"
 git init -q dirtyrepo
 echo x > dirtyrepo/uncommitted.txt
 ( cd dirtyrepo && CLAUDE_API_CONFIG_DIR="$ISO" PATH="$WORK/fakebin:$PATH" "$CA" run st-dirty 'x' ) > t11.out 2> t11.err
@@ -302,7 +303,7 @@ else
   bad "dirty guard: dirty rc=$drc want 2 + refusal + no worker artifacts; non-repo rc=$nrc want 0 (t11.err / t11b.err)"
 fi
 
-step "12/17 run: failure shapes labeled correctly in the cost log (parked vs died-after-result)"
+step "12/18 run: failure shapes labeled correctly in the cost log (parked vs died-after-result)"
 FAKE_MODE=parked PATH="$WORK/fakebin:$PATH" CLAUDE_API_CONFIG_DIR="$ISO" "$CA" run st-parked 'x' > t12.out 2> t12.err
 prc=$?
 FAKE_MODE=dieafter PATH="$WORK/fakebin:$PATH" CLAUDE_API_CONFIG_DIR="$ISO" "$CA" run st-dieafter 'x' > t12b.out 2> t12b.err
@@ -316,7 +317,7 @@ else
   bad "failure labels: parked rc=$prc want 1 + failed=empty-result; dieafter rc=$darc want 1 + failed=exit-7, never empty-result (t12.err / t12b.err / $ISO/cost-log.jsonl)"
 fi
 
-step "13/17 headless injections: ScheduleWakeup denial, briefing, -n slug on run spawns only"
+step "13/18 headless injections: ScheduleWakeup denial, briefing, -n slug on run spawns only"
 mkdir -p argbin
 cat > argbin/claude <<'EOF'
 #!/usr/bin/env bash
@@ -340,9 +341,10 @@ pname_ok=1
 # The briefing names the session that ACTUALLY executed the spawn — the
 # caller's own CLAUDE_CODE_SESSION_ID. Run from a worker, that is the worker
 # itself, not the CLAUDE_API_PARENT_SID it inherited (that id stays pinned to
-# the lineage root for the ask-relay inbox and, at depth 2, names the
-# grandparent — the misrouting the depth-2 assertions below pin down). Same
-# fallback order claude-api uses, so an interactive run is unchanged.
+# the lineage root — the ask relay's fallback/escalation inbox — and, at
+# depth 2, names the grandparent: the misrouting the depth-2 assertions below
+# pin down). Same fallback order claude-api uses, so an interactive run is
+# unchanged.
 my_name="$(python3 - "$HOME/.claude/sessions" "${CLAUDE_CODE_SESSION_ID:-${CLAUDE_API_PARENT_SID:-}}" 2>/dev/null <<'PY'
 import glob, json, sys
 d, sid = sys.argv[1], sys.argv[2]
@@ -363,10 +365,12 @@ fi
 # Depth-2 regression: a worker spawning a sub-worker carries the grandparent's
 # id in CLAUDE_API_PARENT_SID (inherited, never overwritten) and its own id in
 # CLAUDE_CODE_SESSION_ID. The briefing must name the direct spawner (the
-# caller's session), while CLAUDE_API_PARENT_SID must reach the child
-# UNCHANGED — the ask-relay inbox stays at the root. Fixed 2026-08-17: the
-# briefing used to resolve from PARENT_SID, telling a depth-2 worker its
-# grandparent spawned it and misrouting its SendMessage pings.
+# caller's session), CLAUDE_API_PARENT_SID must reach the child UNCHANGED (it
+# stays the lineage root — the ask relay's fallback/escalation inbox), and
+# CLAUDE_API_SPAWNER_SID must reach the child OVERWRITTEN with the caller's
+# sid (it routes the child's asks — check 18). Fixed 2026-08-17: the briefing
+# used to resolve from PARENT_SID, telling a depth-2 worker its grandparent
+# spawned it and misrouting its SendMessage pings.
 d2_ok=1
 D2HOME="$WORK/d2home"
 mkdir -p "$D2HOME/.claude/sessions" envbin
@@ -378,9 +382,9 @@ cat > "$D2HOME/.claude/sessions/parent.json" <<'EOF'
 EOF
 cat > envbin/claude <<'EOF'
 #!/usr/bin/env bash
-# selftest stub: record argv and the inherited parent sid, then exit
+# selftest stub: record argv and the lineage/spawner sids, then exit
 printf '%s\n' "$@" > "${FAKE_ARGV_OUT:?}"
-printf '%s\n' "${CLAUDE_API_PARENT_SID:-unset}" > "${FAKE_ENV_OUT:?}"
+printf '%s\n%s\n' "${CLAUDE_API_PARENT_SID:-unset}" "${CLAUDE_API_SPAWNER_SID:-unset}" > "${FAKE_ENV_OUT:?}"
 EOF
 chmod +x envbin/claude
 env FAKE_ARGV_OUT="$WORK/t13d2.argv" FAKE_ENV_OUT="$WORK/t13d2.env" \
@@ -389,7 +393,8 @@ env FAKE_ARGV_OUT="$WORK/t13d2.argv" FAKE_ENV_OUT="$WORK/t13d2.env" \
     "$CA" --permission-mode acceptEdits -p x < /dev/null > /dev/null 2> t13d2.err || true
 grep -x -A1 -- '--append-system-prompt' t13d2.argv 2>/dev/null | grep -qF "agent named 'd2-parent'" || d2_ok=0
 grep -q 'd2-grandparent' t13d2.argv 2>/dev/null && d2_ok=0
-[ "$(cat t13d2.env 2>/dev/null)" = "d2-grandparent-sid" ] || d2_ok=0
+[ "$(cat t13d2.env 2>/dev/null)" = "d2-grandparent-sid
+d2-parent-sid" ] || d2_ok=0
 if grep -x -A1 -- '--disallowedTools' t13run.argv | grep -qx 'ScheduleWakeup' \
    && grep -x -A1 -- '--append-system-prompt' t13run.argv | grep -q 'ScheduleWakeup never fires' \
    && grep -x -A1 -- '-n' t13run.argv | grep -qx 'st-argv' \
@@ -405,12 +410,12 @@ if grep -x -A1 -- '--disallowedTools' t13run.argv | grep -qx 'ScheduleWakeup' \
 elif [ "$pname_ok" -eq 0 ]; then
   bad "parent-name sentence missing from the briefing despite a resolvable parent ('$my_name'; t13run.argv)"
 elif [ "$d2_ok" -eq 0 ]; then
-  bad "depth-2: briefing must name the direct spawner (d2-parent) and the child must inherit PARENT_SID=d2-grandparent-sid unchanged (t13d2.argv / t13d2.env / t13d2.err)"
+  bad "depth-2: briefing must name the direct spawner (d2-parent), and the child must get PARENT_SID=d2-grandparent-sid unchanged plus SPAWNER_SID=d2-parent-sid overwritten (t13d2.argv / t13d2.env / t13d2.err)"
 else
   bad "headless injections: missing/duplicated on the run spawn, or present interactively (t13run.argv / t13nam.argv / t13int.argv)"
 fi
 
-step "14/17 run: close-linger guard — post-close wedge terminated, run still succeeds"
+step "14/18 run: close-linger guard — post-close wedge terminated, run still succeeds"
 lstart="$(date +%s)"
 FAKE_MODE=linger PATH="$WORK/fakebin:$PATH" CLAUDE_API_CONFIG_DIR="$ISO" CLAUDE_API_CLOSE_GRACE=3 \
   "$CA" run st-linger 'x' > t14.out 2> t14.err
@@ -424,7 +429,7 @@ else
 fi
 
 echo
-step "15/17 text args: file flags keep backticks out of the shell, and empty text is refused"
+step "15/18 text args: file flags keep backticks out of the shell, and empty text is refused"
 # A brief passed as a quoted argument is mangled by the CALLER's shell before
 # run sees it, so the durable fix is to read it from a file. Guard both the
 # file reading and the argument parsing around it: an earlier version of this
@@ -484,7 +489,7 @@ else
 fi
 
 echo
-step "16/17 claude-sub: strips API auth and the worker marker before exec"
+step "16/18 claude-sub: strips API auth and the worker marker before exec"
 # claude-sub's one job is that boundary. The worker marker matters as much as
 # the key: claude-api reads it as "my parent session is this worker", so leaving
 # it set would file the spawned session's runs and questions under the wrong
@@ -492,20 +497,21 @@ step "16/17 claude-sub: strips API auth and the worker marker before exec"
 mkdir -p subbin
 cat > subbin/claude <<'EOF'
 #!/usr/bin/env bash
-echo "SID=[${CLAUDE_API_PARENT_SID:-unset}] KEY=[${ANTHROPIC_API_KEY:-unset}] TOK=[${ANTHROPIC_AUTH_TOKEN:-unset}] URL=[${ANTHROPIC_BASE_URL:-unset}] CFG=[${CLAUDE_CONFIG_DIR:-unset}]"
+echo "SID=[${CLAUDE_API_PARENT_SID:-unset}] SPW=[${CLAUDE_API_SPAWNER_SID:-unset}] KEY=[${ANTHROPIC_API_KEY:-unset}] TOK=[${ANTHROPIC_AUTH_TOKEN:-unset}] URL=[${ANTHROPIC_BASE_URL:-unset}] CFG=[${CLAUDE_CONFIG_DIR:-unset}]"
 EOF
 chmod +x subbin/claude
-subout=$(CLAUDE_API_PARENT_SID=fake-worker ANTHROPIC_API_KEY=k ANTHROPIC_AUTH_TOKEN=t \
+subout=$(CLAUDE_API_PARENT_SID=fake-worker CLAUDE_API_SPAWNER_SID=fake-spawner \
+         ANTHROPIC_API_KEY=k ANTHROPIC_AUTH_TOKEN=t \
          ANTHROPIC_BASE_URL=u CLAUDE_SUB_CONFIG_DIR="$WORK/subcfg" \
          PATH="$WORK/subbin:$PATH" "$BIN_DIR/claude-sub" probe 2>/dev/null)
-if [ "$subout" = "SID=[unset] KEY=[unset] TOK=[unset] URL=[unset] CFG=[$WORK/subcfg]" ]; then
+if [ "$subout" = "SID=[unset] SPW=[unset] KEY=[unset] TOK=[unset] URL=[unset] CFG=[$WORK/subcfg]" ]; then
   ok
 else
   bad "claude-sub passed through: '$subout'"
 fi
 
 echo
-step "17/17 permission mode: hook→worker inheritance, and a loud refusal when nothing was recorded"
+step "17/18 permission mode: hook→worker inheritance, and a loud refusal when nothing was recorded"
 # Free: the stub `claude` from check 13 just records argv. The whole point is
 # that the failure mode here used to be SILENT — a session whose config dir has
 # no permission-mode hook (the fleet's ~/.claude-api sessions) got workers on the
@@ -595,11 +601,117 @@ else
   bad "permission mode: no-record rc=$norec_rc/argv=$norec_argv_exists (want 3/0), hook_wrote=$hook_wrote, inherit rc=$byp_rc mode='$byp_mode' (want 0/bypassPermissions), default rc=$def_rc mode='$def_mode' (want 0/acceptEdits), unknown rc=$unk_rc (want 3), symlink rc=$sym_rc (want 3), explicit rc=$exp_rc mode='$exp_mode' (want 0/acceptEdits), no-session rc=$nosid_rc mode='$nosid_mode' (want 0/acceptEdits), setup-worker registers exactly once in both config dirs=$reg_ok (setup rc $setup1_rc/$setup2_rc; $WORK/pm-setup1.out, $WORK/pm-setup2.out)"
 fi
 
+echo
+step "18/18 ask routing: direct spawner's inbox at depth 2, root fallback + one escalation, depth-1 unchanged"
+# `ask` files a question and blocks — it spawns no claude, so this is free.
+# A receivable spawner is a live, ownership-valid registry record: pid alive
+# AND started before the record was written (a recycled pid starts only after
+# its predecessor died). Three fake records exercise the gate:
+#  - ask-parent-sid   → this shell's pid, record written now: receivable
+#  - ask-dead-sid     → a reaped child's pid: dead, must fall back to the root
+#  - ask-recycled-sid → this shell's pid but the record predates the process
+#                       (mtime 2001): recycled pid, must fall back to the root
+ASKHOME="$WORK/askhome"
+mkdir -p "$ASKHOME/.claude/sessions"
+printf '{"sessionId": "ask-parent-sid", "pid": %s, "name": "ask-parent"}\n' "$$" > "$ASKHOME/.claude/sessions/parent.json"
+( : ) & askdead=$!
+wait "$askdead" 2>/dev/null
+printf '{"sessionId": "ask-dead-sid", "pid": %s}\n' "$askdead" > "$ASKHOME/.claude/sessions/dead.json"
+printf '{"sessionId": "ask-recycled-sid", "pid": %s}\n' "$$" > "$ASKHOME/.claude/sessions/recycled.json"
+touch -d '2001-01-01' "$ASKHOME/.claude/sessions/recycled.json"
+IQ_ROOT="$ISO/run/workers/ask-root-sid/questions"
+IQ_PARENT="$ISO/run/workers/ask-parent-sid/questions"
+ask18() { # [VAR=val ...] cmd args — fake registry + root lineage preset
+  env HOME="$ASKHOME" CLAUDE_API_CONFIG_DIR="$ISO" CLAUDE_API_PARENT_SID=ask-root-sid "$@"
+}
+wait_q() { # dir from-prefix → prints the qid once its .q exists
+  local d="$1" p="$2" i=0 f
+  while [ "$i" -lt 150 ]; do
+    for f in "$d/$p"-*.q; do
+      [ -e "$f" ] && { basename "$f" .q; return 0; }
+    done
+    sleep 0.1; i=$((i + 1))
+  done
+  return 1
+}
+ask_ok=1; ask_why=""
+a18_fail() { ask_ok=0; [ -n "$ask_why" ] || ask_why="$1"; }
+# (a) live spawner: the .q lands in the SPAWNER's inbox (never the root's),
+# the filed line names the addressee, and the spawner's answer flows back.
+ask18 CLAUDE_API_SPAWNER_SID=ask-parent-sid "$CA" ask --from t18live --timeout 30 'route?' > t18a.out 2> t18a.err & apid=$!
+qid="$(wait_q "$IQ_PARENT" t18live)" || true
+ls "$IQ_ROOT"/t18live-*.q > /dev/null 2>&1 && a18_fail "live: question leaked into the root inbox"
+if [ -n "$qid" ]; then
+  env CLAUDE_CODE_SESSION_ID=ask-parent-sid CLAUDE_API_CONFIG_DIR="$ISO" "$CA" answer "$qid" "ROUTED" > /dev/null 2>&1 || a18_fail "live: answer from the spawner refused"
+else
+  a18_fail "live: no .q appeared in the spawner's inbox"
+fi
+wait "$apid" || a18_fail "live: ask exited nonzero"
+[ "$(cat t18a.out)" = "ROUTED" ] || a18_fail "live: wrong ask stdout"
+grep -q 'ask-parent-sid' t18a.err || a18_fail "live: filed line does not name the spawner"
+# (b) live spawner that never answers: after --timeout the ask escalates ONCE
+# — the .q is re-filed (annotated) in the root's inbox and the root's answer
+# is accepted.
+ask18 CLAUDE_API_SPAWNER_SID=ask-parent-sid CLAUDE_API_ASK_ESCALATION_SECS=60 \
+  "$CA" ask --from t18esc --timeout 2 'route?' > t18b.out 2> t18b.err & bpid=$!
+qid2="$(wait_q "$IQ_ROOT" t18esc)" || true
+if [ -n "$qid2" ]; then
+  grep -q 'escalated' "$IQ_ROOT/$qid2.q" || a18_fail "esc: escalated copy lacks the escalation note"
+  env CLAUDE_CODE_SESSION_ID=ask-root-sid CLAUDE_API_CONFIG_DIR="$ISO" "$CA" answer "$qid2" "ROOTED" > /dev/null 2>&1 || a18_fail "esc: answer from the root refused"
+else
+  a18_fail "esc: question never escalated into the root inbox"
+fi
+wait "$bpid" || a18_fail "esc: ask exited nonzero"
+[ "$(cat t18b.out)" = "ROOTED" ] || a18_fail "esc: wrong ask stdout"
+grep -q 'escalating once' t18b.err || a18_fail "esc: no escalation notice on stderr"
+# (c) nobody answers either window: exit 124 and NO_ANSWER names BOTH addressees.
+ask18 CLAUDE_API_SPAWNER_SID=ask-parent-sid CLAUDE_API_ASK_ESCALATION_SECS=2 \
+  "$CA" ask --from t18noans --timeout 1 'route?' > t18c.out 2> t18c.err; noans_rc=$?
+[ "$noans_rc" -eq 124 ] || a18_fail "noans: rc=$noans_rc want 124"
+{ grep -q 'NO_ANSWER' t18c.out && grep -q 'ask-parent-sid' t18c.out && grep -q 'ask-root-sid' t18c.out; } || a18_fail "noans: NO_ANSWER must name both the spawner and the root"
+# (d) dead spawner: immediate fallback — .q lands in the root's inbox, the
+# root answers, and the filed line explains the fallback.
+ask18 CLAUDE_API_SPAWNER_SID=ask-dead-sid "$CA" ask --from t18dead --timeout 30 'route?' > t18d.out 2> t18d.err & dpid=$!
+qid3="$(wait_q "$IQ_ROOT" t18dead)" || true
+ls "$IQ_PARENT"/t18dead-*.q > /dev/null 2>&1 && a18_fail "dead: question leaked into the dead spawner's inbox"
+if [ -n "$qid3" ]; then
+  env CLAUDE_CODE_SESSION_ID=ask-root-sid CLAUDE_API_CONFIG_DIR="$ISO" "$CA" answer "$qid3" "FELLBACK" > /dev/null 2>&1 || a18_fail "dead: answer from the root refused"
+else
+  a18_fail "dead: no .q appeared in the root inbox"
+fi
+wait "$dpid" || a18_fail "dead: ask exited nonzero"
+[ "$(cat t18d.out)" = "FELLBACK" ] || a18_fail "dead: wrong ask stdout"
+grep -q 'cannot receive' t18d.err || a18_fail "dead: filed line does not explain the fallback"
+# (e) recycled pid: alive but not the record's writer — the ownership gate
+# must refuse it and fall back to the root (no escalation on this path).
+ask18 CLAUDE_API_SPAWNER_SID=ask-recycled-sid "$CA" ask --from t18rec --timeout 1 'route?' > t18e.out 2> t18e.err; rec_rc=$?
+[ "$rec_rc" -eq 124 ] || a18_fail "recycled: rc=$rec_rc want 124"
+{ grep -q 'cannot receive' t18e.out && grep -q 'ask-root-sid' t18e.out; } || a18_fail "recycled: NO_ANSWER must name the root and explain the refused spawner"
+# (f) depth 1 (spawner == root, and spawner unset): byte-identical to the
+# historical behavior — exactly the old filed line and the old NO_ANSWER text.
+old_noans="NO_ANSWER: nobody replied within 1s — proceed with the default you stated in the question, or stop and report the open decision."
+ask18 CLAUDE_API_SPAWNER_SID=ask-root-sid "$CA" ask --from t18d1a --timeout 1 'route?' > t18f.out 2> t18f.err; d1a_rc=$?
+ask18 env -u CLAUDE_API_SPAWNER_SID "$CA" ask --from t18d1b --timeout 1 'route?' > t18g.out 2> t18g.err; d1b_rc=$?
+for v in f g; do
+  [ "$(cat "t18$v.out")" = "$old_noans" ] || a18_fail "depth-1($v): NO_ANSWER text changed"
+  [ "$(grep -c . "t18$v.err")" -eq 1 ] || a18_fail "depth-1($v): extra stderr output"
+  grep -Eq '^question filed as t18d1[ab]-[0-9]+-[0-9]+; waiting up to 1s for an answer$' "t18$v.err" || a18_fail "depth-1($v): filed line changed"
+done
+{ [ "$d1a_rc" -eq 124 ] && [ "$d1b_rc" -eq 124 ]; } || a18_fail "depth-1: rc=$d1a_rc/$d1b_rc want 124"
+# depth-1 questions must have landed in the root inbox (the .q is cleaned on
+# exit, so assert via the answer path being the ROOT's inbox in (a)/(d) above
+# and via the unchanged messages here).
+if [ "$ask_ok" -eq 1 ]; then
+  ok
+else
+  bad "ask routing: $ask_why (t18*.out / t18*.err)"
+fi
+
 if [ "$fails" -eq 0 ]; then
   if [ -n "${SELFTEST_SKIP_LIVE:-}" ]; then
-    echo "selftest: checks 11-17 passed (live checks 1-10 SKIPPED)"
+    echo "selftest: checks 11-18 passed (live checks 1-10 SKIPPED)"
   else
-    echo "selftest: all 17 checks passed"
+    echo "selftest: all 18 checks passed"
   fi
 else
   echo "selftest: $fails check(s) FAILED"
