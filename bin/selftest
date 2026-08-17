@@ -602,7 +602,7 @@ else
 fi
 
 echo
-step "18/18 ask routing: direct spawner's inbox at depth 2, root fallback + one escalation, depth-1 unchanged"
+step "18/18 ask routing: direct spawner's inbox at depth 2, root fallback + one escalation, depth-1 unchanged, total wait clamped to the budget"
 # `ask` files a question and blocks — it spawns no claude, so this is free.
 # A receivable spawner is a live, ownership-valid registry record: pid alive
 # AND started before the record was written (a recycled pid starts only after
@@ -701,6 +701,60 @@ done
 # depth-1 questions must have landed in the root inbox (the .q is cleaned on
 # exit, so assert via the answer path being the ROOT's inbox in (a)/(d) above
 # and via the unchanged messages here).
+# (g) budget clamp, through the real script: a huge escalation env must be
+# clamped so tmo + esc_window never exceeds the 570s default budget — the
+# escalation notice prints the CLAMPED window (570 - 1 = 569), never 999999.
+# Without the clamp, --timeout 540 (the default) + 180s escalation = 720s,
+# and the 600s Bash tool cap kills the ask 60s into the escalation window —
+# the EXIT trap then withdraws both .q copies and the asker gets a killed
+# tool call instead of NO_ANSWER.
+ask18 CLAUDE_API_SPAWNER_SID=ask-parent-sid CLAUDE_API_ASK_ESCALATION_SECS=999999 \
+  "$CA" ask --from t18clamp --timeout 1 'route?' > t18h.out 2> t18h.err & hpid=$!
+qid4="$(wait_q "$IQ_ROOT" t18clamp)" || true
+if [ -n "$qid4" ]; then
+  env CLAUDE_CODE_SESSION_ID=ask-root-sid CLAUDE_API_CONFIG_DIR="$ISO" "$CA" answer "$qid4" "CLAMPED" > /dev/null 2>&1 || a18_fail "clamp: answer from the root refused"
+else
+  a18_fail "clamp: question never escalated into the root inbox"
+fi
+wait "$hpid" || a18_fail "clamp: ask exited nonzero"
+[ "$(cat t18h.out)" = "CLAMPED" ] || a18_fail "clamp: wrong ask stdout"
+grep -q 'waiting another 569s' t18h.err || a18_fail "clamp: escalation window not clamped to budget - tmo (want 569s in t18h.err)"
+# (h) no room left: when --timeout consumes the whole budget the escalation is
+# skipped outright — announced on stderr, and the NO_ANSWER names the spawner
+# and says the escalation was skipped for budget. No .q may reach the root.
+ask18 CLAUDE_API_SPAWNER_SID=ask-parent-sid CLAUDE_API_ASK_BUDGET_SECS=2 CLAUDE_API_ASK_ESCALATION_SECS=180 \
+  "$CA" ask --from t18skip --timeout 2 'route?' > t18i.out 2> t18i.err; skip_rc=$?
+[ "$skip_rc" -eq 124 ] || a18_fail "skip: rc=$skip_rc want 124"
+grep -q 'SKIPPED' t18i.err || a18_fail "skip: no skipped-escalation notice on stderr"
+{ grep -q 'NO_ANSWER' t18i.out && grep -q 'ask-parent-sid' t18i.out && grep -q 'skipped' t18i.out; } || a18_fail "skip: NO_ANSWER must name the spawner and say the escalation was skipped"
+ls "$IQ_ROOT"/t18skip-*.q > /dev/null 2>&1 && a18_fail "skip: a zero-window escalation still filed into the root inbox"
+# (i) explicit over-budget timeout: cannot be clamped without breaking the
+# caller's stated wait, so it must WARN loudly that the tool cap will kill
+# the call — and otherwise proceed.
+ask18 env -u CLAUDE_API_SPAWNER_SID CLAUDE_API_ASK_BUDGET_SECS=1 \
+  "$CA" ask --from t18warn --timeout 2 'route?' > t18j.out 2> t18j.err; warn_rc=$?
+[ "$warn_rc" -eq 124 ] || a18_fail "warn: rc=$warn_rc want 124"
+{ grep -q 'WARNING' t18j.err && grep -q 'tool cap' t18j.err && grep -q 'KILL' t18j.err; } || a18_fail "warn: over-budget --timeout must warn that the tool cap will kill the call"
+# (j) mutation check on the clamp: neutralise the clamp line in a throwaway
+# copy of worker-ctl and prove sub-test (g)'s assertion catches it — the
+# mutant must print the UNclamped 999999s window. If the sed no longer
+# matches, the clamp line moved and this check must move with it.
+WCTL="$BIN_DIR/worker-ctl"
+sed '/esc_window" -gt "\$esc_room"/d' "$WCTL" > "$WORK/mut-ctl" && chmod +x "$WORK/mut-ctl"
+if cmp -s "$WCTL" "$WORK/mut-ctl"; then
+  a18_fail "mutation: sed removed nothing — the clamp line changed; update this check"
+else
+  ask18 CLAUDE_API_SPAWNER_SID=ask-parent-sid CLAUDE_API_ASK_ESCALATION_SECS=999999 \
+    "$WORK/mut-ctl" ask --from t18mut --timeout 1 'route?' > t18k.out 2> t18k.err & mpid=$!
+  qid5="$(wait_q "$IQ_ROOT" t18mut)" || true
+  if [ -n "$qid5" ]; then
+    env CLAUDE_CODE_SESSION_ID=ask-root-sid CLAUDE_API_CONFIG_DIR="$ISO" "$CA" answer "$qid5" "MUTANT" > /dev/null 2>&1 || a18_fail "mutation: answer to the mutant refused"
+  else
+    a18_fail "mutation: mutant never escalated"
+  fi
+  wait "$mpid" || a18_fail "mutation: mutant ask exited nonzero"
+  grep -q 'waiting another 999999s' t18k.err || a18_fail "mutation: clamp-free mutant did NOT print the unclamped window — (g) would not catch a broken clamp"
+fi
 if [ "$ask_ok" -eq 1 ]; then
   ok
 else

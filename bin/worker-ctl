@@ -523,6 +523,25 @@ ask)
   # first timeout (see below), so a question is never stranded.
   esc_window="${CLAUDE_API_ASK_ESCALATION_SECS:-180}"
   case "$esc_window" in ''|*[!0-9]*) echo "claude-api ask: CLAUDE_API_ASK_ESCALATION_SECS must be a number of seconds" >&2; exit 1 ;; esac
+  # HARD TOTAL BUDGET. The Bash tool kills any call at 600s. A kill mid-wait is
+  # the worst outcome: the EXIT trap withdraws both .q copies — possibly right
+  # after the escalated copy woke the root's watcher — and the asker gets a
+  # killed tool call instead of NO_ANSWER + its stated default. So the total
+  # wait (tmo + esc_window) is clamped to a budget with margin under the cap:
+  # the escalation window shrinks to whatever room the first timeout leaves,
+  # and when no room is left the escalation is skipped (announced in the
+  # NO_ANSWER). An explicit --timeout above the budget cannot be clamped
+  # without breaking the caller's stated wait, so it only warns — loudly.
+  # (CLAUDE_API_ASK_BUDGET_SECS exists for the selftest and for harnesses with
+  # a different tool cap; the default matches Claude Code's 600s.)
+  budget="${CLAUDE_API_ASK_BUDGET_SECS:-570}"
+  case "$budget" in ''|*[!0-9]*) echo "claude-api ask: CLAUDE_API_ASK_BUDGET_SECS must be a number of seconds" >&2; exit 1 ;; esac
+  if [ "$tmo" -gt "$budget" ]; then
+    echo "claude-api ask: WARNING — --timeout ${tmo}s exceeds the ${budget}s total-wait budget; the harness Bash tool cap (600s) will KILL this call before the ask completes, the question is withdrawn on kill, and you will see a killed tool call instead of an answer or NO_ANSWER" >&2
+  fi
+  esc_room=$((budget - tmo))
+  if [ "$esc_room" -lt 0 ]; then esc_room=0; fi
+  if [ "$esc_window" -gt "$esc_room" ]; then esc_window=$esc_room; fi
   spawner="${CLAUDE_API_SPAWNER_SID:-}"
   root="${CLAUDE_API_PARENT_SID:-}"
   asked=""  # set only off the depth-1 path; named in the filed/timeout messages
@@ -575,6 +594,14 @@ PY
   done
   # Timeout — one last look in case the answer landed this second.
   if [ -f "$QDIR/$qid.a" ]; then deliver "$QDIR/$qid.a"; exit $?; fi
+  if [ -n "$QDIR2" ] && [ "$esc_window" -eq 0 ]; then
+    # The first timeout consumed the whole budget — escalating would either be
+    # a zero-second wait (a watcher wake-up whose question we withdraw in the
+    # same breath) or blow past the tool cap. Skip it and say so.
+    echo "no answer from your spawner within ${tmo}s — escalation to $root_desc SKIPPED: --timeout ${tmo}s leaves no room in the ${budget}s total-wait budget (600s tool cap)" >&2
+    echo "NO_ANSWER: nobody replied within ${tmo}s — asked your direct spawner session $spawner; escalation to $root_desc was skipped because --timeout left no room in the ${budget}s budget under the 600s tool cap. Proceed with the default you stated in the question, or stop and report the open decision."
+    exit 124
+  fi
   if [ -n "$QDIR2" ]; then
     # Escalate ONCE: the spawner is alive but never answered (e.g. it runs in
     # dontAsk mode, where inbound pings are held for a user that a headless
@@ -582,7 +609,8 @@ PY
     # lineage root's inbox — filing is the wake-up: it fires any `questions
     # --wait` watcher the root has armed — and wait one shorter window. The
     # spawner's copy stays; an answer from EITHER inbox is accepted. Never
-    # retried beyond this: total wait is bounded at tmo + esc_window.
+    # retried beyond this: total wait is bounded at tmo + esc_window, which
+    # the clamp above keeps within the budget.
     mkdir -p "$QDIR2"
     WCTL_Q="$q [escalated: the direct spawner session $spawner did not answer within ${tmo}s]" \
       python3 - "$QDIR2/$qid.q" "$qid" "$from" <<'PY'
