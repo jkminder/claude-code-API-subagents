@@ -331,9 +331,12 @@ spawner's session is gone, the question is filed straight to the lineage
 root's inbox; and if a live spawner never answers within the ask's
 `--timeout`, the ask **escalates once** — it re-files the question into the
 root's inbox (filing is the wake-up: it fires any armed `--wait` watcher
-there) and waits another 180 s (`CLAUDE_API_ASK_ESCALATION_SECS`), accepting
+there) and waits the remaining escalation window, accepting
 an answer from either inbox, before giving up with a `NO_ANSWER` that names
-both addressees. No native ping arrives for a fallback or escalated question
+both addressees. The window is `CLAUDE_API_ASK_ESCALATION_SECS` (default
+180 s) clamped to what a hard 570 s total-wait budget leaves after
+`--timeout` — at the default `--timeout 540` that is 30 s, and at 570 s or
+more the escalation is skipped (the `NO_ANSWER` says so). No native ping arrives for a fallback or escalated question
 — only `claude-api questions` / an armed watcher surfaces it.
 
 **Wake-up paths.** The native ping wakes this session with no setup. It is
@@ -363,8 +366,8 @@ hit a decision point:
 > If you hit a genuine decision point — ambiguous requirement, irreversible or costly action, a fork only the user can decide — ask the human. First, if you have a SendMessage tool and your system prompt names the session that spawned you, notify that agent with a one-line message like "question incoming from <slug>"; if SendMessage asks you to confirm with a ref, re-send with the exact ref it shows; if it fails or your system prompt names no parent, skip the ping and continue. Then run `claude-api ask --from <slug> --timeout 400 "<question — state what you will do by default if unanswered>"` as a single foreground Bash call with the tool timeout set to 600000 ms (the ask clamps its total wait — --timeout plus one escalation window — to a 570 s budget, so it always finishes inside the 600 s tool-call cap; 400 leaves a 170 s escalation window). Do not `&`-background it or poll for it. Its stdout is the answer. On NO_ANSWER, a denial, or a tool error, take your stated default if safe, otherwise stop and report the open decision. Never ask for status updates, confirmations of your own analysis, or anything you can determine yourself — every question stalls you and interrupts the human. This is the only `claude-api` command you may run.
 
 Answer within the worker's `--timeout` (default 540 s; the canned briefing
-uses 400 s so the single 180 s escalation window still fits the tool-call
-cap); after that `answer` fails cleanly — the worker has moved on and takes
+uses 400 s, which leaves a 170 s escalation window inside the 570 s budget —
+at the 540 s default the window is only 30 s); after that `answer` fails cleanly — the worker has moved on and takes
 its stated default. A running
 worker can still be reached via `send` (a finished one only via `--resume`). A
 worker blocked mid-`ask` cannot act on `send` until the ask returns; to redirect
