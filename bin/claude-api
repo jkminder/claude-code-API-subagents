@@ -790,7 +790,16 @@ export -n CLAUDE_API_RUN_SLUG 2>/dev/null || true
 # when job control is off, which would starve FIFO/stream-json workers.
 claude "$@" <&0 &
 child=$!
-trap 'kill -TERM "$child" 2>/dev/null || true' TERM INT
+# Handler is a FUNCTION NAME, not a command string: bash re-parses a string
+# handler at fire time, and on 2026-08-28 two brief workers' wrappers printed
+# "trap: line 2: unexpected EOF while looking for matching ')'" at their group
+# kill — a re-parse failure whose corrupted string was never reproduced (file
+# unchanged since Aug 17; plain-TERM, group-TERM, poisoned-env and stub-run
+# repros all clean). A function name has no re-parse surface: the body parses
+# once at script load (corruption fails loudly at startup, not silently at
+# fire), and the fire-time handler is a single word.
+__capi_relay_term() { kill -TERM "$child" 2>/dev/null || true; }
+trap __capi_relay_term TERM INT
 # run workers pass the task through the FIFO, not argv — the slug is the label.
 printf '{"event":"spawn","ts":%s,"pid":%s,"sid":"%s","slug":"%s","cwd":"%s","cmd":"%s"}\n' \
   "$start_ts" "$child" "$(san "${CLAUDE_CODE_SESSION_ID:-}")" "$(san "${CLAUDE_API_RUN_SLUG:-}")" "$(san "$PWD")" "$(san "$*")" >> "$LEDGER" 2>/dev/null || true
