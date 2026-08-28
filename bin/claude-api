@@ -793,11 +793,17 @@ child=$!
 # Handler is a FUNCTION NAME, not a command string: bash re-parses a string
 # handler at fire time, and on 2026-08-28 two brief workers' wrappers printed
 # "trap: line 2: unexpected EOF while looking for matching ')'" at their group
-# kill — a re-parse failure whose corrupted string was never reproduced (file
-# unchanged since Aug 17; plain-TERM, group-TERM, poisoned-env and stub-run
-# repros all clean). A function name has no re-parse surface: the body parses
-# once at script load (corruption fails loudly at startup, not silently at
-# fire), and the fire-time handler is a single word.
+# kill. That exact message IS producible from a ONE-line handler whose string
+# lost a closing paren of a $( — bash counts the virtual line past the
+# string's end, so "line 2" does not imply a multi-line handler (reviewer
+# repro, 2026-08-28; an earlier note here claimed otherwise). The string this
+# file ships is well-formed and unchanged since Aug 17, so the incident
+# implies the INSTALLED COPY of the string was corrupted in those two
+# processes — mechanism never reproduced (plain-TERM, group-TERM,
+# poisoned-env and stub-run repros all clean). A function name removes the
+# whole surface: the body parses once at script load (corruption fails
+# loudly at startup, not silently at fire), and the fire-time handler is a
+# single word.
 __capi_relay_term() { kill -TERM "$child" 2>/dev/null || true; }
 trap __capi_relay_term TERM INT
 # run workers pass the task through the FIFO, not argv — the slug is the label.
