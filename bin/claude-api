@@ -105,7 +105,9 @@ case "${1:-}" in
       exit 2
     fi
     case "$slug" in
-      *[!A-Za-z0-9._-]*) echo "claude-api run: slug must match [A-Za-z0-9._-]" >&2; exit 2 ;;
+      # leading '-' also refused: an option-shaped slug (run -x "task") would
+      # silently become worker files and ledger keys named like flags
+      *[!A-Za-z0-9._-]*|-*) echo "claude-api run: slug must match [A-Za-z0-9._-] and not start with '-'" >&2; exit 2 ;;
     esac
     if [ "$PWD" -ef "$HOME" ]; then
       echo "claude-api run: refusing to spawn from \$HOME (the worker sandbox would cover your whole home dir) — cd into the target repo or a scratch dir" >&2
