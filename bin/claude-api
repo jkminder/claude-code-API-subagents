@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Worker wrapper: runs `claude` against a dedicated Anthropic API key with an
-# identity fully isolated from any subscription login in the parent environment.
+# Worker wrapper: runs `claude` as the API-billed worker identity — a config
+# dir (CLAUDE_CONFIG_DIR=$CLAUDE_API_CONFIG_DIR, default ~/.claude-api) fully
+# isolated from any subscription login in the parent environment.
 #
-# Key resolution order (each source cascades to the next on failure/empty):
-#   1. $CLAUDE_API_KEY_CMD        (a command that prints the key, e.g. a vault CLI)
-#   2. macOS Keychain             (service $CLAUDE_API_KEYCHAIN_SERVICE, default claude-api-worker)
-#   3. $CLAUDE_API_CONFIG_DIR/api-key   (0600 file — the path for Linux/clusters)
-# Store the key with bin/store-key (works on both platforms).
+# API key: the worker fetches it itself. Claude Code runs the `apiKeyHelper` in
+# the config dir's settings.json (a command that prints the key — an `op read`
+# from 1Password under with-op) and re-runs it periodically, so a rotation
+# reaches even a long-lived --stay worker. This wrapper only checks that the
+# helper is configured: it reads no key file, asks no Keychain, and exports no
+# key — an ANTHROPIC_API_KEY in the environment would outrank the helper and
+# pin one key for the worker's lifetime, so an inherited one is stripped. No
+# API key lives in any file (Fellows security reset 2026-09-06).
 #
 # Permission mode resolution (first match wins):
 #   1. Explicit --permission-mode / --dangerously-skip-permissions in the args
@@ -40,7 +44,6 @@ done
 BIN_DIR="$(cd "$(dirname "$SRC")" && pwd)"
 
 CONFIG_DIR="${CLAUDE_API_CONFIG_DIR:-$HOME/.claude-api}"
-KEYCHAIN_SERVICE="${CLAUDE_API_KEYCHAIN_SERVICE:-claude-api-worker}"
 RUN_DIR="$CONFIG_DIR/run"
 # The config dir of the session that called us, captured BEFORE we point
 # CLAUDE_CONFIG_DIR at the worker identity — that is the settings.json whose
@@ -549,32 +552,45 @@ case "${1:-}" in
   mcp|config|update|install|setup-token|auth|plugin|migrate-installer|agents|-h|--help|-v|--version) meta=1 ;;
 esac
 
-# Key resolution — independent cascading sources.
-key=""
-if [ -n "${CLAUDE_API_KEY_CMD:-}" ]; then
-  key="$(eval "$CLAUDE_API_KEY_CMD" 2>/dev/null || true)"
-  [ -n "$key" ] || echo "claude-api: CLAUDE_API_KEY_CMD produced no key; trying next source" >&2
-fi
-if [ -z "$key" ] && [ "$(uname)" = Darwin ] && command -v security >/dev/null 2>&1; then
-  key="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)"
-fi
-if [ -z "$key" ] && [ -f "$CONFIG_DIR/api-key" ]; then
-  key="$(tr -d '[:space:]' < "$CONFIG_DIR/api-key")"
+# Key source check — nothing is fetched or exported here (see the header). A
+# spawn without a helper would fail on the worker's first API call, far from
+# the cause, so refuse up front. python3 is a hard dependency of this repo
+# already (the run supervisor and worker-ctl are python).
+api_key_helper() { # config dir → prints its settings.json apiKeyHelper, empty when absent
+  python3 - "$1/settings.json" <<'PY'
+import json, sys
+try:
+    v = json.load(open(sys.argv[1])).get("apiKeyHelper")
+except Exception:
+    v = None
+print(v.strip() if isinstance(v, str) else "")
+PY
+}
+if [ "$meta" -eq 0 ]; then
+  command -v python3 >/dev/null 2>&1 || { echo "claude-api: python3 is required (key-source check, run supervisor, worker-ctl)" >&2; exit 1; }
+  if [ -z "$(api_key_helper "$CONFIG_DIR")" ]; then
+    {
+      echo "claude-api: no API key source — $CONFIG_DIR/settings.json has no apiKeyHelper."
+      echo "  The worker fetches its key at runtime through that helper (Claude Code runs it in the"
+      echo "  worker process). This wrapper reads no key file and exports no key. Set the helper to a"
+      echo "  command that prints the key, fetched from 1Password under with-op, e.g."
+      echo "    \"apiKeyHelper\": \"$HOME/.local/bin/with-op op read 'op://<vault>/<item>/credential'\""
+      if [ -n "${CLAUDE_API_KEY_CMD:-}" ]; then
+        echo "  CLAUDE_API_KEY_CMD is set in this environment, but a worker never reads it — put that"
+        echo "  same command into settings.json as the apiKeyHelper: $CLAUDE_API_KEY_CMD"
+      fi
+      echo "  Then: claude-api doctor (runs the helper once and shows op's error if it fails)."
+    } >&2
+    exit 1
+  fi
 fi
 
-if [ -n "$key" ]; then
-  export ANTHROPIC_API_KEY="$key"
-elif [ "$meta" -eq 0 ]; then
-  echo "claude-api: no API key found." >&2
-  echo "Store it once with:  claude-api-store-key  (or $BIN_DIR/store-key)" >&2
-  echo "(macOS: Keychain service '$KEYCHAIN_SERVICE'; Linux: $CONFIG_DIR/api-key, 0600)" >&2
-  exit 1
-fi
-
-# Nothing inherited from the parent may win the auth precedence (AUTH_TOKEN
-# outranks API_KEY), reroute traffic (BASE_URL, Bedrock/Vertex switches), or
-# override the worker model.
-unset ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_BASE_URL \
+# Nothing inherited from the parent may outrank the helper in the auth
+# precedence (ANTHROPIC_AUTH_TOKEN and ANTHROPIC_API_KEY both do — a stale or
+# foreign key would win silently and stay fixed for the worker's lifetime),
+# reroute traffic (BASE_URL, Bedrock/Vertex switches), or override the worker
+# model.
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_BASE_URL \
       CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
       ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_CUSTOM_HEADERS 2>/dev/null || true
 

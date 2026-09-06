@@ -45,12 +45,16 @@ A worker is a separate `claude -p` process. Spawn one only for:
 For anything else, use a subagent.
 
 `claude-api` is on PATH (installed by this repo's `bin/setup-worker`). It runs
-`claude` with the API key from `~/.claude-api/api-key` (or Keychain) and
-`CLAUDE_CONFIG_DIR=~/.claude-api`. Never put the key on a command line or
-export it into a shared shell — every wrapper reads it from the file at
-runtime. If `claude-api` reports **no API key found**, stop and ask the user to
-run `claude-api-store-key`; it prompts interactively and you cannot do that
-step for them.
+`claude` with `CLAUDE_CONFIG_DIR=~/.claude-api`; the worker fetches its API key
+at runtime through the `apiKeyHelper` in `~/.claude-api/settings.json` — an
+`op read` from 1Password under `with-op`. No key is stored in a file, exported
+into a shell, or put on a command line, and you never do any of that either. If
+`claude-api` reports **no API key source**, the helper is missing from
+`~/.claude-api/settings.json` — the message shows the line to add; tell the
+user. If a worker fails to authenticate, run `claude-api doctor`: it runs the
+helper once and shows `op`'s error (a missing or expired
+`OP_SERVICE_ACCOUNT_TOKEN` / `~/.config/op/service-account-token` is the usual
+cause). Report that to the user; never paste a key anywhere.
 
 **Portability:** this skill plus the repo README are the complete operating
 manual — assume no other local state or prior conversation. If `claude-api` is
@@ -415,4 +419,4 @@ about the whole machine. `kill <pid>` is always literal.
 - `claude-api kill <pid>|--all [--global]` — stop runaway workers immediately (Linux: reaps their supervisors too; macOS: run `clean --all` after); `claude-api end <slug>` is the graceful version.
 - `claude-api send <slug> "<msg>" [--wait [secs]]` / `claude-api reply <slug>` / `claude-api end <slug>` — steer, read, and finish running workers (steering section); `questions [--wait]` / `answer <qid> "<text>"` — the question relay (above).
 - `claude-api clean [--all] [--global]` — sweep dead keepers, stale artifacts, and old questions in the session's worker dir (`--all` also kills live keepers, ending their workers).
-- `claude-api doctor [--ping]` — when spawning misbehaves: checks key, config, the permission-mode hook, symlinks (`--ping` does one live run). `claude-api selftest` — after Claude Code upgrades: re-validates the behaviors this skill depends on (spends a few sonnet runs).
+- `claude-api doctor [--ping]` — when spawning misbehaves: checks the `apiKeyHelper` (runs it once, never prints the key), config, the permission-mode hook, symlinks (`--ping` does one live run). `claude-api selftest` — after Claude Code upgrades: re-validates the behaviors this skill depends on (spends a few sonnet runs).

@@ -4,16 +4,16 @@ Run Claude Code on an **Anthropic API key** — one API-billed identity for your
 
 ## What it gives you
 
-- **An API-billed identity**, installed once: settings, credentials and sessions under `~/.claude-api`, with your user context (CLAUDE.md, skills, agents, hooks) mirrored in.
+- **An API-billed identity**, installed once: settings and sessions under `~/.claude-api` (no credentials on disk — the key is fetched at runtime), with your user context (CLAUDE.md, skills, agents, hooks) mirrored in.
 - **Workers** — separate `claude` processes you spawn, steer mid-run, keep alive between turns, and run in their own git worktree. They can outlive the session that started them.
 - **A delegation skill** so an agent can do all of that itself.
 
 ## How it works
 
-Auth resolves per **process**: in Claude Code's [credential precedence](https://code.claude.com/docs/en/authentication.md), `ANTHROPIC_API_KEY` outranks subscription OAuth, and `CLAUDE_CONFIG_DIR` gives a process a fully isolated identity. Every session and every worker runs with the key in its environment and `CLAUDE_CONFIG_DIR=~/.claude-api`, so all their tokens bill the API org.
+Auth resolves per **process**: `CLAUDE_CONFIG_DIR` gives a process a fully isolated identity, and that identity's `settings.json` carries an `apiKeyHelper` — a command Claude Code runs to fetch the API key at runtime (an `op read` from 1Password; see *Install*). Every session and every worker runs with `CLAUDE_CONFIG_DIR=~/.claude-api`, so all of them fetch the same key and bill the API org. No process holds the key in a file or in a long-lived environment variable: in Claude Code's [credential precedence](https://code.claude.com/docs/en/authentication.md) `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` outrank the helper, so the wrapper strips inherited ones.
 
 ```
-Session (ANTHROPIC_API_KEY, CLAUDE_CONFIG_DIR=~/.claude-api)
+Session (CLAUDE_CONFIG_DIR=~/.claude-api → its apiKeyHelper fetches the key at runtime)
    ├─ built-in Agent-tool subagents — in-process, same identity   ← the default
    └─ claude-api run <slug> ─▶ separate claude -p worker processes
                                (standing workers, isolated checkouts,
@@ -28,14 +28,17 @@ Billing is the same either way, so pick by process properties instead: built-in 
 ```bash
 git clone https://github.com/jkminder/claude-code-API-subagents.git
 claude-code-API-subagents/bin/setup-worker    # worker config, PATH links, delegate skill (idempotent)
-claude-code-API-subagents/bin/store-key       # prompts for the API key: Keychain on macOS, 0600 file on Linux
+# the API key: a command that fetches it at runtime, in ~/.claude-api/settings.json — never a key file
+#   "apiKeyHelper": "with-op op read 'op://<vault>/<item>/credential'"
+claude-api doctor                                              # health-check: runs the helper once (never prints the key)
 claude-api -p 'Reply with exactly: WORKER OK' --model sonnet   # verify → appears on Console usage
-claude-api doctor                                              # health-check the install
 ```
+
+**The API key is never stored on the machine.** Claude Code runs the `apiKeyHelper` inside the worker process and re-runs it periodically, so a key rotation reaches even a long-lived worker without a relaunch. `with-op` (installed at `~/.local/bin/with-op` by the agent-skills repo) exports `OP_SERVICE_ACCOUNT_TOKEN` from `~/.config/op/service-account-token` (mode 0600 — the one secret on disk) for that single `op` command, so the helper works from systemd units and plain shells alike. Keychain is not used. `claude-api` refuses to spawn (exit 1) when the helper is missing, instead of letting the worker fail on its first API call.
 
 **Updating an existing install:** `git pull && ./bin/setup-worker`. The PATH and skill symlinks point into the checkout, so repo-side changes arrive with the pull alone — but anything materialized outside the repo (user-context passthrough links, mirrored hooks, worker-settings keys) only updates when setup-worker reruns. It's idempotent; also rerun it after adding a user skill or moving the repo.
 
-Prerequisite: `claude` on PATH (`npm install -g @anthropic-ai/claude-code`); `~/.local/bin` on PATH. `setup-worker` **merges** its managed keys into `~/.claude-api/settings.json` — your customizations survive re-runs. The wrapper also accepts `$CLAUDE_API_KEY_CMD` (a command printing the key, e.g. a vault CLI) instead of Keychain/file storage. `setup-worker --uninstall` removes the symlinks and deregisters the hook.
+Prerequisite: `claude` on PATH (`npm install -g @anthropic-ai/claude-code`); `~/.local/bin` on PATH; `python3`. `setup-worker` **merges** its managed keys into `~/.claude-api/settings.json` — your customizations, the `apiKeyHelper` included, survive re-runs; its last line says whether a helper is present. `setup-worker --uninstall` removes the symlinks and deregisters the hook.
 
 ## Usage
 
@@ -94,15 +97,20 @@ The two compose into **multi-level fan-out**: a session (or worker) spawns one w
 - Check `~/.claude-api/cost-log.jsonl` — every finished run gets a line; failed runs carry `"failed": "<subtype>"` (`"empty-result"` for the parked case; `"exit-<n>"` when the worker was killed or died *after* a successful turn — its partial result was real, don't chase a limit). The spawn's full command line (including any injected `--max-budget-usd`) is in `~/.claude-api/run/ledger.jsonl`.
 - The wrapper exits nonzero with a `FAILED` line and a `cause:` for both cases. An empty result never exits 0 — if you see that, the wrapper predates this check.
 
+**`claude-api` exits 1 with "no API key source", or a worker fails to authenticate.**
+
+- The worker gets its key from the `apiKeyHelper` in `~/.claude-api/settings.json` and from nowhere else — no key file, no Keychain, no `ANTHROPIC_API_KEY` in the environment (the wrapper strips one). "no API key source" means the helper is missing from that file; the message shows the line to add.
+- A helper that is present but fails is an `op` problem: run `claude-api doctor` — it runs the helper once and prints its stderr (never the key). `with-op` exits 3 when `~/.config/op/service-account-token` is missing or empty and 2 when its mode or owner is not `0600` / you; `op` itself reports an expired or revoked `OP_SERVICE_ACCOUNT_TOKEN`.
+
 ## Components
 
-- [bin/claude-api](bin/claude-api) — worker wrapper: resolves the key (`$CLAUDE_API_KEY_CMD` → Keychain → `~/.claude-api/api-key`), sets `CLAUDE_CONFIG_DIR`, strips everything inherited that could reroute billing (`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, Bedrock/Vertex switches, `ANTHROPIC_MODEL`), resolves the permission mode, pins the default worker model to fable via `--settings '{"model": "claude-fable-5"}'` (headless sessions ignore the settings.json model key; an explicit `--model` or caller-supplied `--settings` wins), injects `--max-budget-usd` only when `CLAUDE_API_MAX_BUDGET_USD` is set, runs `claude`, and records every run in the ledger. Also implements `run` — the FIFO supervisor that spawns the stream-json worker, keeps the pipe open, closes it under a lock when every message is answered, and turns the last `result` line into stdout/exit-code — and dispatches the subcommands below.
+- [bin/claude-api](bin/claude-api) — worker wrapper: checks that `~/.claude-api/settings.json` carries an `apiKeyHelper` (exit 1 otherwise — the worker fetches its key through it; the wrapper reads no key and exports none), sets `CLAUDE_CONFIG_DIR`, strips everything inherited that could outrank the helper or reroute billing (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, Bedrock/Vertex switches, `ANTHROPIC_MODEL`), resolves the permission mode, pins the default worker model to fable via `--settings '{"model": "claude-fable-5"}'` (headless sessions ignore the settings.json model key; an explicit `--model` or caller-supplied `--settings` wins), injects `--max-budget-usd` only when `CLAUDE_API_MAX_BUDGET_USD` is set, runs `claude`, and records every run in the ledger. Also implements `run` — the FIFO supervisor that spawns the stream-json worker, keeps the pipe open, closes it under a lock when every message is answered, and turns the last `result` line into stdout/exit-code — and dispatches the subcommands below.
 - [bin/claude-sub](bin/claude-sub) — the mirror: a `claude` session on subscription auth (unsets `ANTHROPIC_API_KEY` explicitly, since an inherited key wins silently). Only for the work an API key cannot do — the claude.ai-hosted connectors (`mcp__claude_ai_*`, e.g. Notion, Todoist) load only under a subscription login. It cannot publish artifacts (that tool needs an interactive session, not a billing mode).
 - [bin/worker-ctl](bin/worker-ctl) — `ps` / `kill` / `clean` / `send` / `reply` / `end` / `ask` / `questions` / `answer`: worker registry from the ledger, liveness (busy/idle from the supervisor's `.state` file, `/proc` fallback for legacy FIFO workers), FIFO messaging with delivery confirmation (non-consuming `FIONREAD` probe) and a locked send↔close handoff, graceful end via the `.keeper` pid, the worker→human question relay (file-based; filed in the direct spawner's inbox via `CLAUDE_API_SPAWNER_SID` — the same session the worker's ping targets — with a fallback to the lineage root's inbox via `CLAUDE_API_PARENT_SID` when the spawner's session cannot receive, and a single timed escalation to that root inbox when a live spawner never answers), artifact sweeping; session-scoped by default, `--global` for machine-wide.
 - [bin/worker-worktree](bin/worker-worktree) — per-worker git worktrees (`worker/<slug>` branches) for parallel edits on one repo.
-- [bin/doctor](bin/doctor) — install health check (key source, config perms, no stray OAuth creds in the worker identity, hook registration, symlinks, shared session registry; `--ping` for a live run).
-- [bin/selftest](bin/selftest) — re-runs the validation matrix (basic run, `--resume`, `acceptEdits` edits, legacy FIFO envelope + `send`, worker→human ask relay from a `run` worker, `run` one-shot/EOF-drain/close-race/crash/steer+slug-registration, dirty-tree guard, parked-worker failure, headless injections incl. `-n` and the parent-name briefing, close-linger guard — the protocol and guard checks use stub workers and are free).
-- [bin/store-key](bin/store-key) — key storage; on macOS `security` itself prompts (key never enters argv), elsewhere a 0600 file.
+- [bin/doctor](bin/doctor) — install health check (`apiKeyHelper` present and producing a key — run once, never printed, `op`'s error surfaced; config perms, no stray OAuth creds in the worker identity, hook registration, symlinks, shared session registry; `--ping` for a live run).
+- [bin/selftest](bin/selftest) — re-runs the validation matrix (basic run, `--resume`, `acceptEdits` edits, legacy FIFO envelope + `send`, worker→human ask relay from a `run` worker, `run` one-shot/EOF-drain/close-race/crash/steer+slug-registration, dirty-tree guard, parked-worker failure, headless injections incl. `-n` and the parent-name briefing, close-linger guard, the key path — helper-only, no key export, `store-key` refuses — the protocol and guard checks use stub workers and are free).
+- [bin/store-key](bin/store-key) — retired tombstone: exits 2 and prints the rule (the key is fetched at runtime through `apiKeyHelper`, never stored), so old references fail loudly instead of with "command not found".
 - [bin/setup-worker](bin/setup-worker) — idempotent installer (merges settings, guards against clobbering real files, atomic writes); also symlinks `~/.claude-api/sessions` → `~/.claude/sessions` so workers are natively discoverable; `--uninstall` reverses it. Re-run after moving the repo.
 - [bin/permission-mode-hook](bin/permission-mode-hook) — PreToolUse hook recording the session's permission mode to a private 0700 dir (`~/.claude-api/run/`, atomic 0600 writes, stale files pruned) so workers can inherit elevated modes. Registered in both `~/.claude/settings.json` and the worker config dir's, since a session only reads the one in its own `CLAUDE_CONFIG_DIR`; if the record is missing, `claude-api` refuses to spawn (exit 3).
 - [skills/delegate/SKILL.md](skills/delegate/SKILL.md) — the delegation playbook (spawn, collect, steer, swarm, housekeeping).
@@ -111,7 +119,7 @@ The two compose into **multi-level fan-out**: a session (or worker) spawns one w
 
 ## Facts this relies on (verified 2026-08-04, Claude Code v2.1.220)
 
-- Credential precedence: cloud creds → `ANTHROPIC_AUTH_TOKEN` → `ANTHROPIC_API_KEY` → `apiKeyHelper` → `CLAUDE_CODE_OAUTH_TOKEN` → subscription OAuth ([authentication.md](https://code.claude.com/docs/en/authentication.md)).
+- Credential precedence: cloud creds → `ANTHROPIC_AUTH_TOKEN` → `ANTHROPIC_API_KEY` → `apiKeyHelper` → `CLAUDE_CODE_OAUTH_TOKEN` → subscription OAuth ([authentication.md](https://code.claude.com/docs/en/authentication.md)). The wrapper relies on the `apiKeyHelper` step and strips the two variables above it. A headless `claude -p` honours the config dir's helper (verified 2026-09-06, v2.1.263: a worker with no `ANTHROPIC_API_KEY` and no `OP_SERVICE_ACCOUNT_TOKEN` in its environment answered; the helper ran under `with-op`).
 - Remote Control (steering a local session from claude.ai or the phone app) is subscription-only; an API key in the session env disables it ([remote-control.md](https://code.claude.com/docs/en/remote-control.md), [#59062](https://github.com/anthropics/claude-code/issues/59062)). An API-billed session therefore needs some other remote UI if you want one.
 - In-process subagents have no auth override; their costs roll into the parent session ([sub-agents docs](https://code.claude.com/docs/en/sub-agents.md)) — which is why a session and its subagents always bill the same way.
 - `CLAUDE_CONFIG_DIR` relocates settings + credentials + sessions wholesale ([settings docs](https://code.claude.com/docs/en/settings.md)); nested `claude` spawning is unguarded (`CLAUDECODE=1` is a marker, not a block).

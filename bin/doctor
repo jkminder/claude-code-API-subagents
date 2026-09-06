@@ -12,7 +12,6 @@ while [ -L "$SRC" ]; do
 done
 BIN_DIR="$(cd "$(dirname "$SRC")" && pwd)"
 CONFIG_DIR="${CLAUDE_API_CONFIG_DIR:-$HOME/.claude-api}"
-KEYCHAIN_SERVICE="${CLAUDE_API_KEYCHAIN_SERVICE:-claude-api-worker}"
 
 fails=0; warns=0
 ok()   { echo "  ok    $1"; }
@@ -27,17 +26,36 @@ else
   fail "claude not on PATH — npm install -g @anthropic-ai/claude-code"
 fi
 
-src=""
-if [ -n "${CLAUDE_API_KEY_CMD:-}" ] && [ -n "$(eval "$CLAUDE_API_KEY_CMD" 2>/dev/null || true)" ]; then
-  src="CLAUDE_API_KEY_CMD"
-elif [ "$(uname)" = Darwin ] && security find-generic-password -s "$KEYCHAIN_SERVICE" >/dev/null 2>&1; then
-  src="macOS Keychain ($KEYCHAIN_SERVICE)"
-elif [ -f "$CONFIG_DIR/api-key" ]; then
-  src="file $CONFIG_DIR/api-key"
-  perms="$(stat -c %a "$CONFIG_DIR/api-key" 2>/dev/null || stat -f %Lp "$CONFIG_DIR/api-key" 2>/dev/null)"
-  [ "$perms" = "600" ] || warn "api-key file perms are $perms (expected 600)"
+# API key source: the apiKeyHelper in the config dir's settings.json — Claude
+# Code runs it in the worker process to fetch the key at runtime (an `op read`
+# from 1Password under with-op). No key file, no Keychain (security reset
+# 2026-09-06). Probe it once here so an op failure shows its reason; the key
+# itself is never printed.
+helper="$(python3 - "$CONFIG_DIR/settings.json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    v = json.load(open(sys.argv[1])).get("apiKeyHelper")
+except Exception:
+    v = None
+print(v.strip() if isinstance(v, str) else "")
+PY
+)"
+if [ -n "$helper" ]; then
+  ok "apiKeyHelper set in $CONFIG_DIR/settings.json (workers fetch the key at runtime through it)"
+  helper_err="$(mktemp)"
+  if key="$(eval "$helper" 2>"$helper_err")" && [ -n "$key" ]; then
+    case "$key" in
+      sk-ant-*) ok "apiKeyHelper produced a key (not shown)" ;;
+      *) warn "apiKeyHelper produced output that does not look like an Anthropic key (no sk-ant- prefix; not shown)" ;;
+    esac
+  else
+    fail "apiKeyHelper produced no key — its stderr: $(tr '\n' ' ' < "$helper_err" | cut -c1-400) — for an op read, check OP_SERVICE_ACCOUNT_TOKEN / the op bootstrap file ~/.config/op/service-account-token (with-op exits 2 or 3 with the reason)"
+  fi
+  unset key
+  rm -f "$helper_err"
+else
+  fail "no apiKeyHelper in $CONFIG_DIR/settings.json — workers fetch the key at runtime through it (an op read under with-op); never a key file"
 fi
-if [ -n "$src" ]; then ok "API key available via $src"; else fail "no API key — run claude-api-store-key"; fi
 
 if [ -d "$CONFIG_DIR" ]; then
   dperms="$(stat -c %a "$CONFIG_DIR" 2>/dev/null || stat -f %Lp "$CONFIG_DIR" 2>/dev/null)"
@@ -57,7 +75,7 @@ else
 fi
 
 if [ -f "$CONFIG_DIR/.credentials.json" ]; then
-  warn "OAuth credentials present in the worker identity ($CONFIG_DIR/.credentials.json) — if the API key ever goes missing, workers would silently bill that account. Remove: rm '$CONFIG_DIR/.credentials.json'"
+  warn "OAuth credentials present in the worker identity ($CONFIG_DIR/.credentials.json) — if the apiKeyHelper ever fails, workers could silently bill that account. Remove: rm '$CONFIG_DIR/.credentials.json'"
 else
   ok "no OAuth credentials in the worker identity"
 fi

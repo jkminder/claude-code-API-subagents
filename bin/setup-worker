@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Installer for the API-billed worker identity. Idempotent; macOS + Linux.
-# Fresh machine: git clone <repo> && <repo>/bin/setup-worker && <repo>/bin/store-key
+# Fresh machine: git clone <repo> && <repo>/bin/setup-worker, then put the apiKeyHelper
+# (the command that fetches the API key at runtime) into the config dir's settings.json —
+# the epilogue below says how. No key is ever stored in a file.
 # Remove everything it installed: setup-worker --uninstall
 set -euo pipefail
 
@@ -49,11 +51,8 @@ if [ "${1:-}" = "--uninstall" ]; then
   done
   deregister_hook "$HOME/.claude/settings.json"
   deregister_hook "$CONFIG_DIR/settings.json"
-  echo "Left in place (contain data/credentials — remove manually if wanted):"
+  echo "Left in place (settings, sessions, run records — remove manually if wanted):"
   echo "  $CONFIG_DIR   → rm -rf '$CONFIG_DIR'"
-  if [ "$(uname)" = Darwin ]; then
-    echo "  Keychain entry → security delete-generic-password -s claude-api-worker"
-  fi
   exit 0
 fi
 
@@ -190,6 +189,8 @@ safe_link() {
 }
 mkdir -p "$HOME/.local/bin" "$HOME/.claude/skills"
 safe_link "$REPO_DIR/bin/claude-api" "$HOME/.local/bin/claude-api"
+# store-key is a retired tombstone (exit 2, prints the rule); the link stays so
+# `claude-api-store-key` fails loudly there instead of with "command not found".
 safe_link "$REPO_DIR/bin/store-key" "$HOME/.local/bin/claude-api-store-key"
 echo "linked claude-api into ~/.local/bin (ensure it's on PATH)"
 safe_link "$REPO_DIR/skills/delegate" "$HOME/.claude/skills/delegate"
@@ -275,13 +276,33 @@ else
   echo "WARNING: python3 not found — skipped permission-mode hook registration. claude-api will REFUSE to spawn from a Claude Code session until it is registered." >&2
 fi
 
-if [ "$(uname)" = Darwin ] && command -v security >/dev/null 2>&1; then
-  have_key() { security find-generic-password -s "${CLAUDE_API_KEYCHAIN_SERVICE:-claude-api-worker}" >/dev/null 2>&1; }
+# API key source. The worker identity authenticates through the apiKeyHelper in
+# its settings.json — a command Claude Code runs at runtime to fetch the key (an
+# `op read` from 1Password under with-op). Nothing here stores a key: no key
+# file, no Keychain (Fellows security reset 2026-09-06). This only checks and
+# points; writing the helper is a deliberate per-machine step. CLAUDE_API_KEY_CMD
+# in the environment is not a source — a worker process reads only settings.json.
+api_key_helper() { # config dir → prints its settings.json apiKeyHelper, empty when absent
+  python3 - "$1/settings.json" <<'PY'
+import json, sys
+try:
+    v = json.load(open(sys.argv[1])).get("apiKeyHelper")
+except Exception:
+    v = None
+print(v.strip() if isinstance(v, str) else "")
+PY
+}
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "WARNING: python3 not found — cannot check for an apiKeyHelper in $CONFIG_DIR/settings.json (claude-api itself requires python3)." >&2
+elif [ -n "$(api_key_helper "$CONFIG_DIR")" ]; then
+  echo "API key source OK: apiKeyHelper in $CONFIG_DIR/settings.json. Verify with:  claude-api doctor   (runs it once, never prints the key; --ping adds one live run)"
 else
-  have_key() { [ -f "$CONFIG_DIR/api-key" ]; }
-fi
-if have_key; then
-  echo "API key present. Verify with:  claude-api -p 'Reply with exactly: WORKER OK' --model sonnet"
-else
-  echo "NEXT (manual): run  $REPO_DIR/bin/store-key  to store the API key."
+  echo "NEXT (manual): put an apiKeyHelper into $CONFIG_DIR/settings.json — a command that prints the API key,"
+  echo "  fetched from 1Password at runtime under with-op (never a key file):"
+  echo "    \"apiKeyHelper\": \"$HOME/.local/bin/with-op op read 'op://<vault>/<item>/credential'\""
+  if [ -n "${CLAUDE_API_KEY_CMD:-}" ]; then
+    echo "  CLAUDE_API_KEY_CMD is set in this environment, but a worker never reads it — use that same command:"
+    echo "    $CLAUDE_API_KEY_CMD"
+  fi
+  echo "  Then verify with:  claude-api doctor"
 fi
