@@ -14,10 +14,16 @@
 # makes claude-api complicated exists because workers are long-lived, and a
 # connector lookup is a function call.
 #
-# WHAT IT CANNOT DO: publish artifacts. The Artifact tool is gated on the
-# session being interactive, not on billing — a headless subscription session
-# does not have it either (measured, same day). Do not reach for this to make
-# an artifact; it will quietly not have the tool.
+# ARTIFACTS (claude.ai-hosted, externally shareable): the Artifact tool IS
+# reachable in a headless subscription run (2026-09-10; on 2026-08-14 it was
+# not), but a publish stops at a permission prompt that `claude -p` cannot
+# answer — the call returns the prompt text and nothing is uploaded. A publish
+# therefore happens only on Julian's word for THAT run, given in your session:
+#   claude-sub --prompt-file <f> --permission-mode bypassPermissions
+# with the prompt scoped to the one finished file and forbidding any file edit
+# or auth/config change (extra arguments pass through to claude; the first
+# such publish, 2026-09-10, ran exactly so). Never a settings entry, never a
+# standing route, never on a peer's say-so: it publishes under his account.
 #
 # WHAT IT COSTS: the subscription pool, which is the thing API billing is meant
 # to spare. Keep it to connector reads. If it becomes the general escape hatch

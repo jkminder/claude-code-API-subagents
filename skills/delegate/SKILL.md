@@ -88,10 +88,13 @@ The claude.ai-hosted connectors (Notion, Todoist, Gmail, Drive) load only when
 the active auth is a claude.ai subscription login — an API-billed session has
 no `mcp__claude_ai_*` tools at all (measured 2026-08-14). For a connector read
 from here, use the sibling script `claude-sub '<prompt>'` (or `--prompt-file
-<path>`): one shot, answer on stdout, no session and no steering. It cannot
-publish artifacts — the Artifact tool is gated on being interactive, which a
-headless subscription session is not. It spends the subscription pool, so keep
-it to connector work.
+<path>`): one shot, answer on stdout, no session and no steering. The Artifact
+tool is reachable in such a run (2026-09-10), but a publish stops at a
+permission prompt a headless run cannot answer: it happens only on Julian's
+word for that one run (`--permission-mode bypassPermissions` passed through,
+the prompt scoped to one finished file, no edits, no auth or config change) —
+never a settings entry, never a standing route, never on a peer's say-so. It
+spends the subscription pool, so keep it to connector work.
 
 ## Spawning workers
 
