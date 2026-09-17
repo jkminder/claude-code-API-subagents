@@ -65,11 +65,12 @@ mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/run"
 chmod 700 "$CONFIG_DIR" "$CONFIG_DIR/run" 2>/dev/null || true
 
 # Worker settings: MERGE managed keys, preserve user customizations, atomic write.
-# The `hooks` key is managed: mirrored verbatim from ~/.claude/settings.json on
-# every run so workers run the user's hooks too — including the permission-mode
+# The `hooks` key is managed: the user's hooks from ~/.claude/settings.json are
+# mirrored on every run so workers run them too — including the permission-mode
 # hook, which any session reading this config dir needs (see the registration
-# step below). Worker-specific hooks belong in the target repo's
-# .claude/settings.json or a per-spawn --settings.
+# step below) — and hook groups only the worker file carries (gates a fleet adds
+# to its API identity alone) are kept, see the merge below. Per-repo hooks
+# belong in the target repo's .claude/settings.json or a per-spawn --settings.
 if command -v python3 >/dev/null 2>&1; then
   python3 - "$CONFIG_DIR/settings.json" "$HOME/.claude/settings.json" <<'PY'
 import json, os, sys, tempfile
@@ -116,13 +117,54 @@ if isinstance(user_hooks, dict):
         kept = [g for g in groups if isinstance(g, dict) and g.get("hooks")]
         if kept:
             mirrored[event] = kept
-    if cfg.get("hooks", {}) != mirrored:
-        if mirrored:
-            cfg["hooks"] = mirrored
+    # Worker-only hook groups survive the mirror (2026-09-17): a fleet's API
+    # identity carries gates its subscription file does not (a job-submission
+    # gate, a merge-protocol guard, a SessionStart pin), and the old verbatim
+    # mirror dropped them on every rerun. A group is worker-only when it is
+    # not in the user file now AND was not put there by an earlier mirror
+    # (recorded in <config dir>/run/mirrored-hooks.json), so a hook the user
+    # removed from ~/.claude/settings.json leaves the worker file too, while
+    # a gate added to the worker file by hand stays. Without a record (the
+    # first run after this change) every worker-only group is kept and named.
+    record_path = os.path.join(os.path.dirname(path), "run", "mirrored-hooks.json")
+    try:
+        with open(record_path) as f:
+            previously = json.load(f)
+        if not isinstance(previously, dict):
+            previously = {}
+    except Exception:
+        previously = {}
+    existing = cfg.get("hooks") if isinstance(cfg.get("hooks"), dict) else {}
+    merged, worker_only = {}, []
+    for event in list(mirrored) + [e for e in existing if e not in mirrored]:
+        groups = list(mirrored.get(event, []))
+        old = existing.get(event) if isinstance(existing.get(event), list) else []
+        for g in old:
+            if isinstance(g, dict) and g.get("hooks") and g not in groups and g not in previously.get(event, []):
+                groups.append(g)
+                worker_only.append((event, g))
+        if groups:
+            merged[event] = groups
+    if existing != merged:
+        if merged:
+            cfg["hooks"] = merged
         else:
             cfg.pop("hooks", None)
         changed = True
         print("user hooks mirrored into worker settings")
+    if worker_only:
+        names = ["%s: %s" % (event, str(h.get("command", "?"))[:80])
+                 for event, g in worker_only for h in g.get("hooks", []) if isinstance(h, dict)]
+        print("worker-only hook group(s) kept (not in %s): %s" % (user_path, "; ".join(names)))
+    try:
+        os.makedirs(os.path.dirname(record_path), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(record_path))
+        with os.fdopen(fd, "w") as f:
+            json.dump(mirrored, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, record_path)
+    except OSError as e:
+        print("WARNING: could not record the mirrored hooks in %s: %s" % (record_path, e))
 if changed:
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
     with os.fdopen(fd, "w") as f:
