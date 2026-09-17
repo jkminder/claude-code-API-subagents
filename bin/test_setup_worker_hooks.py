@@ -104,8 +104,12 @@ def test_a_hook_the_user_removed_leaves_the_worker_file_too():
 
 def test_without_a_record_every_worker_only_group_is_kept():
     """The first run after this change on an install whose worker file already
-    carries mirrored groups: nothing is dropped (a stale mirrored group survives
-    once and is named), because no record says which groups the mirror wrote."""
+    carries mirrored groups: nothing is dropped, because no record says which
+    groups the mirror wrote. A group the mirror wrote BEFORE the record existed
+    cannot be told from a hand-added gate, so it is kept and named on every run
+    (the record only ever holds the user file's current groups) until someone
+    removes it from the worker file by hand — the safe side (reviewer row 6 on
+    6259947: the wording said it survives once)."""
     os.remove(RECORD)
     stale = group("$HOME/.local/bin/removed-long-ago")
     cfg = read(WORKER)
