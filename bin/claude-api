@@ -616,7 +616,15 @@ if [ "$meta" -eq 0 ]; then
       if [ -z "$OAUTH_TOKEN_REF" ]; then
         echo "claude-api: AUTH_MODE=enterprise but OAUTH_TOKEN_REF is unset — add OAUTH_TOKEN_REF=op://<vault>/<item>/credential to ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf} (the 1Password item holding the \`claude setup-token\` token)." >&2
         exit 1
-      fi ;;
+      fi
+      # The value must be a 1Password reference. A token pasted in its place
+      # would reach stderr through the op-read failure line below, so the
+      # refusal never prints it.
+      case "$OAUTH_TOKEN_REF" in
+        op://*) ;;
+        *) echo "claude-api: OAUTH_TOKEN_REF is not an op:// reference (value not shown). Set OAUTH_TOKEN_REF=op://<vault>/<item>/credential in ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf}." >&2
+           exit 1 ;;
+      esac ;;
     *) echo "claude-api: AUTH_MODE='$AUTH_MODE' is neither api nor enterprise — fix ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf}" >&2; exit 1 ;;
   esac
   if [ "$AUTH_MODE" = api ] && [ -z "$(api_key_helper "$CONFIG_DIR")" ]; then

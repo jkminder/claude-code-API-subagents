@@ -6,8 +6,10 @@ CLAUDE_CODE_OAUTH_TOKEN for the worker and empties apiKeyHelper through the
 injected --settings (merged into the model pin; alone beside a caller's
 --model; a caller's own --settings is warned, not merged). The injected model
 is fleet.conf's MODEL_DEFAULT (Julian's D165 = A, 2026-10-02), claude-fable-5
-without one, and a value that is not a model id refuses. Hermetic: throwaway
-HOME and config dir, a fake claude on PATH, no key, no network.
+without one, and a value that is not a model id refuses. An OAUTH_TOKEN_REF that
+is not an op:// reference (a pasted token) refuses in claude-api and is a FAIL
+row in doctor, before op runs and without showing the value. Hermetic:
+throwaway HOME and config dir, a fake claude on PATH, no key, no network.
 Run: python3 bin/test_claude_api_auth.py
 """
 import atexit
@@ -117,6 +119,75 @@ assert r.returncode == 1 and "cannot read the Enterprise token" in r.stderr and 
 
 r, calls = case("unknown AUTH_MODE refuses", helper=True, conf_lines=["AUTH_MODE=bogus"])
 assert r.returncode == 1 and "neither api nor enterprise" in r.stderr, r.stderr
+
+# --- a token pasted where the 1Password reference belongs: refused, never printed ---
+# With op working and failing, so neither the spawn nor the op-read failure line
+# can carry the value.
+FAKE_TOKEN = "sk-ant-oat01-FAKEFAKEFAKE"   # token-shaped, not a real token
+for op_fail in ("", "1"):
+    r, calls = case("enterprise refuses a non-op:// OAUTH_TOKEN_REF without printing it (op %s)"
+                    % ("failing" if op_fail else "working"), helper=True,
+                    conf_lines=["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + FAKE_TOKEN],
+                    env_extra={"FAKE_OP_FAIL": op_fail} if op_fail else None)
+    out = r.stdout + r.stderr
+    assert r.returncode == 1 and "OAUTH_TOKEN_REF is not an op:// reference (value not shown)" in r.stderr, out
+    assert os.path.join(TMP, "fleet%d.conf" % n) in r.stderr, out            # the refusal names this case's fleet.conf
+    assert FAKE_TOKEN not in out and "FAKEFAKE" not in out, out
+    assert "CLAUDE_FAKE" not in r.stdout and calls == [], (out, calls)   # no spawn, op never ran
+# The other source: claude-api clears OAUTH_TOKEN_REF near the top (the line
+# OAUTH_TOKEN_REF=""), so its fleet_key never sees a same-named environment
+# variable and fleet.conf's reference is the one used. A token in that variable
+# therefore never reaches op or a message.
+for op_fail in ("", "1"):
+    extra = {"OAUTH_TOKEN_REF": FAKE_TOKEN}
+    if op_fail:
+        extra["FAKE_OP_FAIL"] = op_fail
+    r, calls = case("a token in the OAUTH_TOKEN_REF environment variable is never read or printed (op %s)"
+                    % ("failing" if op_fail else "working"), helper=True,
+                    conf_lines=["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF], env_extra=extra)
+    out = r.stdout + r.stderr
+    assert r.returncode == (1 if op_fail else 0) and calls == ["op read " + TOKEN_REF], (out, calls)
+    assert FAKE_TOKEN not in out and "FAKEFAKE" not in out, out
+
+
+def doctor(label, conf_lines, env_extra=None):
+    """bin/doctor in a throwaway HOME (no --ping: nothing live), the fake with-op
+    and the fake claude on PATH. Its rc is not asserted: the throwaway HOME lacks
+    the skill install, which fails doctor on its own."""
+    global n
+    n += 1
+    home = os.path.join(TMP, "dochome%d" % n)
+    os.makedirs(os.path.join(home, ".claude-api"))
+    conf = os.path.join(TMP, "docfleet%d.conf" % n)
+    with open(conf, "w") as f:
+        f.write("".join(l + "\n" for l in conf_lines))
+    if os.path.exists(REC):
+        os.remove(REC)
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("CLAUDE_CODE_", "CLAUDE_API_", "ANTHROPIC_", "AUTH_MODE", "OAUTH_TOKEN_REF",
+                                "MODEL_DEFAULT"))}
+    env.update({"HOME": home, "FLEET_CONF": conf, "CLAUDE_API_WITH_OP": OP,
+                "PATH": FAKE_BIN + os.pathsep + env.get("PATH", "")})
+    env.update(env_extra or {})
+    r = subprocess.run(["bash", os.path.join(HERE, "doctor")], capture_output=True, text=True, env=env,
+                       timeout=60, cwd=TMP)
+    calls = open(REC).read().splitlines() if os.path.exists(REC) else []
+    print("ok  doctor: %s" % label)
+    return r, calls
+
+
+r, calls = doctor("enterprise with an op:// ref reads the token once, never shows it",
+                  ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF])
+assert "  ok    the Enterprise token reads from 1Password (not shown; 11 chars)" in r.stdout, r.stdout + r.stderr
+assert calls == ["op read " + TOKEN_REF] and "tok-abc-123" not in r.stdout + r.stderr, (calls, r.stdout)
+for where, conf_ref, env_ref in (("fleet.conf", FAKE_TOKEN, None), ("the environment", TOKEN_REF, FAKE_TOKEN)):
+    r, calls = doctor("a non-op:// OAUTH_TOKEN_REF from %s is a FAIL row that never shows the value" % where,
+                      ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + conf_ref],
+                      {"OAUTH_TOKEN_REF": env_ref} if env_ref else None)
+    out = r.stdout + r.stderr
+    assert "  FAIL  OAUTH_TOKEN_REF is not an op:// reference (value not shown)" in r.stdout, out
+    assert FAKE_TOKEN not in out and "FAKEFAKE" not in out, out
+    assert calls == [], calls                                               # op never ran
 
 # --- the worker model: fleet.conf's MODEL_DEFAULT (D165 = A) ---
 r, calls = case("the worker runs fleet.conf's MODEL_DEFAULT", helper=True, conf_lines=[],

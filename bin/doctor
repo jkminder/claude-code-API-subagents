@@ -72,7 +72,10 @@ PY
 AUTH_MODE="$(fleet_key AUTH_MODE api)"
 if [ "$AUTH_MODE" = enterprise ]; then
   ref="$(fleet_key OAUTH_TOKEN_REF "")"
-  if [ -n "$ref" ]; then
+  if [ -n "$ref" ] && [ "${ref#op://}" = "$ref" ]; then
+    # a token pasted in place of the reference: never shown, never sent to op
+    fail "OAUTH_TOKEN_REF is not an op:// reference (value not shown): set OAUTH_TOKEN_REF=op://<vault>/<item>/credential in fleet.conf (a variable of that name in the environment wins over the file)"
+  elif [ -n "$ref" ]; then
     ok "AUTH_MODE=enterprise: OAUTH_TOKEN_REF set in fleet.conf"
     WITH_OP="${CLAUDE_API_WITH_OP:-$(command -v with-op 2>/dev/null || echo "$HOME/.local/bin/with-op")}"
     tok_err="$(mktemp)"
