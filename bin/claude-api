@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Worker wrapper: runs `claude` as the API-billed worker identity — a config
+# Worker wrapper: runs `claude` as the fleet's worker identity (API key or
+# Claude Enterprise token, per fleet.conf AUTH_MODE) — a config
 # dir (CLAUDE_CONFIG_DIR=$CLAUDE_API_CONFIG_DIR, default ~/.claude-api) fully
 # isolated from any subscription login in the parent environment.
 #

@@ -1,22 +1,25 @@
 ---
 name: delegate
-description: How to parallelize work. Built-in Claude Code subagents (the Agent tool) are the default in every session, including main and handler sessions. `claude-api` workers are optional — for standing workers, cross-repo isolation, and work that must outlive this session. Everything is API-billed and runs on Fable. Trigger on "delegate", "worker", "swarm", "spawn workers", "parallelize this", "run this in the background".
+description: How to parallelize work. Built-in Claude Code subagents (the Agent tool) are the default in every session, including main and handler sessions. `claude-api` workers are optional — for standing workers, cross-repo isolation, and work that must outlive this session. Fleet sessions and workers are billed to one flat pool and run the fleet default model (fleet.conf `MODEL_DEFAULT`). Trigger on "delegate", "worker", "swarm", "spawn workers", "parallelize this", "run this in the background".
 ---
 
 # Delegating work
 
-The whole fleet is API-billed (decided 2026-08-15). Sessions are Happy-wrapped
-`claude` processes with `CLAUDE_CONFIG_DIR=~/.claude-api`, so this session, its
-subagents, and any `claude-api` worker all bill the same flat API pool. Tokens
-are effectively free — parallelize whenever subtasks are independent. Latency
-and coordination are the only real costs.
+The whole fleet is billed to one flat pool, not to Julian's subscription
+(decided 2026-08-15). Sessions are Happy-wrapped `claude` processes with
+`CLAUDE_CONFIG_DIR=~/.claude-api`, so a fleet session, its subagents, and any
+`claude-api` worker all bill that pool: the API key, or the Claude Enterprise
+seat when fleet.conf (`~/.config/fleet/fleet.conf`) sets `AUTH_MODE=enterprise`
+(Julian's fleet since 2026-10-02). Tokens are effectively free — parallelize
+whenever subtasks are independent. Latency and coordination are the only real
+costs.
 
 ## Default: built-in subagents
 
 **Use the Agent tool.** That holds in every session, main and handler sessions
 included. The old rule "normal subagents must never be used in a main session"
-is dead: it existed to protect Julian's Max subscription, and nothing bills the
-subscription any more.
+is dead: it existed to protect Julian's Max subscription, and no fleet session
+bills the subscription any more.
 
 - Send independent subagents in a single message so they run concurrently.
 - Every agent type is allowed: general-purpose, Explore, fork,
@@ -45,16 +48,21 @@ A worker is a separate `claude -p` process. Spawn one only for:
 For anything else, use a subagent.
 
 `claude-api` is on PATH (installed by this repo's `bin/setup-worker`). It runs
-`claude` with `CLAUDE_CONFIG_DIR=~/.claude-api`; the worker fetches its API key
-at runtime through the `apiKeyHelper` in `~/.claude-api/settings.json` — an
-`op read` from 1Password under `with-op`. No key is stored in a file, exported
-into a shell, or put on a command line, and you never do any of that either. If
-`claude-api` reports **no API key source**, the helper is missing from
+`claude` with `CLAUDE_CONFIG_DIR=~/.claude-api`, and auth follows fleet.conf
+`AUTH_MODE`. With `api` (the default) the worker fetches its API key at runtime
+through the `apiKeyHelper` in `~/.claude-api/settings.json` — an `op read` from
+1Password under `with-op`. With `enterprise`, `claude-api` reads the Claude
+Enterprise token from 1Password at spawn into the worker's
+`CLAUDE_CODE_OAUTH_TOKEN` (never a file or a command line) and switches the
+helper off for that worker. No key is stored in a file, exported into a shell,
+or put on a command line, and you never do any of that either. If `claude-api`
+reports **no API key source**, the helper is missing from
 `~/.claude-api/settings.json` — the message shows the line to add; tell the
 user. If a worker fails to authenticate, run `claude-api doctor`: it runs the
-helper once and shows `op`'s error (a missing or expired
-`OP_SERVICE_ACCOUNT_TOKEN` / `~/.config/op/service-account-token` is the usual
-cause). Report that to the user; never paste a key anywhere.
+helper once (in enterprise mode it reads the token once instead) and shows
+`op`'s error (a missing or expired `OP_SERVICE_ACCOUNT_TOKEN` /
+`~/.config/op/service-account-token` is the usual cause). Report that to the
+user; never paste a key anywhere.
 
 **Portability:** this skill plus the repo README are the complete operating
 manual — assume no other local state or prior conversation. If `claude-api` is
@@ -64,23 +72,24 @@ missing, parse worker JSON with `python3 -c 'import
 json,sys;d=json.load(open(sys.argv[1]));print(d["result"],d["session_id"])'
 <file>`.
 
-## Model: Fable everywhere
+## Model: the fleet default everywhere
 
-- `~/.claude-api/settings.json` pins `claude-fable-5`, and every session and
-  worker inherits it. **Do not weaken it** — no `--model` on `claude-api`, no
-  `model` override on a subagent. Opus and Sonnet are steps *down* from Fable,
-  so `--model opus` on a hard job reads like an upgrade and gets you a weaker
-  agent on the task that least deserves one.
+- Fleet sessions and workers run fleet.conf's `MODEL_DEFAULT`
+  (`claude-opus-5-5` on Julian's fleet since 2026-10-02). Happy-wrapped
+  sessions get it as `--model`; `claude-api` pins it in each worker's
+  `--settings`, or the built-in `claude-fable-5` where no fleet.conf names one.
+  **Do not weaken it** — no `--model` on `claude-api`, no `model` override on
+  a subagent.
 - The pin is a convention, not a block (Julian, 2026-08-11): `claude-api` still
   honours an explicit `--model`, and a caller-supplied `--settings` suppresses
   the pin. The rule above is the only thing stopping you.
 - **One exception:** a subagent whose only job is creating or publishing a
   Notion page may run on Opus (`model: "opus"`). The page text is written by
-  the calling Fable session and handed over verbatim for the Opus agent to
+  the calling session and handed over verbatim for the Opus agent to
   paste. Opus never writes or rewrites prose.
 - **The other exception:** `claude-code-guide` runs on sonnet
-  (`model: "sonnet"`, or `"haiku"` for a simple lookup) per CLAUDE.md — a
-  docs lookup does not need Fable.
+  (`model: "sonnet"`) per CLAUDE.md — a docs lookup does not need the fleet
+  default model.
 
 ## Connector work needs subscription auth
 
@@ -145,7 +154,7 @@ With nothing sent it behaves one-shot — one turn, then it closes and reports.
 
 - Exit 0 → stdout is the answer, never empty (a stderr footer gives cost, turn count, the resume handle, and the `.ndjson` path). Exit 1 → a `FAILED` line with the failure subtype, cost, a `cause:` line when the cause is known (budget cap, turn limit, worker parked itself), any partial result, and the worker's stderr tail; respin or resume. Exit 2 → refused before spawning (bad usage, `$HOME` cwd, or a dirty tree — see above). Extra flags pass through after the prompt: `claude-api run <slug> "<task>" --allowedTools "Bash(git push *)"` (not `--model` — see *Model* above).
 - `--stay` keeps the worker alive between turns — it idles waiting for the next `send` until `claude-api end <slug>` or death. Use it for monitors, babysitters, and any standing worker. Without `--stay` the run closes once every message it received has been answered.
-- No default spend cap (the key bills a flat pool). For a run you want bounded — e.g. an experimental loop that could spin — pass `--max-budget-usd <n>` yourself, or set `CLAUDE_API_MAX_BUDGET_USD` to give every headless run a default ceiling.
+- No default spend cap (the fleet's pool is flat). For a run you want bounded — e.g. an experimental loop that could spin — pass `--max-budget-usd <n>` yourself, or set `CLAUDE_API_MAX_BUDGET_USD` to give every headless run a default ceiling.
 - Pick a slug unique **within this session** (the dir is per-session, so no cross-session collisions; `run` warns before overwriting a reused slug, and refuses a slug whose worker is still alive). The worker also registers as a native agent named `<slug>` (visible in `ListAgents`; see *Native messaging*) — pass your own `-n <name>` to override.
 - Prompt must be self-contained: goal, constraints, a verification step ("run the tests and include the output"), and what to report.
 - **Commit policy:** tell workers to leave changes uncommitted (or commit only on their own worktree branch, below) — integration and committing is this session's job. Nothing else stops parallel workers from committing over each other.
@@ -392,9 +401,8 @@ cd <target-repo> && claude-api --resume <session_id> -p "<follow-up>" --output-f
 
 Agent teams are enabled in the `~/.claude-api` settings, so this session and
 any worker can lead one. Teammates are separate processes spawned by the lead
-and inherit its environment, so the whole team bills the same API pool. Within
-the team, lead↔teammate communication is native (shared task list + mailbox).
-Size the team to the work.
+and inherit its environment. Within the team, lead↔teammate communication is
+native (shared task list + mailbox). Size the team to the work.
 
 Lead a team here for ordinary parallel work. Spawn a worker to lead one when
 the swarm needs its own repo or must outlive this session:
@@ -422,4 +430,4 @@ about the whole machine. `kill <pid>` is always literal.
 - `claude-api kill <pid>|--all [--global]` — stop runaway workers immediately (Linux: reaps their supervisors too; macOS: run `clean --all` after); `claude-api end <slug>` is the graceful version.
 - `claude-api send <slug> "<msg>" [--wait [secs]]` / `claude-api reply <slug>` / `claude-api end <slug>` — steer, read, and finish running workers (steering section); `questions [--wait]` / `answer <qid> "<text>"` — the question relay (above).
 - `claude-api clean [--all] [--global]` — sweep dead keepers, stale artifacts, and old questions in the session's worker dir (`--all` also kills live keepers, ending their workers).
-- `claude-api doctor [--ping]` — when spawning misbehaves: checks the `apiKeyHelper` (runs it once, never prints the key), config, the permission-mode hook, symlinks (`--ping` does one live run). `claude-api selftest` — after Claude Code upgrades: re-validates the behaviors this skill depends on (spends a few sonnet runs).
+- `claude-api doctor [--ping]` — when spawning misbehaves: checks the auth source (api mode: runs the `apiKeyHelper` once; enterprise mode: reads the token once; never prints either), config, the permission-mode hook, symlinks (`--ping` does one live run). `claude-api selftest` — after Claude Code upgrades: re-validates the behaviors this skill depends on (spends a few sonnet runs).
