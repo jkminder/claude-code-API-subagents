@@ -4,12 +4,16 @@ the apiKeyHelper requirement and spawns with no token; enterprise reads the
 Enterprise OAuth token from 1Password (a fake with-op here) into
 CLAUDE_CODE_OAUTH_TOKEN for the worker and empties apiKeyHelper through the
 injected --settings (merged into the model pin; alone beside a caller's
---model; a caller's own --settings is warned, not merged). The injected model
-is fleet.conf's MODEL_DEFAULT (Julian's D165 = A, 2026-10-02), claude-fable-5
-without one, and a value that is not a model id refuses. An OAUTH_TOKEN_REF that
-is not an op:// reference (a pasted token) refuses in claude-api and is a FAIL
-row in doctor, before op runs and without showing the value. Hermetic:
-throwaway HOME and config dir, a fake claude on PATH, no key, no network.
+--model; a caller's own --settings is warned, not merged). Any other AUTH_MODE
+refuses without showing the value. The injected model is fleet.conf's
+MODEL_DEFAULT (Julian's D165 = A, 2026-10-02), claude-fable-5 without one; only
+the fleet's canonical id (claude-<fable|mythos|opus>-<n>[-<n>...]) passes, and
+any other value, a pasted token included, refuses before claude starts and
+without showing the value; a caller's --model or --settings still bypasses the
+pin. An OAUTH_TOKEN_REF that is not an op:// reference (a pasted token) refuses
+in claude-api and is a FAIL row in doctor, before op runs and without showing
+the value. Hermetic: throwaway HOME and config dir, a fake claude on PATH, no
+key, no network.
 Run: python3 bin/test_claude_api_auth.py
 """
 import atexit
@@ -23,12 +27,16 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLAUDE_API = os.path.join(HERE, "claude-api")
 TOKEN_REF = "op://Fellow - Julian Minder/Claude Enterprise Token/credential"
+FAKE_TOKEN = "sk-ant-oat01-FAKEFAKEFAKE"   # token-shaped, not a real token
 TMP = tempfile.mkdtemp(prefix="claude-api-auth-test-")
 atexit.register(shutil.rmtree, TMP, ignore_errors=True)
 FAKE_BIN = os.path.join(TMP, "fakebin")
 os.makedirs(FAKE_BIN)
+CLAUDE_REC = os.path.join(TMP, "claude-calls.log")   # the fake claude's argv, one CALL block per start
 with open(os.path.join(FAKE_BIN, "claude"), "w") as f:
-    f.write('#!/usr/bin/env bash\necho "CLAUDE_FAKE oauth_set=${CLAUDE_CODE_OAUTH_TOKEN:+1} len=${#CLAUDE_CODE_OAUTH_TOKEN}"\n'
+    f.write('#!/usr/bin/env bash\n'
+            '{ echo CALL; for a in "$@"; do printf \'ARG %s\\n\' "$a"; done; } >> ' + repr(CLAUDE_REC) + '\n'
+            'echo "CLAUDE_FAKE oauth_set=${CLAUDE_CODE_OAUTH_TOKEN:+1} len=${#CLAUDE_CODE_OAUTH_TOKEN}"\n'
             'for a in "$@"; do printf \'ARG %s\\n\' "$a"; done\n')
 os.chmod(os.path.join(FAKE_BIN, "claude"), 0o755)
 REC = os.path.join(TMP, "op-calls.log")
@@ -55,8 +63,9 @@ def case(label, *, helper, conf_lines, args=("-p", "say hi"), env_extra=None,
     conf = os.path.join(TMP, "fleet%d.conf" % n)
     with open(conf, "w") as f:
         f.write("".join(l + "\n" for l in ([model_line] if model_line else []) + list(conf_lines)))
-    if os.path.exists(REC):
-        os.remove(REC)
+    for rec in (REC, CLAUDE_REC):
+        if os.path.exists(rec):
+            os.remove(rec)
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("CLAUDE_CODE_", "CLAUDE_API_", "ANTHROPIC_", "AUTH_MODE", "OAUTH_TOKEN_REF",
                                 "MODEL_DEFAULT"))}
@@ -77,6 +86,28 @@ def settings_arg(r):
         if a == "--settings":
             return args[i + 1]
     return None
+
+
+def claude_record():
+    """The fake claude's argv since the last case(); "" when it never started."""
+    return open(CLAUDE_REC).read() if os.path.exists(CLAUDE_REC) else ""
+
+
+def refused_unshown(r, calls, value, message):
+    """The last case() refused with exit 1 and `message` (a format naming that
+    case's fleet.conf), the value shows nowhere: not in stdout or stderr, not in
+    any file under the case's HOME (the run ledger lives there), not on a
+    command line (the fake claude never started), and op never ran."""
+    conf = os.path.join(TMP, "fleet%d.conf" % n)
+    out = r.stdout + r.stderr
+    assert r.returncode == 1 and message % conf in r.stderr, out
+    shown = out.replace(conf, "<conf>")   # the path is random text a short value could match
+    assert value not in shown and "FAKEFAKE" not in shown, out
+    for d, _, files in os.walk(os.path.join(TMP, "home%d" % n)):
+        for name in files:
+            with open(os.path.join(d, name), errors="replace") as f:
+                assert value not in f.read(), os.path.join(d, name)
+    assert claude_record() == "" and calls == [], (claude_record(), calls)
 
 
 r, calls = case("api mode is the default: no token, no overlay, no op call", helper=True, conf_lines=[])
@@ -117,13 +148,19 @@ r, calls = case("enterprise refuses when op cannot read the token", helper=True,
                 conf_lines=["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF], env_extra={"FAKE_OP_FAIL": "1"})
 assert r.returncode == 1 and "cannot read the Enterprise token" in r.stderr and "CLAUDE_FAKE" not in r.stdout, r.stderr
 
-r, calls = case("unknown AUTH_MODE refuses", helper=True, conf_lines=["AUTH_MODE=bogus"])
-assert r.returncode == 1 and "neither api nor enterprise" in r.stderr, r.stderr
+# --- an AUTH_MODE that is neither api nor enterprise: refused, never printed ---
+AUTH_REFUSAL = "claude-api: AUTH_MODE (value not shown) is neither api nor enterprise — fix %s"
+r, calls = case("a token-shaped AUTH_MODE in fleet.conf refuses without showing it", helper=True,
+                conf_lines=["AUTH_MODE=" + FAKE_TOKEN])
+refused_unshown(r, calls, FAKE_TOKEN, AUTH_REFUSAL)
+
+r, calls = case("a token-shaped AUTH_MODE in the environment refuses without showing it", helper=True,
+                conf_lines=["AUTH_MODE=api"], env_extra={"AUTH_MODE": FAKE_TOKEN})
+refused_unshown(r, calls, FAKE_TOKEN, AUTH_REFUSAL)
 
 # --- a token pasted where the 1Password reference belongs: refused, never printed ---
 # With op working and failing, so neither the spawn nor the op-read failure line
 # can carry the value.
-FAKE_TOKEN = "sk-ant-oat01-FAKEFAKEFAKE"   # token-shaped, not a real token
 for op_fail in ("", "1"):
     r, calls = case("enterprise refuses a non-op:// OAUTH_TOKEN_REF without printing it (op %s)"
                     % ("failing" if op_fail else "working"), helper=True,
@@ -189,7 +226,7 @@ for where, conf_ref, env_ref in (("fleet.conf", FAKE_TOKEN, None), ("the environ
     assert FAKE_TOKEN not in out and "FAKEFAKE" not in out, out
     assert calls == [], calls                                               # op never ran
 
-# --- the worker model: fleet.conf's MODEL_DEFAULT (D165 = A) ---
+# --- the worker model: fleet.conf's MODEL_DEFAULT (D165 = A), a canonical id only ---
 r, calls = case("the worker runs fleet.conf's MODEL_DEFAULT", helper=True, conf_lines=[],
                 model_line="MODEL_DEFAULT=claude-opus-5-5")
 assert r.returncode == 0, r.stdout + r.stderr
@@ -204,18 +241,43 @@ r, calls = case("no MODEL_DEFAULT in fleet.conf: the built-in claude-fable-5", h
 assert r.returncode == 0 and settings_arg(r) == '{"model": "claude-fable-5"}', r.stdout + r.stderr
 
 r, calls = case("MODEL_DEFAULT from the environment wins over fleet.conf", helper=True, conf_lines=[],
-                model_line="MODEL_DEFAULT=claude-opus-5-5", env_extra={"MODEL_DEFAULT": "claude-sonnet-5"})
-assert r.returncode == 0 and settings_arg(r) == '{"model": "claude-sonnet-5"}', r.stdout + r.stderr
+                model_line="MODEL_DEFAULT=claude-opus-5-5", env_extra={"MODEL_DEFAULT": "claude-fable-5-1"})
+assert r.returncode == 0 and settings_arg(r) == '{"model": "claude-fable-5-1"}', r.stdout + r.stderr
 
-for bad in ("claude-opus-5-5 # inline comment", 'claude"x', "-opus", "claude opus"):
-    r, calls = case("a MODEL_DEFAULT that is not a model id refuses before claude runs: %r" % bad,
+# Only the fleet's canonical id passes: the rule of agent-skills'
+# skills/handlers/bin/fleet_conf.sh fleet_model_required. The last three values
+# passed the old check (any [A-Za-z0-9._-] string) onto the worker's command line.
+MODEL_REFUSAL = ("claude-api: MODEL_DEFAULT (value not shown) from the environment or %s is not a canonical "
+                 "fable/mythos/opus model id (claude-<family>-<n>[-<n>...])")
+for bad in ("claude-opus-5-5 # inline comment", 'claude"x', "-opus", "claude opus",
+            "claude-sonnet-5", "sonnet", "claude-opus-5.5"):
+    r, calls = case("a MODEL_DEFAULT that is not a canonical id refuses before claude runs: %r" % bad,
                     helper=True, conf_lines=[], model_line="MODEL_DEFAULT=" + bad)
-    assert r.returncode == 1 and "is not a model id" in r.stderr and "CLAUDE_FAKE" not in r.stdout, \
-        r.stdout + r.stderr
+    refused_unshown(r, calls, bad, MODEL_REFUSAL)
 
-r, calls = case("a caller --model wins: no injection, and a bad MODEL_DEFAULT is never read", helper=True,
-                conf_lines=[], model_line="MODEL_DEFAULT=claude opus", args=("--model", "claude-sonnet-5", "-p", "say hi"))
-assert r.returncode == 0 and settings_arg(r) is None and "ARG claude-sonnet-5" in r.stdout, r.stdout + r.stderr
+# --- a token pasted as MODEL_DEFAULT, from either source: refused before it
+# reaches the worker's command line (the --settings argument) or the run
+# ledger, never printed. The ledger keeps the first 200 characters of the
+# command line; for a -p spawn those are the injected headless briefing, so the
+# interactive spawn is the one whose ledger line would carry --settings. ---
+for where, conf_model, env_model in (("fleet.conf", FAKE_TOKEN, None),
+                                     ("the environment", "claude-fable-5-1", FAKE_TOKEN)):
+    for args in (("-p", "say hi"), ("say hi",)):
+        r, calls = case("a token-shaped MODEL_DEFAULT in %s refuses (args: %s); claude never starts"
+                        % (where, " ".join(args)), helper=True, conf_lines=[],
+                        model_line="MODEL_DEFAULT=" + conf_model,
+                        env_extra={"MODEL_DEFAULT": env_model} if env_model else None, args=args)
+        refused_unshown(r, calls, FAKE_TOKEN, MODEL_REFUSAL)
+
+# A caller's own --model or --settings still bypasses the pin: MODEL_DEFAULT is
+# never read, so a token there reaches no command line and no output.
+for flag, value in (("--model", "claude-sonnet-5"), ("--settings", '{"model": "claude-sonnet-5"}')):
+    r, calls = case("a caller %s wins: no injection, and MODEL_DEFAULT is never read" % flag, helper=True,
+                    conf_lines=[], model_line="MODEL_DEFAULT=" + FAKE_TOKEN, args=(flag, value, "-p", "say hi"))
+    out = r.stdout + r.stderr
+    assert r.returncode == 0 and "ARG " + value in r.stdout, out
+    assert settings_arg(r) == (None if flag == "--model" else value), out
+    assert FAKE_TOKEN not in out + claude_record(), (out, claude_record())
 
 r, calls = case("enterprise beside an Opus default: model and emptied helper in one --settings", helper=True,
                 conf_lines=["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF],

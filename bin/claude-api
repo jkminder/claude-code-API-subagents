@@ -625,7 +625,9 @@ if [ "$meta" -eq 0 ]; then
         *) echo "claude-api: OAUTH_TOKEN_REF is not an op:// reference (value not shown). Set OAUTH_TOKEN_REF=op://<vault>/<item>/credential in ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf}." >&2
            exit 1 ;;
       esac ;;
-    *) echo "claude-api: AUTH_MODE='$AUTH_MODE' is neither api nor enterprise — fix ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf}" >&2; exit 1 ;;
+    # never the value: a token pasted onto the AUTH_MODE line would reach stderr
+    # (and, for a run worker, its .err file)
+    *) echo "claude-api: AUTH_MODE (value not shown) is neither api nor enterprise — fix ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf} (an AUTH_MODE variable in the environment wins over the file)" >&2; exit 1 ;;
   esac
   if [ "$AUTH_MODE" = api ] && [ -z "$(api_key_helper "$CONFIG_DIR")" ]; then
     {
@@ -783,7 +785,8 @@ fi
 # claude-fable-5 when no fleet.conf names one. Headless sessions ignore the
 # `model` key in the worker settings.json (verified on Claude Code v2.1.222),
 # so the default is pinned via the --settings flagSettings scope instead. An
-# explicit --model wins; a caller-supplied --settings suppresses the injection.
+# explicit --model wins; a caller-supplied --settings suppresses the injection
+# (neither reads MODEL_DEFAULT).
 has_settings=0 has_model=0
 for a in "$@"; do
   case "$a" in
@@ -801,9 +804,12 @@ overlay=""
 [ "$AUTH_MODE" = enterprise ] && overlay=', "apiKeyHelper": ""'
 if [ "$has_settings" -eq 0 ] && [ "$has_model" -eq 0 ]; then
   worker_model="$(fleet_key MODEL_DEFAULT claude-fable-5)"
-  # the id goes into a JSON string below: a model id or alias, nothing else
-  if [[ ! "$worker_model" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-    echo "claude-api: MODEL_DEFAULT='$worker_model' (environment or ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf}) is not a model id — fix it (full-line comments only in fleet.conf), or pass --model" >&2
+  # The id goes onto the worker's command line (the --settings below) and into
+  # the run ledger, so only the fleet's canonical id passes — the rule of
+  # skills/handlers/bin/fleet_conf.sh fleet_model_required in agent-skills. A
+  # token pasted as MODEL_DEFAULT fails it, and the refusal never shows the value.
+  if [[ ! "$worker_model" =~ ^claude-(fable|mythos|opus)-[0-9]+(-[0-9]+)*$ ]]; then
+    echo "claude-api: MODEL_DEFAULT (value not shown) from the environment or ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf} is not a canonical fable/mythos/opus model id (claude-<family>-<n>[-<n>...]) — fix it (full-line comments only in fleet.conf), or pass --model" >&2
     exit 1
   fi
   set -- --settings "{\"model\": \"$worker_model\"$overlay}" "$@"
