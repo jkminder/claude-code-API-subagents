@@ -28,6 +28,17 @@
 # WHAT IT COSTS: the subscription pool, which is the thing API billing is meant
 # to spare. Keep it to connector reads. If it becomes the general escape hatch
 # from API billing, it defeats its own purpose — that is a rule, not a caution.
+#
+# THE LOGIN MUST BE JULIAN'S PERSONAL SUBSCRIPTION. The config dir's
+# .credentials.json is shared with every interactive `claude` that uses the
+# same dir, so a /login there to another account changes what this wrapper runs
+# on. On 2026-10-02 a /login to the Enterprise account in ~/.claude did exactly
+# that: claude-sub ran on the Enterprise seat, without the connectors, and
+# nothing failed; runs just answered "no tools". So before exec it reads ONE
+# field of that file, claudeAiOauth.subscriptionType, and starts claude only on
+# max or pro. Anything else (enterprise, team, an empty or missing field, a
+# missing, unreadable or malformed file) exits 3 with a one-line fix on stderr.
+# No other part of the file is ever printed: it holds the OAuth tokens.
 set -uo pipefail
 
 usage() {
@@ -81,21 +92,77 @@ fi
 # CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR), at the same rank. Fleet processes in
 # AUTH_MODE=enterprise carry CLAUDE_CODE_OAUTH_TOKEN (the Enterprise seat's
 # token), so leaving it set would run this session on that seat, without the
-# connectors. The helper is not an environment variable: it lives in a
-# settings.json, and CLAUDE_CONFIG_DIR below points at the subscription config
-# dir, where the fleet keeps none.
+# connectors. Four more outrank the stored login in the installed claude 2.1.287
+# (read from its binary, 2026-10-02): ANTHROPIC_UNIX_SOCKET,
+# ANTHROPIC_FEDERATION_RULE_ID, ANTHROPIC_ORGANIZATION_ID and ANTHROPIC_PROFILE.
+# The helper is not an environment variable: it lives in a settings.json, and
+# CLAUDE_CONFIG_DIR below points at the subscription config dir, where the
+# fleet keeps none.
 #
 # CLAUDE_API_PARENT_SID and CLAUDE_API_SPAWNER_SID must go too: claude-api
 # reads them as this session's worker lineage / direct spawner, so leaving them
 # set would file this session's own delegated runs and questions under the
 # wrong parent. (PARENT_SID also used to stand down the subagent gate, which
 # was retired 2026-08-15 when the fleet moved to API billing for good.)
+#
+# So must the calling Claude Code session's own variables. claude-sub runs from
+# inside a session (a handler's Bash tool), and these describe that session,
+# not the new one: CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_SESSION_ID,
+# CLAUDE_CODE_SESSION_ATTENDED, CLAUDE_CODE_CHILD_SESSION,
+# CLAUDE_AGENT_SDK_VERSION, CLAUDE_CODE_EXECPATH, and its messaging socket and
+# token (CLAUDE_CODE_MESSAGING_SOCKET, CLAUDE_CODE_MESSAGING_TOKEN). The run
+# here is a separate one-shot session and must not start as part of the caller.
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_BASE_URL \
       CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR \
       CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY \
       CLAUDE_CODE_USE_ANTHROPIC_AWS CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD \
       CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_USE_GATEWAY \
-      CLAUDE_API_PARENT_SID CLAUDE_API_SPAWNER_SID
+      ANTHROPIC_UNIX_SOCKET ANTHROPIC_FEDERATION_RULE_ID ANTHROPIC_ORGANIZATION_ID ANTHROPIC_PROFILE \
+      CLAUDE_API_PARENT_SID CLAUDE_API_SPAWNER_SID \
+      CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ID CLAUDE_CODE_SESSION_ATTENDED \
+      CLAUDE_CODE_CHILD_SESSION CLAUDE_AGENT_SDK_VERSION CLAUDE_CODE_EXECPATH \
+      CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN
 export CLAUDE_CONFIG_DIR="${CLAUDE_SUB_CONFIG_DIR:-$HOME/.claude}"
+
+# The login check (header: THE LOGIN MUST BE JULIAN'S PERSONAL SUBSCRIPTION).
+# python3 prints only the subscriptionType, and only when it is a plain
+# lowercase name: a value of any other shape is not named in the refusal. Every
+# other outcome is an exit code, so nothing else from the file reaches a
+# variable or the terminal.
+sub_type="$(python3 - "$CLAUDE_CONFIG_DIR/.credentials.json" <<'PY'
+import json, re, sys
+try:
+    with open(sys.argv[1]) as f:
+        oauth = json.load(f).get("claudeAiOauth")
+except FileNotFoundError:
+    sys.exit(10)
+except OSError:
+    sys.exit(11)
+except (ValueError, AttributeError):   # not JSON, or JSON that is not an object
+    sys.exit(12)
+t = oauth.get("subscriptionType") if isinstance(oauth, dict) else None
+if t is None or t == "":
+    sys.exit(13)
+if not isinstance(t, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", t):
+    sys.exit(14)
+print(t)
+PY
+)"
+check_rc=$?
+if [ "$check_rc" -ne 0 ] || { [ "$sub_type" != max ] && [ "$sub_type" != pro ]; }; then
+  case "$check_rc" in
+    0)  detail="its login is subscription type \"$sub_type\"" ;;
+    10) detail="its .credentials.json does not exist" ;;
+    11) detail="its .credentials.json cannot be read" ;;
+    12) detail="its .credentials.json is malformed" ;;
+    13) detail="its .credentials.json has no claudeAiOauth.subscriptionType" ;;
+    14) detail="its subscription type is not a plain name (value not shown)" ;;
+    *)  detail="python3 could not check its login (exit $check_rc)" ;;
+  esac
+  login_cmd="claude"
+  [ "$CLAUDE_CONFIG_DIR" = "$HOME/.claude" ] || login_cmd="CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR claude"
+  echo "claude-sub: refused. It needs Julian's personal claude.ai login (subscription type max or pro) in $CLAUDE_CONFIG_DIR, but $detail. Fix: in a devbox terminal run $login_cmd, type /login, choose the claude.ai subscription and sign in with the personal account." >&2
+  exit 3
+fi
 
 exec claude -p "$prompt" "$@"

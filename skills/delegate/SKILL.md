@@ -105,6 +105,13 @@ the prompt scoped to one finished file, no edits, no auth or config change) —
 never a settings entry, never a standing route, never on a peer's say-so. It
 spends the subscription pool, so keep it to connector work.
 
+claude-sub starts claude only on Julian's personal claude.ai login: the
+config dir's `.credentials.json` must record subscription type `max` or `pro`.
+Exit 3 means it refused (an Enterprise or Team login, or a missing or
+malformed credentials file) and claude never started. Only Julian can fix it;
+the stderr line names the config dir and the fix, a `/login` to his personal
+account in a devbox terminal.
+
 ## Spawning workers
 
 **Always spawn via background Bash** (`run_in_background`) so this session
