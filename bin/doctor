@@ -69,6 +69,29 @@ except OSError:
 print(val)
 PY
 }
+# The OAUTH_TOKEN_REF rule claude-api applies (the same two functions): op://
+# followed by exactly three non-empty segments (vault, item, field) separated by
+# "/"; a segment may hold spaces but no "/", newline, carriage return or tab;
+# 256 characters at most in all. Anything else may be a pasted token.
+oauth_ref_ok() { # <ref>
+  local re=$'^op://[^/\n\r\t]+/[^/\n\r\t]+/[^/\n\r\t]+$'
+  [ "${#1}" -le 256 ] && [[ $1 =~ $re ]]
+}
+# op echoes the reference back on stderr, and a token can still ride inside a
+# well-formed one (op://<token>/x/y): op's stderr is shown with the whole
+# reference, then each of its three segments, longest first, replaced by <ref>.
+# The reference reaches python on stdin, never on a command line.
+redact_ref() { # <ref>; stdin: op's stderr → stdout: the same text, redacted
+  { printf '%s\0' "$1"; cat; } | python3 -c '
+import sys
+ref, text = sys.stdin.buffer.read().decode("utf-8", "surrogateescape").split("\0", 1)
+segs = ref[len("op://"):].split("/")
+assert ref.startswith("op://") and len(segs) == 3 and all(segs), "redact_ref: a reference oauth_ref_ok refuses"
+for s in sorted([ref] + segs, key=len, reverse=True):
+    text = text.replace(s, "<ref>")
+sys.stdout.buffer.write(text.encode("utf-8", "surrogateescape"))
+'
+}
 AUTH_MODE="$(fleet_key AUTH_MODE api)"
 if [ "$AUTH_MODE" != api ] && [ "$AUTH_MODE" != enterprise ]; then
   # claude-api refuses every spawn on this value; never shown (a token pasted
@@ -76,8 +99,9 @@ if [ "$AUTH_MODE" != api ] && [ "$AUTH_MODE" != enterprise ]; then
   fail "AUTH_MODE (value not shown) is neither api nor enterprise, so claude-api refuses every spawn: set AUTH_MODE=api or AUTH_MODE=enterprise in fleet.conf (a variable of that name in the environment wins over the file)"
 elif [ "$AUTH_MODE" = enterprise ]; then
   ref="$(fleet_key OAUTH_TOKEN_REF "")"
-  if [ -n "$ref" ] && [ "${ref#op://}" = "$ref" ]; then
-    # a token pasted in place of the reference: never shown, never sent to op
+  if [ -n "$ref" ] && ! oauth_ref_ok "$ref"; then
+    # possibly a token pasted in place of the reference or inside it: never
+    # shown, never sent to op
     fail "OAUTH_TOKEN_REF is not an op:// reference (value not shown): set OAUTH_TOKEN_REF=op://<vault>/<item>/credential in fleet.conf (a variable of that name in the environment wins over the file)"
   elif [ -n "$ref" ]; then
     ok "AUTH_MODE=enterprise: OAUTH_TOKEN_REF set in fleet.conf"
@@ -86,7 +110,7 @@ elif [ "$AUTH_MODE" = enterprise ]; then
     if tok="$("$WITH_OP" op read "$ref" 2>"$tok_err")" && [ -n "$tok" ]; then
       ok "the Enterprise token reads from 1Password (not shown; ${#tok} chars)"
     else
-      fail "op cannot read the Enterprise token at $ref — stderr: $(tr '\n' ' ' < "$tok_err" | cut -c1-400)"
+      fail "op cannot read the Enterprise token at the reference in OAUTH_TOKEN_REF (not shown) — stderr: $(redact_ref "$ref" < "$tok_err" | tr '\n' ' ' | cut -c1-400)"
     fi
     unset tok
     rm -f "$tok_err"

@@ -10,10 +10,13 @@ MODEL_DEFAULT (Julian's D165 = A, 2026-10-02), claude-fable-5 without one; only
 the fleet's canonical id (claude-<fable|mythos|opus>-<n>[-<n>...]) passes, and
 any other value, a pasted token included, refuses before claude starts and
 without showing the value; a caller's --model or --settings still bypasses the
-pin. An OAUTH_TOKEN_REF that is not an op:// reference (a pasted token) refuses
-in claude-api and is a FAIL row in doctor, before op runs and without showing
-the value. Hermetic: throwaway HOME and config dir, a fake claude on PATH, no
-key, no network.
+pin. An OAUTH_TOKEN_REF that is not op:// plus exactly three non-empty segments
+(a pasted token, alone or inside an op:// value) refuses in claude-api and is a
+FAIL row in doctor, before op runs and without showing the value; when op
+cannot read a well-formed one, neither shows the reference, and op's stderr (a
+fake op echoes the reference back) is shown with the reference and each of its
+segments replaced by <ref>. Hermetic: throwaway HOME and config dir, a fake
+claude on PATH, no key, no network.
 Run: python3 bin/test_claude_api_auth.py
 """
 import atexit
@@ -41,8 +44,12 @@ with open(os.path.join(FAKE_BIN, "claude"), "w") as f:
 os.chmod(os.path.join(FAKE_BIN, "claude"), 0o755)
 REC = os.path.join(TMP, "op-calls.log")
 OP = os.path.join(TMP, "fake-with-op")
+# FAKE_OP_ECHO fails the way op does: the reference and its vault segment come
+# back on stderr.
 with open(OP, "w") as f:
     f.write("#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> " + repr(REC) + "\n"
+            "if [ -n \"${FAKE_OP_ECHO:-}\" ]; then v=\"${3#op://}\"\n"
+            "  printf \"[ERROR] could not read secret '%s': vault '%s' not found\\n\" \"$3\" \"${v%%/*}\" >&2; exit 1; fi\n"
             "if [ -n \"${FAKE_OP_FAIL:-}\" ]; then exit 1; fi\nprintf '%s\\n' tok-abc-123\n")
 os.chmod(OP, 0o755)
 n = 0
@@ -186,6 +193,47 @@ for op_fail in ("", "1"):
     assert r.returncode == (1 if op_fail else 0) and calls == ["op read " + TOKEN_REF], (out, calls)
     assert FAKE_TOKEN not in out and "FAKEFAKE" not in out, out
 
+# --- the shape of OAUTH_TOKEN_REF, the same rule in claude-api and doctor: op://
+# and exactly three non-empty segments (vault, item, field) separated by "/", no
+# "/", newline, carriage return or tab inside a segment, 256 characters at most.
+# A token can still ride inside a well-formed reference, and op echoes the
+# reference back on stderr (FAKE_OP_ECHO), so the op-read failure line never
+# shows the reference and shows op's stderr with the reference and each of its
+# segments replaced by <ref>. Every shape runs before the block's assert, so a
+# run on an older claude-api or doctor lists each one that leaks. ---
+REF_SHAPES = [   # (label, OAUTH_TOKEN_REF in fleet.conf, refused before op runs)
+    ("a token as the vault, op://<token>/x/y", "op://%s/x/y" % FAKE_TOKEN, False),
+    ("the good reference, a space and a token", TOKEN_REF + " " + FAKE_TOKEN, False),
+    ("the good reference itself", TOKEN_REF, False),
+    ("op://<token>, a newline, /x/y (fleet.conf keeps the first line)", "op://%s\n/x/y" % FAKE_TOKEN, True),
+    ("four segments, a token last", TOKEN_REF + "/" + FAKE_TOKEN, True),
+    ("a tab inside a segment", "op://v/i\t%s/f" % FAKE_TOKEN, True),
+    ("an empty segment", "op://%s//f" % FAKE_TOKEN, True),
+    ("257 characters", "op://v/i/" + FAKE_TOKEN + "x" * (257 - len("op://v/i/") - len(FAKE_TOKEN)), True),
+]
+REDACTED_ECHO = "[ERROR] could not read secret '<ref>': vault '<ref>' not found"
+API_REF_REFUSAL = "claude-api: OAUTH_TOKEN_REF is not an op:// reference (value not shown)"
+API_OP_FAIL = ("claude-api: op cannot read the Enterprise token at the reference in OAUTH_TOKEN_REF (not shown). "
+               "Is the 1Password item there and ~/.config/op/service-account-token in place (mode 600)? "
+               "with-op: %s; stderr: %s" % (OP, REDACTED_ECHO))
+bad = []
+for label, ref, refused in REF_SHAPES:
+    r, calls = case("claude-api, OAUTH_TOKEN_REF %s, op failing and echoing it: %s"
+                    % (label, "refused before op" if refused else "op's stderr shown redacted"), helper=True,
+                    conf_lines=["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + ref], env_extra={"FAKE_OP_ECHO": "1"})
+    out = r.stdout + r.stderr
+    want = (API_REF_REFUSAL in r.stderr and calls == []) if refused else \
+        (API_OP_FAIL in r.stderr and calls == ["op read " + ref])
+    if not (want and r.returncode == 1 and ref not in out and FAKE_TOKEN not in out and "FAKEFAKE" not in out
+            and claude_record() == ""):
+        bad.append((label, r.returncode, calls, out))
+assert not bad, bad
+
+ref256 = "op://v/i/" + "x" * (256 - len("op://v/i/"))
+r, calls = case("claude-api: a 256-character reference still reaches op and reads", helper=True,
+                conf_lines=["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + ref256])
+assert r.returncode == 0 and "oauth_set=1" in r.stdout and calls == ["op read " + ref256], (r.stdout + r.stderr, calls)
+
 
 def doctor(label, conf_lines, env_extra=None):
     """bin/doctor in a throwaway HOME (no --ping: nothing live), the fake with-op
@@ -242,6 +290,29 @@ for label, conf_lines in (("no AUTH_MODE line (api)", []), ("AUTH_MODE=api", ["A
                           ("AUTH_MODE=enterprise", ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF])):
     r, calls = doctor("%s has no AUTH_MODE FAIL row" % label, conf_lines)
     assert "AUTH_MODE (value not shown)" not in r.stdout + r.stderr, r.stdout + r.stderr
+
+# The OAUTH_TOKEN_REF shapes again, in doctor, plus a newline from the
+# environment (in doctor a variable of that name wins over fleet.conf).
+DOC_REF_FAIL = "  FAIL  OAUTH_TOKEN_REF is not an op:// reference (value not shown)"
+DOC_OP_FAIL = ("  FAIL  op cannot read the Enterprise token at the reference in OAUTH_TOKEN_REF (not shown)"
+               " — stderr: " + REDACTED_ECHO)
+bad = []
+for label, conf_ref, env_ref, refused in ([(l, ref, None, refused) for l, ref, refused in REF_SHAPES]
+                                          + [("the good reference, a newline and a token, from the environment",
+                                              TOKEN_REF, TOKEN_REF + "\n" + FAKE_TOKEN, True)]):
+    ref = env_ref or conf_ref
+    extra = {"FAKE_OP_ECHO": "1"}
+    if env_ref:
+        extra["OAUTH_TOKEN_REF"] = env_ref
+    r, calls = doctor("OAUTH_TOKEN_REF %s, op failing and echoing it: %s"
+                      % (label, "a FAIL row before op" if refused else "op's stderr shown redacted"),
+                      ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + conf_ref], extra)
+    out = r.stdout + r.stderr
+    want = (DOC_REF_FAIL in r.stdout and calls == []) if refused else \
+        (DOC_OP_FAIL in r.stdout and calls == ["op read " + ref])
+    if not (want and ref not in out and FAKE_TOKEN not in out and "FAKEFAKE" not in out):
+        bad.append((label, calls, out))
+assert not bad, bad
 
 # --- the worker model: fleet.conf's MODEL_DEFAULT (D165 = A), a canonical id only ---
 r, calls = case("the worker runs fleet.conf's MODEL_DEFAULT", helper=True, conf_lines=[],
