@@ -491,22 +491,34 @@ else
 fi
 
 echo
-step "16/19 claude-sub: strips API auth and the worker marker before exec"
-# claude-sub's one job is that boundary. The worker marker matters as much as
-# the key: claude-api reads it as "my parent session is this worker", so leaving
-# it set would file the spawned session's runs and questions under the wrong
-# parent. A stub claude records what crosses.
+step "16/19 claude-sub: strips every auth variable above the login, and the worker marker, before exec"
+# claude-sub's one job is that boundary. Every variable that outranks the
+# subscription login must go: the key, the auth token, the Enterprise OAuth
+# token fleet processes carry in AUTH_MODE=enterprise, the file-descriptor
+# channels for the key and that token, and the cloud provider switches. The worker marker matters as much as the key: claude-api reads it
+# as "my parent session is this worker", so leaving it set would file the
+# spawned session's runs and questions under the wrong parent. A stub claude
+# records what crosses (PROV lists the provider switches that are set at all).
 mkdir -p subbin
 cat > subbin/claude <<'EOF'
 #!/usr/bin/env bash
-echo "SID=[${CLAUDE_API_PARENT_SID:-unset}] SPW=[${CLAUDE_API_SPAWNER_SID:-unset}] KEY=[${ANTHROPIC_API_KEY:-unset}] TOK=[${ANTHROPIC_AUTH_TOKEN:-unset}] URL=[${ANTHROPIC_BASE_URL:-unset}] CFG=[${CLAUDE_CONFIG_DIR:-unset}]"
+prov=""
+for v in CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_ANTHROPIC_AWS \
+         CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_USE_GATEWAY; do
+  [ -n "${!v+x}" ] && prov="$prov $v"
+done
+echo "SID=[${CLAUDE_API_PARENT_SID:-unset}] SPW=[${CLAUDE_API_SPAWNER_SID:-unset}] KEY=[${ANTHROPIC_API_KEY:-unset}] TOK=[${ANTHROPIC_AUTH_TOKEN:-unset}] OAT=[${CLAUDE_CODE_OAUTH_TOKEN-unset}] KFD=[${CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR-unset}] OFD=[${CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR-unset}] URL=[${ANTHROPIC_BASE_URL:-unset}] PROV=[${prov# }] CFG=[${CLAUDE_CONFIG_DIR:-unset}]"
 EOF
 chmod +x subbin/claude
 subout=$(CLAUDE_API_PARENT_SID=fake-worker CLAUDE_API_SPAWNER_SID=fake-spawner \
-         ANTHROPIC_API_KEY=k ANTHROPIC_AUTH_TOKEN=t \
+         ANTHROPIC_API_KEY=k ANTHROPIC_AUTH_TOKEN=t CLAUDE_CODE_OAUTH_TOKEN=o \
+         CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR=7 CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR=8 \
+         CLAUDE_CODE_USE_BEDROCK=1 CLAUDE_CODE_USE_VERTEX=1 CLAUDE_CODE_USE_FOUNDRY=1 \
+         CLAUDE_CODE_USE_ANTHROPIC_AWS=1 CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD=1 \
+         CLAUDE_CODE_USE_MANTLE=1 CLAUDE_CODE_USE_GATEWAY=1 \
          ANTHROPIC_BASE_URL=u CLAUDE_SUB_CONFIG_DIR="$WORK/subcfg" \
          PATH="$WORK/subbin:$PATH" "$BIN_DIR/claude-sub" probe 2>/dev/null)
-if [ "$subout" = "SID=[unset] SPW=[unset] KEY=[unset] TOK=[unset] URL=[unset] CFG=[$WORK/subcfg]" ]; then
+if [ "$subout" = "SID=[unset] SPW=[unset] KEY=[unset] TOK=[unset] OAT=[unset] KFD=[unset] OFD=[unset] URL=[unset] PROV=[] CFG=[$WORK/subcfg]" ]; then
   ok
 else
   bad "claude-sub passed through: '$subout'"

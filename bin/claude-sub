@@ -71,12 +71,31 @@ fi
 # like the tool being broken. (Happy's issue #120 is a user discovering this the
 # expensive way.)
 #
+# Every variable that outranks the subscription login goes, not only the key.
+# claude's auth order: a cloud provider switch (CLAUDE_CODE_USE_*: Bedrock,
+# Vertex, Foundry, Anthropic AWS, Anthropic Google Cloud, Mantle, gateway),
+# then ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY, the apiKeyHelper, and
+# CLAUDE_CODE_OAUTH_TOKEN, all above the /login credentials. The installed
+# claude also reads the key and the OAuth token from a file descriptor an SDK
+# host names (CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR,
+# CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR), at the same rank. Fleet processes in
+# AUTH_MODE=enterprise carry CLAUDE_CODE_OAUTH_TOKEN (the Enterprise seat's
+# token), so leaving it set would run this session on that seat, without the
+# connectors. The helper is not an environment variable: it lives in a
+# settings.json, and CLAUDE_CONFIG_DIR below points at the subscription config
+# dir, where the fleet keeps none.
+#
 # CLAUDE_API_PARENT_SID and CLAUDE_API_SPAWNER_SID must go too: claude-api
 # reads them as this session's worker lineage / direct spawner, so leaving them
 # set would file this session's own delegated runs and questions under the
 # wrong parent. (PARENT_SID also used to stand down the subagent gate, which
 # was retired 2026-08-15 when the fleet moved to API billing for good.)
-unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL CLAUDE_API_PARENT_SID CLAUDE_API_SPAWNER_SID
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_BASE_URL \
+      CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR \
+      CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY \
+      CLAUDE_CODE_USE_ANTHROPIC_AWS CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD \
+      CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_USE_GATEWAY \
+      CLAUDE_API_PARENT_SID CLAUDE_API_SPAWNER_SID
 export CLAUDE_CONFIG_DIR="${CLAUDE_SUB_CONFIG_DIR:-$HOME/.claude}"
 
 exec claude -p "$prompt" "$@"
