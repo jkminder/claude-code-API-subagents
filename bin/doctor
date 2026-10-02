@@ -40,7 +40,54 @@ except Exception:
 print(v.strip() if isinstance(v, str) else "")
 PY
 )"
-if [ -n "$helper" ]; then
+# AUTH_MODE (fleet.conf; Julian's D159 = C, 2026-10-02): enterprise = the
+# Enterprise OAuth token in 1Password is what workers run on; the helper is then
+# only a note (each worker empties it through its --settings overlay).
+fleet_key() { # <KEY> <default>
+  python3 - "$1" "$2" <<'PY' 2>/dev/null
+import os, sys
+key, default = sys.argv[1], sys.argv[2]
+v = os.environ.get(key)
+if v:
+    print(v); sys.exit(0)
+path = os.environ.get("FLEET_CONF") or os.path.expanduser("~/.config/fleet/fleet.conf")
+val = default
+try:
+    for line in open(path):
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, raw = line.partition("=")
+        if k.strip() != key:
+            continue
+        raw = raw.strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+            raw = raw[1:-1]
+        val = raw
+except OSError:
+    pass
+print(val)
+PY
+}
+AUTH_MODE="$(fleet_key AUTH_MODE api)"
+if [ "$AUTH_MODE" = enterprise ]; then
+  ref="$(fleet_key OAUTH_TOKEN_REF "")"
+  if [ -n "$ref" ]; then
+    ok "AUTH_MODE=enterprise: OAUTH_TOKEN_REF set in fleet.conf"
+    WITH_OP="${CLAUDE_API_WITH_OP:-$(command -v with-op 2>/dev/null || echo "$HOME/.local/bin/with-op")}"
+    tok_err="$(mktemp)"
+    if tok="$("$WITH_OP" op read "$ref" 2>"$tok_err")" && [ -n "$tok" ]; then
+      ok "the Enterprise token reads from 1Password (not shown; ${#tok} chars)"
+    else
+      fail "op cannot read the Enterprise token at $ref — stderr: $(tr '\n' ' ' < "$tok_err" | cut -c1-400)"
+    fi
+    unset tok
+    rm -f "$tok_err"
+  else
+    fail "AUTH_MODE=enterprise but OAUTH_TOKEN_REF is unset in fleet.conf (op://<vault>/<item>/credential of the \`claude setup-token\` token)"
+  fi
+  [ -n "$helper" ] && warn "an apiKeyHelper is still in $CONFIG_DIR/settings.json — every worker empties it through its --settings overlay; remove it once every seat has restarted on the token"
+elif [ -n "$helper" ]; then
   ok "apiKeyHelper set in $CONFIG_DIR/settings.json (workers fetch the key at runtime through it)"
   helper_err="$(mktemp)"
   if key="$(eval "$helper" 2>"$helper_err")" && [ -n "$key" ]; then

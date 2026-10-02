@@ -12,6 +12,14 @@
 # pin one key for the worker's lifetime, so an inherited one is stripped. No
 # API key lives in any file (Fellows security reset 2026-09-06).
 #
+# Claude Enterprise instead (fleet.conf AUTH_MODE=enterprise + OAUTH_TOKEN_REF;
+# Julian's D159 = C, 2026-10-02): the worker runs on the Enterprise seat. The
+# one-year OAuth token `claude setup-token` minted lives only in 1Password; this
+# wrapper reads it at spawn into CLAUDE_CODE_OAUTH_TOKEN for the worker (claude
+# has no helper setting for OAuth tokens — the environment is the only carrier)
+# and empties apiKeyHelper for the worker through the injected --settings, since
+# claude's precedence puts the helper above the token.
+#
 # Permission mode resolution (first match wins):
 #   1. Explicit --permission-mode / --dangerously-skip-permissions in the args
 #   2. Inherited from the parent Claude Code session when it runs in an elevated
@@ -50,6 +58,38 @@ RUN_DIR="$CONFIG_DIR/run"
 # hooks decided whether our parent's permission mode got recorded.
 PARENT_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 export CLAUDE_CONFIG_DIR="$CONFIG_DIR"
+
+# fleet.conf reader (env wins, then $FLEET_CONF or ~/.config/fleet/fleet.conf;
+# the fleet grammar: KEY=VALUE, one pair of matching quotes stripped, full-line
+# comments). A reader only — the strict refusals live in the fleet's own tools.
+fleet_key() { # <KEY> <default>
+  python3 - "$1" "$2" <<'PY'
+import os, sys
+key, default = sys.argv[1], sys.argv[2]
+v = os.environ.get(key)
+if v:
+    print(v); sys.exit(0)
+path = os.environ.get("FLEET_CONF") or os.path.expanduser("~/.config/fleet/fleet.conf")
+val = default
+try:
+    for line in open(path):
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, raw = line.partition("=")
+        if k.strip() != key:
+            continue
+        raw = raw.strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+            raw = raw[1:-1]
+        val = raw
+except OSError:
+    pass
+print(val)
+PY
+}
+AUTH_MODE="$(fleet_key AUTH_MODE api)"
+OAUTH_TOKEN_REF=""
 
 # Framework subcommands.
 case "${1:-}" in
@@ -568,7 +608,17 @@ PY
 }
 if [ "$meta" -eq 0 ]; then
   command -v python3 >/dev/null 2>&1 || { echo "claude-api: python3 is required (key-source check, run supervisor, worker-ctl)" >&2; exit 1; }
-  if [ -z "$(api_key_helper "$CONFIG_DIR")" ]; then
+  case "$AUTH_MODE" in
+    api) ;;
+    enterprise)
+      OAUTH_TOKEN_REF="$(fleet_key OAUTH_TOKEN_REF "")"
+      if [ -z "$OAUTH_TOKEN_REF" ]; then
+        echo "claude-api: AUTH_MODE=enterprise but OAUTH_TOKEN_REF is unset — add OAUTH_TOKEN_REF=op://<vault>/<item>/credential to ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf} (the 1Password item holding the \`claude setup-token\` token)." >&2
+        exit 1
+      fi ;;
+    *) echo "claude-api: AUTH_MODE='$AUTH_MODE' is neither api nor enterprise — fix ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf}" >&2; exit 1 ;;
+  esac
+  if [ "$AUTH_MODE" = api ] && [ -z "$(api_key_helper "$CONFIG_DIR")" ]; then
     {
       echo "claude-api: no API key source — $CONFIG_DIR/settings.json has no apiKeyHelper."
       echo "  The worker fetches its key at runtime through that helper (Claude Code runs it in the"
@@ -596,6 +646,19 @@ unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_B
 
 if [ "$meta" -eq 1 ]; then
   exec claude "$@"
+fi
+
+# AUTH_MODE=enterprise: the Enterprise OAuth token, read from 1Password under
+# with-op for this one spawn, rides in the worker's environment (and nowhere
+# else). CLAUDE_API_WITH_OP: tests.
+if [ "$AUTH_MODE" = enterprise ]; then
+  WITH_OP="${CLAUDE_API_WITH_OP:-$(command -v with-op 2>/dev/null || echo "$HOME/.local/bin/with-op")}"
+  if ! oauth_token="$("$WITH_OP" op read "$OAUTH_TOKEN_REF" 2>/dev/null)" || [ -z "$oauth_token" ]; then
+    echo "claude-api: op cannot read the Enterprise token at $OAUTH_TOKEN_REF (with-op: $WITH_OP) — is the 1Password item there and ~/.config/op/service-account-token in place (mode 600)?" >&2
+    exit 1
+  fi
+  export CLAUDE_CODE_OAUTH_TOKEN="$oauth_token"
+  unset oauth_token
 fi
 
 # Give workers a route back to a question inbox (claude-api ask): inside a
@@ -717,8 +780,20 @@ for a in "$@"; do
     --model|--model=*) has_model=1 ;;
   esac
 done
+# AUTH_MODE=enterprise adds "apiKeyHelper": "" to the injected settings: claude's
+# precedence puts the helper above CLAUDE_CODE_OAUTH_TOKEN, and the shared
+# settings.json may keep its helper while seats still run on it (measured
+# 2026-10-02: "" disables the helper for this process, null does not). A caller's
+# own --settings is not merged into — warned, and the worker then bills the API
+# key as long as the helper is in settings.json.
+overlay=""
+[ "$AUTH_MODE" = enterprise ] && overlay=', "apiKeyHelper": ""'
 if [ "$has_settings" -eq 0 ] && [ "$has_model" -eq 0 ]; then
-  set -- --settings '{"model": "claude-fable-5"}' "$@"
+  set -- --settings "{\"model\": \"claude-fable-5\"$overlay}" "$@"
+elif [ "$has_settings" -eq 0 ] && [ -n "$overlay" ]; then
+  set -- --settings '{"apiKeyHelper": ""}' "$@"
+elif [ "$has_settings" -eq 1 ] && [ -n "$overlay" ]; then
+  echo "claude-api: WARNING: AUTH_MODE=enterprise but the caller passed its own --settings, so the apiKeyHelper overlay is not merged into it — while $CONFIG_DIR/settings.json carries an apiKeyHelper this worker bills the API key, not the Enterprise seat. Add \"apiKeyHelper\": \"\" to that --settings." >&2
 fi
 
 # Headless briefing: ScheduleWakeup never fires for a `claude -p` process, and
