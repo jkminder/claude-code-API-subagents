@@ -99,12 +99,21 @@ if [ "$AUTH_MODE" != api ] && [ "$AUTH_MODE" != enterprise ]; then
   fail "AUTH_MODE (value not shown) is neither api nor enterprise, so claude-api refuses every spawn: set AUTH_MODE=api or AUTH_MODE=enterprise in fleet.conf (a variable of that name in the environment wins over the file)"
 elif [ "$AUTH_MODE" = enterprise ]; then
   ref="$(fleet_key OAUTH_TOKEN_REF "")"
+  # where the value came from (claude-api's rule): the environment when a
+  # non-empty variable of that name is exported, else fleet.conf
+  if [ -n "${OAUTH_TOKEN_REF:-}" ]; then
+    ref_origin="the environment variable OAUTH_TOKEN_REF, which wins over the file"
+    ref_fix="Fix or unset the exported OAUTH_TOKEN_REF"
+  else
+    ref_origin="${FLEET_CONF:-$HOME/.config/fleet/fleet.conf}"
+    ref_fix="Set OAUTH_TOKEN_REF=op://<vault>/<item>/credential in ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf}"
+  fi
   if [ -n "$ref" ] && ! oauth_ref_ok "$ref"; then
     # possibly a token pasted in place of the reference or inside it: never
     # shown, never sent to op
-    fail "OAUTH_TOKEN_REF is not an op:// reference (value not shown): set OAUTH_TOKEN_REF=op://<vault>/<item>/credential in fleet.conf (a variable of that name in the environment wins over the file)"
+    fail "OAUTH_TOKEN_REF is not an op:// reference (value not shown); it comes from $ref_origin. $ref_fix."
   elif [ -n "$ref" ]; then
-    ok "AUTH_MODE=enterprise: OAUTH_TOKEN_REF set in fleet.conf"
+    ok "AUTH_MODE=enterprise: OAUTH_TOKEN_REF set (not shown), from $ref_origin"
     WITH_OP="${CLAUDE_API_WITH_OP:-$(command -v with-op 2>/dev/null || echo "$HOME/.local/bin/with-op")}"
     tok_err="$(mktemp)"
     if tok="$("$WITH_OP" op read "$ref" 2>"$tok_err")" && [ -n "$tok" ]; then

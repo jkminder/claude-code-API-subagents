@@ -14,12 +14,16 @@
 # API key lives in any file (Fellows security reset 2026-09-06).
 #
 # Claude Enterprise instead (fleet.conf AUTH_MODE=enterprise + OAUTH_TOKEN_REF;
-# Julian's D159 = C, 2026-10-02): the worker runs on the Enterprise seat. The
-# one-year OAuth token `claude setup-token` minted lives only in 1Password; this
-# wrapper reads it at spawn into CLAUDE_CODE_OAUTH_TOKEN for the worker (claude
-# has no helper setting for OAuth tokens — the environment is the only carrier)
-# and empties apiKeyHelper for the worker through the injected --settings, since
-# claude's precedence puts the helper above the token.
+# Julian's D159 = C, 2026-10-02; an exported variable of either name wins over
+# the file): the worker runs on the Enterprise seat. The one-year OAuth token
+# `claude setup-token` minted lives only in 1Password; this wrapper reads it at
+# spawn into CLAUDE_CODE_OAUTH_TOKEN for the worker (claude has no helper
+# setting for OAuth tokens — the environment is the only carrier) and empties
+# apiKeyHelper for the worker through the injected --settings, since claude's
+# precedence puts the helper above the token. A caller that passes its own
+# --settings gets no overlay (the wrapper warns): while settings.json keeps its
+# apiKeyHelper, that worker bills the API key unless its --settings carries
+# "apiKeyHelper": "".
 #
 # Permission mode resolution (first match wins):
 #   1. Explicit --permission-mode / --dangerously-skip-permissions in the args
@@ -90,7 +94,10 @@ print(val)
 PY
 }
 AUTH_MODE="$(fleet_key AUTH_MODE api)"
-OAUTH_TOKEN_REF=""
+# The reference read in enterprise mode lives in oauth_ref: an assignment to the
+# inherited name would hide an exported OAUTH_TOKEN_REF from fleet_key, and the
+# environment wins over fleet.conf here as in doctor and every fleet reader.
+oauth_ref=""
 
 # Framework subcommands.
 case "${1:-}" in
@@ -637,16 +644,26 @@ if [ "$meta" -eq 0 ]; then
   case "$AUTH_MODE" in
     api) ;;
     enterprise)
-      OAUTH_TOKEN_REF="$(fleet_key OAUTH_TOKEN_REF "")"
-      if [ -z "$OAUTH_TOKEN_REF" ]; then
+      oauth_ref="$(fleet_key OAUTH_TOKEN_REF "")"
+      # where the value came from, for the refusal (never the value): the
+      # environment when a non-empty variable of that name was exported, which
+      # is exactly when fleet_key reads it instead of the file
+      if [ -n "${OAUTH_TOKEN_REF:-}" ]; then
+        ref_origin="the environment variable OAUTH_TOKEN_REF, which wins over the file"
+        ref_fix="Fix or unset the exported OAUTH_TOKEN_REF"
+      else
+        ref_origin="${FLEET_CONF:-$HOME/.config/fleet/fleet.conf}"
+        ref_fix="Set OAUTH_TOKEN_REF=op://<vault>/<item>/credential in ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf}"
+      fi
+      if [ -z "$oauth_ref" ]; then
         echo "claude-api: AUTH_MODE=enterprise but OAUTH_TOKEN_REF is unset — add OAUTH_TOKEN_REF=op://<vault>/<item>/credential to ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf} (the 1Password item holding the \`claude setup-token\` token)." >&2
         exit 1
       fi
       # The value must be a 1Password reference of the shape oauth_ref_ok
       # checks. A value of any other shape may be a pasted token, so it is
       # refused before op runs, and the refusal never prints it.
-      if ! oauth_ref_ok "$OAUTH_TOKEN_REF"; then
-        echo "claude-api: OAUTH_TOKEN_REF is not an op:// reference (value not shown). Set OAUTH_TOKEN_REF=op://<vault>/<item>/credential in ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf}." >&2
+      if ! oauth_ref_ok "$oauth_ref"; then
+        echo "claude-api: OAUTH_TOKEN_REF is not an op:// reference (value not shown); it comes from $ref_origin. $ref_fix." >&2
         exit 1
       fi ;;
     # never the value: a token pasted onto the AUTH_MODE line would reach stderr
@@ -689,8 +706,8 @@ fi
 if [ "$AUTH_MODE" = enterprise ]; then
   WITH_OP="${CLAUDE_API_WITH_OP:-$(command -v with-op 2>/dev/null || echo "$HOME/.local/bin/with-op")}"
   op_err="$(mktemp)" || { echo "claude-api: mktemp failed, so op's stderr cannot be captured" >&2; exit 1; }
-  if ! oauth_token="$("$WITH_OP" op read "$OAUTH_TOKEN_REF" 2>"$op_err")" || [ -z "$oauth_token" ]; then
-    echo "claude-api: op cannot read the Enterprise token at the reference in OAUTH_TOKEN_REF (not shown). Is the 1Password item there and ~/.config/op/service-account-token in place (mode 600)? with-op: $WITH_OP; stderr: $(redact_ref "$OAUTH_TOKEN_REF" < "$op_err" | tr '\n' ' ' | cut -c1-400)" >&2
+  if ! oauth_token="$("$WITH_OP" op read "$oauth_ref" 2>"$op_err")" || [ -z "$oauth_token" ]; then
+    echo "claude-api: op cannot read the Enterprise token at the reference in OAUTH_TOKEN_REF (not shown). Is the 1Password item there and ~/.config/op/service-account-token in place (mode 600)? with-op: $WITH_OP; stderr: $(redact_ref "$oauth_ref" < "$op_err" | tr '\n' ' ' | cut -c1-400)" >&2
     rm -f "$op_err"
     exit 1
   fi

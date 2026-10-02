@@ -12,7 +12,8 @@ any other value, a pasted token included, refuses before claude starts and
 without showing the value; a caller's --model or --settings still bypasses the
 pin. An OAUTH_TOKEN_REF that is not op:// plus exactly three non-empty segments
 (a pasted token, alone or inside an op:// value) refuses in claude-api and is a
-FAIL row in doctor, before op runs and without showing the value; when op
+FAIL row in doctor, before op runs and without showing the value (both tools
+read an exported OAUTH_TOKEN_REF before fleet.conf and name the source); when op
 cannot read a well-formed one, neither shows the reference, and op's stderr (a
 fake op echoes the reference back) is shown with the reference and each of its
 segments replaced by <ref>. Hermetic: throwaway HOME and config dir, a fake
@@ -178,20 +179,55 @@ for op_fail in ("", "1"):
     assert os.path.join(TMP, "fleet%d.conf" % n) in r.stderr, out            # the refusal names this case's fleet.conf
     assert FAKE_TOKEN not in out and "FAKEFAKE" not in out, out
     assert "CLAUDE_FAKE" not in r.stdout and calls == [], (out, calls)   # no spawn, op never ran
-# The other source: claude-api clears OAUTH_TOKEN_REF near the top (the line
-# OAUTH_TOKEN_REF=""), so its fleet_key never sees a same-named environment
-# variable and fleet.conf's reference is the one used. A token in that variable
-# therefore never reaches op or a message.
+# The refusal names where the value came from and how to fix it there.
+r, calls = case("a token in fleet.conf's OAUTH_TOKEN_REF: the refusal names the file and the fix", helper=True,
+                conf_lines=["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + FAKE_TOKEN])
+conf = os.path.join(TMP, "fleet%d.conf" % n)
+assert r.returncode == 1 and ("claude-api: OAUTH_TOKEN_REF is not an op:// reference (value not shown); it comes "
+                              "from %s. Set OAUTH_TOKEN_REF=op://<vault>/<item>/credential in %s." % (conf, conf)
+                              ) in r.stderr, r.stderr
+
+# The other source: an exported OAUTH_TOKEN_REF wins over fleet.conf, in
+# claude-api as in doctor, happy-api and every fleet reader (claude-api used to
+# assign the name before reading it, which hid the exported value and made it
+# read fleet.conf only). A token in that variable is refused before op runs and
+# never printed, and the refusal names the environment.
+ENV_REF = "op://Fellow - Julian Minder/Another Item/credential"
+API_ENV_REFUSAL = ("claude-api: OAUTH_TOKEN_REF is not an op:// reference (value not shown); it comes from the "
+                   "environment variable OAUTH_TOKEN_REF, which wins over the file. Fix or unset the exported "
+                   "OAUTH_TOKEN_REF.")
 for op_fail in ("", "1"):
     extra = {"OAUTH_TOKEN_REF": FAKE_TOKEN}
     if op_fail:
         extra["FAKE_OP_FAIL"] = op_fail
-    r, calls = case("a token in the OAUTH_TOKEN_REF environment variable is never read or printed (op %s)"
+    r, calls = case("a token in the exported OAUTH_TOKEN_REF is refused before op, unshown, source named (op %s)"
                     % ("failing" if op_fail else "working"), helper=True,
                     conf_lines=["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF], env_extra=extra)
     out = r.stdout + r.stderr
-    assert r.returncode == (1 if op_fail else 0) and calls == ["op read " + TOKEN_REF], (out, calls)
+    assert r.returncode == 1 and API_ENV_REFUSAL in r.stderr, out
+    assert calls == [] and claude_record() == "", (calls, claude_record())
     assert FAKE_TOKEN not in out and "FAKEFAKE" not in out, out
+    for d, _, files in os.walk(os.path.join(TMP, "home%d" % n)):
+        for name in files:
+            with open(os.path.join(d, name), errors="replace") as f:
+                assert FAKE_TOKEN not in f.read(), os.path.join(d, name)
+
+r, calls = case("an exported OAUTH_TOKEN_REF wins over fleet.conf's (both well formed)", helper=True,
+                conf_lines=["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF],
+                env_extra={"OAUTH_TOKEN_REF": ENV_REF})
+assert r.returncode == 0 and "oauth_set=1" in r.stdout and calls == ["op read " + ENV_REF], \
+    (r.stdout + r.stderr, calls)
+
+r, calls = case("a good exported OAUTH_TOKEN_REF is used while fleet.conf holds a token", helper=True,
+                conf_lines=["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + FAKE_TOKEN],
+                env_extra={"OAUTH_TOKEN_REF": ENV_REF})
+out = r.stdout + r.stderr
+assert r.returncode == 0 and calls == ["op read " + ENV_REF] and FAKE_TOKEN not in out, (out, calls)
+
+r, calls = case("an empty exported OAUTH_TOKEN_REF falls through to fleet.conf", helper=True,
+                conf_lines=["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF],
+                env_extra={"OAUTH_TOKEN_REF": ""})
+assert r.returncode == 0 and calls == ["op read " + TOKEN_REF], (r.stdout + r.stderr, calls)
 
 # --- the shape of OAUTH_TOKEN_REF, the same rule in claude-api and doctor: op://
 # and exactly three non-empty segments (vault, item, field) separated by "/", no
@@ -292,7 +328,7 @@ for label, conf_lines in (("no AUTH_MODE line (api)", []), ("AUTH_MODE=api", ["A
     assert "AUTH_MODE (value not shown)" not in r.stdout + r.stderr, r.stdout + r.stderr
 
 # The OAUTH_TOKEN_REF shapes again, in doctor, plus a newline from the
-# environment (in doctor a variable of that name wins over fleet.conf).
+# environment (a variable of that name wins over fleet.conf, as in claude-api).
 DOC_REF_FAIL = "  FAIL  OAUTH_TOKEN_REF is not an op:// reference (value not shown)"
 DOC_OP_FAIL = ("  FAIL  op cannot read the Enterprise token at the reference in OAUTH_TOKEN_REF (not shown)"
                " — stderr: " + REDACTED_ECHO)
@@ -312,6 +348,55 @@ for label, conf_ref, env_ref, refused in ([(l, ref, None, refused) for l, ref, r
         (DOC_OP_FAIL in r.stdout and calls == ["op read " + ref])
     if not (want and ref not in out and FAKE_TOKEN not in out and "FAKEFAKE" not in out):
         bad.append((label, calls, out))
+assert not bad, bad
+
+# doctor names the source of the reference too, and reads the exported one.
+DOC_ENV_FAIL = ("  FAIL  OAUTH_TOKEN_REF is not an op:// reference (value not shown); it comes from the "
+                "environment variable OAUTH_TOKEN_REF, which wins over the file. Fix or unset the exported "
+                "OAUTH_TOKEN_REF.")
+r, calls = doctor("a token in the exported OAUTH_TOKEN_REF: the FAIL row names the environment",
+                  ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF], {"OAUTH_TOKEN_REF": FAKE_TOKEN})
+out = r.stdout + r.stderr
+assert DOC_ENV_FAIL in r.stdout and calls == [] and FAKE_TOKEN not in out and "FAKEFAKE" not in out, out
+r, calls = doctor("a token in fleet.conf's OAUTH_TOKEN_REF: the FAIL row names the file",
+                  ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + FAKE_TOKEN])
+conf = os.path.join(TMP, "docfleet%d.conf" % n)
+assert ("  FAIL  OAUTH_TOKEN_REF is not an op:// reference (value not shown); it comes from %s. Set "
+        "OAUTH_TOKEN_REF=op://<vault>/<item>/credential in %s." % (conf, conf)) in r.stdout, r.stdout
+r, calls = doctor("an exported OAUTH_TOKEN_REF: the ok row names the environment and op reads that one",
+                  ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF], {"OAUTH_TOKEN_REF": ENV_REF})
+out = r.stdout + r.stderr
+assert ("  ok    AUTH_MODE=enterprise: OAUTH_TOKEN_REF set (not shown), from the environment variable "
+        "OAUTH_TOKEN_REF, which wins over the file") in r.stdout and calls == ["op read " + ENV_REF], (out, calls)
+assert ENV_REF not in out and TOKEN_REF not in out, out
+r, calls = doctor("OAUTH_TOKEN_REF from fleet.conf: the ok row names the file",
+                  ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF])
+conf = os.path.join(TMP, "docfleet%d.conf" % n)
+assert "  ok    AUTH_MODE=enterprise: OAUTH_TOKEN_REF set (not shown), from %s" % conf in r.stdout, r.stdout
+
+# claude-api and doctor take the reference from the same source: on each pair
+# of values below both read the same reference (the same op call) or both
+# refuse it before op runs. The two disagreed before claude-api honoured an
+# exported OAUTH_TOKEN_REF.
+AGREE = [   # (label, fleet.conf value, exported value or None)
+    ("fleet.conf only", TOKEN_REF, None),
+    ("an exported reference over fleet.conf's", TOKEN_REF, ENV_REF),
+    ("an exported reference over a token in fleet.conf", FAKE_TOKEN, ENV_REF),
+    ("an exported token over a good fleet.conf", TOKEN_REF, FAKE_TOKEN),
+    ("an empty export over a good fleet.conf", TOKEN_REF, ""),
+    ("a token in fleet.conf, nothing exported", FAKE_TOKEN, None),
+]
+bad = []
+for label, conf_ref, env_ref in AGREE:
+    extra = {} if env_ref is None else {"OAUTH_TOKEN_REF": env_ref}
+    conf_lines = ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + conf_ref]
+    ra, api_calls = case("claude-api, source agreement: " + label, helper=True, conf_lines=conf_lines,
+                         env_extra=extra)
+    rd, doc_calls = doctor("source agreement: " + label, conf_lines, extra)
+    api_refused = API_REF_REFUSAL in ra.stderr
+    doc_refused = DOC_REF_FAIL in rd.stdout
+    if api_calls != doc_calls or api_refused != doc_refused:
+        bad.append((label, api_calls, doc_calls, api_refused, doc_refused))
 assert not bad, bad
 
 # --- the worker model: fleet.conf's MODEL_DEFAULT (D165 = A), a canonical id only ---
