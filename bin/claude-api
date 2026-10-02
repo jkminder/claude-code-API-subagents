@@ -627,7 +627,7 @@ if [ "$meta" -eq 0 ]; then
       esac ;;
     # never the value: a token pasted onto the AUTH_MODE line would reach stderr
     # (and, for a run worker, its .err file)
-    *) echo "claude-api: AUTH_MODE (value not shown) is neither api nor enterprise — fix ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf} (an AUTH_MODE variable in the environment wins over the file)" >&2; exit 1 ;;
+    *) echo "claude-api: AUTH_MODE (value not shown) is neither api nor enterprise. Fix ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf} (an AUTH_MODE variable in the environment wins over the file)" >&2; exit 1 ;;
   esac
   if [ "$AUTH_MODE" = api ] && [ -z "$(api_key_helper "$CONFIG_DIR")" ]; then
     {
@@ -805,11 +805,11 @@ overlay=""
 if [ "$has_settings" -eq 0 ] && [ "$has_model" -eq 0 ]; then
   worker_model="$(fleet_key MODEL_DEFAULT claude-fable-5)"
   # The id goes onto the worker's command line (the --settings below) and into
-  # the run ledger, so only the fleet's canonical id passes — the rule of
+  # the run ledger, so only the fleet's canonical id passes: the rule of
   # skills/handlers/bin/fleet_conf.sh fleet_model_required in agent-skills. A
   # token pasted as MODEL_DEFAULT fails it, and the refusal never shows the value.
   if [[ ! "$worker_model" =~ ^claude-(fable|mythos|opus)-[0-9]+(-[0-9]+)*$ ]]; then
-    echo "claude-api: MODEL_DEFAULT (value not shown) from the environment or ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf} is not a canonical fable/mythos/opus model id (claude-<family>-<n>[-<n>...]) — fix it (full-line comments only in fleet.conf), or pass --model" >&2
+    echo "claude-api: MODEL_DEFAULT (value not shown) from the environment or ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf} is not a canonical fable/mythos/opus model id (claude-<family>-<n>[-<n>...]). Fix it (full-line comments only in fleet.conf), or pass --model" >&2
     exit 1
   fi
   set -- --settings "{\"model\": \"$worker_model\"$overlay}" "$@"

@@ -5,7 +5,7 @@ Enterprise OAuth token from 1Password (a fake with-op here) into
 CLAUDE_CODE_OAUTH_TOKEN for the worker and empties apiKeyHelper through the
 injected --settings (merged into the model pin; alone beside a caller's
 --model; a caller's own --settings is warned, not merged). Any other AUTH_MODE
-refuses without showing the value. The injected model is fleet.conf's
+refuses without showing the value, and is a FAIL row in doctor. The injected model is fleet.conf's
 MODEL_DEFAULT (Julian's D165 = A, 2026-10-02), claude-fable-5 without one; only
 the fleet's canonical id (claude-<fable|mythos|opus>-<n>[-<n>...]) passes, and
 any other value, a pasted token included, refuses before claude starts and
@@ -149,7 +149,7 @@ r, calls = case("enterprise refuses when op cannot read the token", helper=True,
 assert r.returncode == 1 and "cannot read the Enterprise token" in r.stderr and "CLAUDE_FAKE" not in r.stdout, r.stderr
 
 # --- an AUTH_MODE that is neither api nor enterprise: refused, never printed ---
-AUTH_REFUSAL = "claude-api: AUTH_MODE (value not shown) is neither api nor enterprise — fix %s"
+AUTH_REFUSAL = "claude-api: AUTH_MODE (value not shown) is neither api nor enterprise. Fix %s"
 r, calls = case("a token-shaped AUTH_MODE in fleet.conf refuses without showing it", helper=True,
                 conf_lines=["AUTH_MODE=" + FAKE_TOKEN])
 refused_unshown(r, calls, FAKE_TOKEN, AUTH_REFUSAL)
@@ -225,6 +225,23 @@ for where, conf_ref, env_ref in (("fleet.conf", FAKE_TOKEN, None), ("the environ
     assert "  FAIL  OAUTH_TOKEN_REF is not an op:// reference (value not shown)" in r.stdout, out
     assert FAKE_TOKEN not in out and "FAKEFAKE" not in out, out
     assert calls == [], calls                                               # op never ran
+
+# An AUTH_MODE claude-api refuses is a FAIL row in doctor too (it used to be
+# read as api mode, so doctor passed a fleet.conf on which every spawn failed),
+# from either source and without the value.
+DOCTOR_AUTH_FAIL = "  FAIL  AUTH_MODE (value not shown) is neither api nor enterprise, so claude-api refuses every spawn"
+for where, conf_lines, env_extra in (("fleet.conf", ["AUTH_MODE=" + FAKE_TOKEN], None),
+                                     ("the environment", ["AUTH_MODE=api"], {"AUTH_MODE": FAKE_TOKEN})):
+    r, calls = doctor("an AUTH_MODE from %s that is neither api nor enterprise is a FAIL row, value not shown" % where,
+                      conf_lines, env_extra)
+    out = r.stdout + r.stderr
+    assert DOCTOR_AUTH_FAIL in r.stdout, out
+    assert FAKE_TOKEN not in out and "FAKEFAKE" not in out, out
+    assert calls == [], calls
+for label, conf_lines in (("no AUTH_MODE line (api)", []), ("AUTH_MODE=api", ["AUTH_MODE=api"]),
+                          ("AUTH_MODE=enterprise", ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF])):
+    r, calls = doctor("%s has no AUTH_MODE FAIL row" % label, conf_lines)
+    assert "AUTH_MODE (value not shown)" not in r.stdout + r.stderr, r.stdout + r.stderr
 
 # --- the worker model: fleet.conf's MODEL_DEFAULT (D165 = A), a canonical id only ---
 r, calls = case("the worker runs fleet.conf's MODEL_DEFAULT", helper=True, conf_lines=[],

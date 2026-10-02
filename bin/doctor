@@ -70,7 +70,11 @@ print(val)
 PY
 }
 AUTH_MODE="$(fleet_key AUTH_MODE api)"
-if [ "$AUTH_MODE" = enterprise ]; then
+if [ "$AUTH_MODE" != api ] && [ "$AUTH_MODE" != enterprise ]; then
+  # claude-api refuses every spawn on this value; never shown (a token pasted
+  # onto the AUTH_MODE line would land in this report)
+  fail "AUTH_MODE (value not shown) is neither api nor enterprise, so claude-api refuses every spawn: set AUTH_MODE=api or AUTH_MODE=enterprise in fleet.conf (a variable of that name in the environment wins over the file)"
+elif [ "$AUTH_MODE" = enterprise ]; then
   ref="$(fleet_key OAUTH_TOKEN_REF "")"
   if [ -n "$ref" ] && [ "${ref#op://}" = "$ref" ]; then
     # a token pasted in place of the reference: never shown, never sent to op
