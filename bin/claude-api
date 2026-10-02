@@ -769,10 +769,12 @@ if [ "$explicit" -eq 0 ]; then
   esac
 fi
 
-# Default model: fable. Headless sessions ignore the `model` key in the
-# worker settings.json (verified on Claude Code v2.1.222), so the default is
-# pinned via the --settings flagSettings scope instead. An explicit --model
-# wins; a caller-supplied --settings suppresses the injection.
+# Default model: fleet.conf's MODEL_DEFAULT, the model the fleet's seats run
+# (Julian's D165 = A, 2026-10-02: workers follow the fleet default), and
+# claude-fable-5 when no fleet.conf names one. Headless sessions ignore the
+# `model` key in the worker settings.json (verified on Claude Code v2.1.222),
+# so the default is pinned via the --settings flagSettings scope instead. An
+# explicit --model wins; a caller-supplied --settings suppresses the injection.
 has_settings=0 has_model=0
 for a in "$@"; do
   case "$a" in
@@ -789,7 +791,13 @@ done
 overlay=""
 [ "$AUTH_MODE" = enterprise ] && overlay=', "apiKeyHelper": ""'
 if [ "$has_settings" -eq 0 ] && [ "$has_model" -eq 0 ]; then
-  set -- --settings "{\"model\": \"claude-fable-5\"$overlay}" "$@"
+  worker_model="$(fleet_key MODEL_DEFAULT claude-fable-5)"
+  # the id goes into a JSON string below: a model id or alias, nothing else
+  if [[ ! "$worker_model" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "claude-api: MODEL_DEFAULT='$worker_model' (environment or ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf}) is not a model id — fix it (full-line comments only in fleet.conf), or pass --model" >&2
+    exit 1
+  fi
+  set -- --settings "{\"model\": \"$worker_model\"$overlay}" "$@"
 elif [ "$has_settings" -eq 0 ] && [ -n "$overlay" ]; then
   set -- --settings '{"apiKeyHelper": ""}' "$@"
 elif [ "$has_settings" -eq 1 ] && [ -n "$overlay" ]; then

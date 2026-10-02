@@ -4,7 +4,9 @@ the apiKeyHelper requirement and spawns with no token; enterprise reads the
 Enterprise OAuth token from 1Password (a fake with-op here) into
 CLAUDE_CODE_OAUTH_TOKEN for the worker and empties apiKeyHelper through the
 injected --settings (merged into the model pin; alone beside a caller's
---model; a caller's own --settings is warned, not merged). Hermetic: throwaway
+--model; a caller's own --settings is warned, not merged). The injected model
+is fleet.conf's MODEL_DEFAULT (Julian's D165 = A, 2026-10-02), claude-fable-5
+without one, and a value that is not a model id refuses. Hermetic: throwaway
 HOME and config dir, a fake claude on PATH, no key, no network.
 Run: python3 bin/test_claude_api_auth.py
 """
@@ -36,7 +38,8 @@ os.chmod(OP, 0o755)
 n = 0
 
 
-def case(label, *, helper, conf_lines, args=("-p", "say hi"), env_extra=None):
+def case(label, *, helper, conf_lines, args=("-p", "say hi"), env_extra=None,
+         model_line="MODEL_DEFAULT=claude-fable-5-1"):
     global n
     n += 1
     home = os.path.join(TMP, "home%d" % n)
@@ -49,11 +52,12 @@ def case(label, *, helper, conf_lines, args=("-p", "say hi"), env_extra=None):
         json.dump(settings, f)
     conf = os.path.join(TMP, "fleet%d.conf" % n)
     with open(conf, "w") as f:
-        f.write("MODEL_DEFAULT=claude-fable-5-1\n" + "".join(l + "\n" for l in conf_lines))
+        f.write("".join(l + "\n" for l in ([model_line] if model_line else []) + list(conf_lines)))
     if os.path.exists(REC):
         os.remove(REC)
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("CLAUDE_CODE_", "CLAUDE_API_", "ANTHROPIC_", "AUTH_MODE", "OAUTH_TOKEN_REF"))}
+           if not k.startswith(("CLAUDE_CODE_", "CLAUDE_API_", "ANTHROPIC_", "AUTH_MODE", "OAUTH_TOKEN_REF",
+                                "MODEL_DEFAULT"))}
     env.update({"HOME": home, "FLEET_CONF": conf, "CLAUDE_API_WITH_OP": OP,
                 "PATH": FAKE_BIN + os.pathsep + env.get("PATH", "")})
     if env_extra:
@@ -76,7 +80,7 @@ def settings_arg(r):
 r, calls = case("api mode is the default: no token, no overlay, no op call", helper=True, conf_lines=[])
 assert r.returncode == 0, r.stdout + r.stderr
 assert "CLAUDE_FAKE oauth_set= len=0" in r.stdout, r.stdout
-assert settings_arg(r) == '{"model": "claude-fable-5"}', r.stdout
+assert settings_arg(r) == '{"model": "claude-fable-5-1"}', r.stdout
 assert calls == [], calls
 
 r, calls = case("api mode still refuses without an apiKeyHelper", helper=False, conf_lines=[])
@@ -86,7 +90,7 @@ r, calls = case("enterprise: token in the worker's environment, helper emptied b
                 helper=True, conf_lines=["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF])
 assert r.returncode == 0, r.stdout + r.stderr
 assert "CLAUDE_FAKE oauth_set=1 len=11" in r.stdout, r.stdout
-assert settings_arg(r) == '{"model": "claude-fable-5", "apiKeyHelper": ""}', r.stdout
+assert settings_arg(r) == '{"model": "claude-fable-5-1", "apiKeyHelper": ""}', r.stdout
 assert calls == ["op read " + TOKEN_REF], calls
 assert "tok-abc-123" not in r.stdout + r.stderr
 
@@ -113,6 +117,39 @@ assert r.returncode == 1 and "cannot read the Enterprise token" in r.stderr and 
 
 r, calls = case("unknown AUTH_MODE refuses", helper=True, conf_lines=["AUTH_MODE=bogus"])
 assert r.returncode == 1 and "neither api nor enterprise" in r.stderr, r.stderr
+
+# --- the worker model: fleet.conf's MODEL_DEFAULT (D165 = A) ---
+r, calls = case("the worker runs fleet.conf's MODEL_DEFAULT", helper=True, conf_lines=[],
+                model_line="MODEL_DEFAULT=claude-opus-5-5")
+assert r.returncode == 0, r.stdout + r.stderr
+assert settings_arg(r) == '{"model": "claude-opus-5-5"}', r.stdout
+
+r, calls = case("a quoted MODEL_DEFAULT reads like the fleet grammar", helper=True, conf_lines=[],
+                model_line='MODEL_DEFAULT="claude-opus-5-5"')
+assert r.returncode == 0 and settings_arg(r) == '{"model": "claude-opus-5-5"}', r.stdout + r.stderr
+
+r, calls = case("no MODEL_DEFAULT in fleet.conf: the built-in claude-fable-5", helper=True, conf_lines=[],
+                model_line=None)
+assert r.returncode == 0 and settings_arg(r) == '{"model": "claude-fable-5"}', r.stdout + r.stderr
+
+r, calls = case("MODEL_DEFAULT from the environment wins over fleet.conf", helper=True, conf_lines=[],
+                model_line="MODEL_DEFAULT=claude-opus-5-5", env_extra={"MODEL_DEFAULT": "claude-sonnet-5"})
+assert r.returncode == 0 and settings_arg(r) == '{"model": "claude-sonnet-5"}', r.stdout + r.stderr
+
+for bad in ("claude-opus-5-5 # inline comment", 'claude"x', "-opus", "claude opus"):
+    r, calls = case("a MODEL_DEFAULT that is not a model id refuses before claude runs: %r" % bad,
+                    helper=True, conf_lines=[], model_line="MODEL_DEFAULT=" + bad)
+    assert r.returncode == 1 and "is not a model id" in r.stderr and "CLAUDE_FAKE" not in r.stdout, \
+        r.stdout + r.stderr
+
+r, calls = case("a caller --model wins: no injection, and a bad MODEL_DEFAULT is never read", helper=True,
+                conf_lines=[], model_line="MODEL_DEFAULT=claude opus", args=("--model", "claude-sonnet-5", "-p", "say hi"))
+assert r.returncode == 0 and settings_arg(r) is None and "ARG claude-sonnet-5" in r.stdout, r.stdout + r.stderr
+
+r, calls = case("enterprise beside an Opus default: model and emptied helper in one --settings", helper=True,
+                conf_lines=["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF],
+                model_line="MODEL_DEFAULT=claude-opus-5-5")
+assert r.returncode == 0 and settings_arg(r) == '{"model": "claude-opus-5-5", "apiKeyHelper": ""}', r.stdout + r.stderr
 
 meta_env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE_CODE_", "CLAUDE_API_"))}
 meta_env.update({"HOME": os.path.join(TMP, "home-meta"), "FLEET_CONF": os.path.join(TMP, "fleet3.conf"),
