@@ -6,7 +6,8 @@ CLAUDE_CODE_OAUTH_TOKEN for the worker and empties apiKeyHelper through the
 injected --settings (merged into the model pin; alone beside a caller's
 --model; a caller's own --settings is warned, not merged). Any other AUTH_MODE
 refuses without showing the value, and is a FAIL row in doctor. The injected model is fleet.conf's
-MODEL_DEFAULT (Julian's D165 = A, 2026-10-02), claude-fable-5 without one; only
+MODEL_DEFAULT (Julian's D165 = A, 2026-10-02), with no built-in default: unset,
+claude-api refuses like the seat launchers (Julian's D73); only
 the fleet's canonical id (claude-<fable|mythos|opus>-<n>[-<n>...]) passes, and
 any other value, a pasted token included, refuses before claude starts and
 without showing the value; a caller's --model or --settings still bypasses the
@@ -409,9 +410,28 @@ r, calls = case("a quoted MODEL_DEFAULT reads like the fleet grammar", helper=Tr
                 model_line='MODEL_DEFAULT="claude-opus-5-5"')
 assert r.returncode == 0 and settings_arg(r) == '{"model": "claude-opus-5-5"}', r.stdout + r.stderr
 
-r, calls = case("no MODEL_DEFAULT in fleet.conf: the built-in claude-fable-5", helper=True, conf_lines=[],
-                model_line=None)
-assert r.returncode == 0 and settings_arg(r) == '{"model": "claude-fable-5"}', r.stdout + r.stderr
+# No built-in default (Julian's D73): an unset MODEL_DEFAULT refuses like the
+# seat launchers, naming the file to fix; claude never starts and op never runs.
+UNSET_REFUSAL = "claude-api: MODEL_DEFAULT is not set — it has no built-in default."
+for label, model_line, extra in (("no MODEL_DEFAULT line in fleet.conf", None, None),
+                                 ("an empty MODEL_DEFAULT= line", "MODEL_DEFAULT=", None),
+                                 ("an exported empty MODEL_DEFAULT and no line", None, {"MODEL_DEFAULT": ""}),
+                                 ("no fleet.conf at all", None, {"FLEET_CONF": os.path.join(TMP, "absent.conf")})):
+    r, calls = case("unset MODEL_DEFAULT refuses before claude runs: " + label, helper=True, conf_lines=[],
+                    model_line=model_line, env_extra=extra)
+    out = r.stdout + r.stderr
+    conf = (extra or {}).get("FLEET_CONF") or os.path.join(TMP, "fleet%d.conf" % n)
+    assert r.returncode == 1 and UNSET_REFUSAL in r.stderr, out
+    assert "to %s (or export MODEL_DEFAULT for this run), or pass --model." % conf in r.stderr, out
+    assert claude_record() == "" and calls == [], (claude_record(), calls)
+
+r, calls = case("unset in fleet.conf, exported: the exported id runs", helper=True, conf_lines=[],
+                model_line=None, env_extra={"MODEL_DEFAULT": "claude-opus-5-5"})
+assert r.returncode == 0 and settings_arg(r) == '{"model": "claude-opus-5-5"}', r.stdout + r.stderr
+
+r, calls = case("unset, but the caller passes --model: runs, nothing injected", helper=True, conf_lines=[],
+                model_line=None, args=("--model", "claude-fable-5-1", "-p", "say hi"))
+assert r.returncode == 0 and settings_arg(r) is None and "ARG claude-fable-5-1" in r.stdout, r.stdout + r.stderr
 
 r, calls = case("MODEL_DEFAULT from the environment wins over fleet.conf", helper=True, conf_lines=[],
                 model_line="MODEL_DEFAULT=claude-opus-5-5", env_extra={"MODEL_DEFAULT": "claude-fable-5-1"})

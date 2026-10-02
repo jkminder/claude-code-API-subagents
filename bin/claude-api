@@ -825,12 +825,13 @@ if [ "$explicit" -eq 0 ]; then
 fi
 
 # Default model: fleet.conf's MODEL_DEFAULT, the model the fleet's seats run
-# (Julian's D165 = A, 2026-10-02: workers follow the fleet default), and
-# claude-fable-5 when no fleet.conf names one. Headless sessions ignore the
-# `model` key in the worker settings.json (verified on Claude Code v2.1.222),
-# so the default is pinned via the --settings flagSettings scope instead. An
-# explicit --model wins; a caller-supplied --settings suppresses the injection
-# (neither reads MODEL_DEFAULT).
+# (Julian's D165 = A, 2026-10-02: workers follow the fleet default). It has no
+# built-in default (Julian's D73, 2026-09-02): unset, the worker refuses like
+# every seat launcher does, rather than guess a model. Headless sessions ignore
+# the `model` key in the worker settings.json (verified on Claude Code
+# v2.1.222), so the default is pinned via the --settings flagSettings scope
+# instead. An explicit --model wins; a caller-supplied --settings suppresses the
+# injection (neither reads MODEL_DEFAULT).
 has_settings=0 has_model=0
 for a in "$@"; do
   case "$a" in
@@ -847,7 +848,13 @@ done
 overlay=""
 [ "$AUTH_MODE" = enterprise ] && overlay=', "apiKeyHelper": ""'
 if [ "$has_settings" -eq 0 ] && [ "$has_model" -eq 0 ]; then
-  worker_model="$(fleet_key MODEL_DEFAULT claude-fable-5)"
+  worker_model="$(fleet_key MODEL_DEFAULT "")"
+  if [ -z "$worker_model" ]; then
+    echo "claude-api: MODEL_DEFAULT is not set — it has no built-in default. Add the line" >&2
+    echo "  MODEL_DEFAULT=claude-<family>-<n>" >&2
+    echo "to ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf} (or export MODEL_DEFAULT for this run), or pass --model. Refusing rather than guessing." >&2
+    exit 1
+  fi
   # The id goes onto the worker's command line (the --settings below) and into
   # the run ledger, so only the fleet's canonical id passes: the rule of
   # skills/handlers/bin/fleet_conf.sh fleet_model_required in agent-skills. A

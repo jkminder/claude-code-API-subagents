@@ -77,7 +77,7 @@ json,sys;d=json.load(open(sys.argv[1]));print(d["result"],d["session_id"])'
 - Fleet sessions and workers run fleet.conf's `MODEL_DEFAULT`
   (`claude-opus-5-5` on Julian's fleet since 2026-10-02). Happy-wrapped
   sessions get it as `--model`; `claude-api` pins it in each worker's
-  `--settings`, or the built-in `claude-fable-5` where no fleet.conf names one.
+  `--settings` and refuses to start a worker when it is unset.
   **Do not weaken it** — no `--model` on `claude-api`, no `model` override on
   a subagent.
 - The pin is a convention, not a block (Julian, 2026-08-11): `claude-api` still

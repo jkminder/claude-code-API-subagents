@@ -89,7 +89,7 @@ changed = False
 # Default worker model: fable. "claude-opus-5" was briefly the managed default,
 # so migrate it back; any other explicitly-chosen model is preserved. (Headless
 # runs ignore this key — bin/claude-api pins fleet.conf's MODEL_DEFAULT via
-# --settings, this same default only when no fleet.conf names one — but it
+# --settings and refuses when it is unset — but it
 # still governs interactive worker sessions.)
 if cfg.get("model") in (None, "claude-opus-5"):
     if cfg.get("model") != "claude-fable-5":
