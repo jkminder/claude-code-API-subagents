@@ -1,18 +1,22 @@
 ---
 name: delegate
-description: How to parallelize work. Built-in Claude Code subagents (the Agent tool) are the default in every session, including main and handler sessions. `claude-api` workers are optional — for standing workers, cross-repo isolation, and work that must outlive this session. Fleet sessions and workers are billed to one flat pool and run the fleet default model (fleet.conf `MODEL_DEFAULT`). Trigger on "delegate", "worker", "swarm", "spawn workers", "parallelize this", "run this in the background".
+description: How to parallelize work. Built-in Claude Code subagents (the Agent tool) are the default in every session, including main and handler sessions. `claude-api` workers are optional — for standing workers, cross-repo isolation, and work that must outlive this session. Fleet sessions and workers bill flat accounts (the API key, or the Enterprise seat) and run the fleet default model (fleet.conf `MODEL_DEFAULT`). Trigger on "delegate", "worker", "swarm", "spawn workers", "parallelize this", "run this in the background".
 ---
 
 # Delegating work
 
-The whole fleet is billed to one flat pool, not to Julian's subscription
-(decided 2026-08-15). Sessions are Happy-wrapped `claude` processes with
-`CLAUDE_CONFIG_DIR=~/.claude-api`, so a fleet session, its subagents, and any
-`claude-api` worker all bill that pool: the API key, or the Claude Enterprise
-seat when fleet.conf (`~/.config/fleet/fleet.conf`) sets `AUTH_MODE=enterprise`
-(Julian's fleet since 2026-10-02). Tokens are effectively free — parallelize
-whenever subtasks are independent. Latency and coordination are the only real
-costs.
+The fleet is not billed to Julian's subscription (decided 2026-08-15).
+Sessions are Happy-wrapped `claude` processes with
+`CLAUDE_CONFIG_DIR=~/.claude-api`. With fleet.conf
+(`~/.config/fleet/fleet.conf`) `AUTH_MODE=api`, every session and every
+`claude-api` worker bills the API key. With `AUTH_MODE=enterprise` (Julian's
+fleet since 2026-10-02) they bill the Claude Enterprise seat, except the
+processes that still run the identity's `apiKeyHelper` and bill the API key,
+such as a session started in local mode, a session's agent-team teammates and
+any `claude` started from a session's shell (the README's *How it works* has
+the full list). A session's subagents bill what the session bills. Both
+accounts are flat pools, so tokens are effectively free — parallelize whenever
+subtasks are independent. Latency and coordination are the only real costs.
 
 ## Default: built-in subagents
 

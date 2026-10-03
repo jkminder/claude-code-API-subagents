@@ -18,10 +18,11 @@ Session (CLAUDE_CONFIG_DIR=~/.claude-api → API key via its apiKeyHelper, or th
    └─ claude-api run <slug> ─▶ separate claude -p worker processes
                                (standing workers, isolated checkouts,
                                 work that must outlive the session)
-        everything above bills the same API key or Enterprise seat
+        everything above bills the API key, or the Enterprise seat
+        in enterprise mode (exceptions: How it works)
 ```
 
-Billing is the same either way, so pick by process properties instead: built-in subagents by default, a worker when you need one to stay alive between turns (`--stay`), to work in a separate checkout, or to keep running after its caller is gone.
+Both accounts are flat pools, so billing does not decide between a subagent and a worker; pick by process properties instead: built-in subagents by default, a worker when you need one to stay alive between turns (`--stay`), to work in a separate checkout, or to keep running after its caller is gone.
 
 ## Install (any machine — laptop or cluster)
 
@@ -46,7 +47,7 @@ Prerequisite: `claude` on PATH (`npm install -g @anthropic-ai/claude-code`); `~/
 
 Once installed, the `delegate` skill is available in every Claude Code session on the machine. Say "delegate …" or "swarm …" — or let the agent trigger it on its own for heavy work. Workers run in background; the agent monitors them, can message them mid-run, and reports results. Every run lands in the wrapper's ledger (`~/.claude-api/run/ledger.jsonl`, inspect with `claude-api ps`); the wrapper also appends a cost/session line to `~/.claude-api/cost-log.jsonl` for every finished run — failures carry a `"failed"` field (client-side estimate — in api mode the Console usage dashboard is authoritative).
 
-**Spawning:** `claude-api run <slug> "<task>"`, or `claude-api run <slug> --prompt-file <path>` — the one way to spawn a worker. **Use `--prompt-file` for any brief containing code, backticks or `$`:** a prompt passed as an argument goes through the caller's shell first, which executes backticks and `$( )` inside a double-quoted string, so the worker silently receives a brief with holes where the examples were. Nothing can detect this downstream — by the time `run` is called the text is already gone — so keep such briefs out of the shell entirely. The worker runs stream-json over a supervised FIFO: the answer lands on stdout (footer with cost, turn count, and resume handle on stderr), failures exit nonzero with diagnostics, cost is logged automatically — and the *same* worker can be steered mid-run with `claude-api send`. With nothing sent it behaves one-shot; `--stay` keeps it alive between turns until `claude-api end <slug>`. No default spend cap — pass `--max-budget-usd` (or set `CLAUDE_API_MAX_BUDGET_USD`) to bound a run. `run` refuses to spawn into a git tree with uncommitted changes (another session may be working there) — use `claude-api worktree add` for an isolated checkout, or override with `--allow-dirty`. One background Bash call from the agent's side — same spawn effort as the built-in Agent tool, and the same billing; what differs is worker startup latency and up-front permission grants, so for quick in-repo lookups the built-in Explore agent remains the faster tool.
+**Spawning:** `claude-api run <slug> "<task>"`, or `claude-api run <slug> --prompt-file <path>` — the one way to spawn a worker. **Use `--prompt-file` for any brief containing code, backticks or `$`:** a prompt passed as an argument goes through the caller's shell first, which executes backticks and `$( )` inside a double-quoted string, so the worker silently receives a brief with holes where the examples were. Nothing can detect this downstream — by the time `run` is called the text is already gone — so keep such briefs out of the shell entirely. The worker runs stream-json over a supervised FIFO: the answer lands on stdout (footer with cost, turn count, and resume handle on stderr), failures exit nonzero with diagnostics, cost is logged automatically — and the *same* worker can be steered mid-run with `claude-api send`. With nothing sent it behaves one-shot; `--stay` keeps it alive between turns until `claude-api end <slug>`. No default spend cap — pass `--max-budget-usd` (or set `CLAUDE_API_MAX_BUDGET_USD`) to bound a run. `run` refuses to spawn into a git tree with uncommitted changes (another session may be working there) — use `claude-api worktree add` for an isolated checkout, or override with `--allow-dirty`. One background Bash call from the agent's side — same spawn effort as the built-in Agent tool, and billing does not decide between them; what differs is worker startup latency and up-front permission grants, so for quick in-repo lookups the built-in Explore agent remains the faster tool.
 
 **Lifecycle:** `claude-api ps` (list workers + status; running workers show busy/idle) · `claude-api send <slug> "<msg>" [--wait]` (or `--message-file <path>` — a steering message quoting code hits the same shell trap as a run brief; `ask` and `answer` take `--question-file` / `--answer-file` for the same reason) / `claude-api reply <slug>` (message a running worker / read its last reply) · `claude-api end <slug>` (graceful finish: the worker completes its current turn and the run returns the answer-so-far) · `claude-api kill <pid>|--all` (immediate; also reaps supervisors on Linux) · `claude-api clean [--all]` (sweep dead keepers and stale artifacts) · `claude-api worktree add|list|clean` (isolated checkouts for parallel workers) · `claude-api doctor [--ping]` (install health) · `claude-api selftest` (re-validate the version-pinned behaviors after a Claude Code upgrade).
 
@@ -77,7 +78,7 @@ Headless workers never prompt — unauthorized tool calls are denied, so the mod
 | | Built-in Agent subagents | Delegated workers |
 |---|---|---|
 | Process | in-process, session identity | separate `claude -p` process |
-| Billing | the session's pool (API key or Enterprise seat) | the same pool |
+| Billing | what the session bills | the API key, or the Enterprise seat in enterprise mode |
 | Startup cost | low | full session startup (seconds) |
 | Lifetime | ends with the parent's turn | can stay alive (`--stay`) and outlive the parent session |
 | Working tree | the session's | its own, via `claude-api worktree add` |
