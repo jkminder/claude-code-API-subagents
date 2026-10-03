@@ -7,13 +7,18 @@ one-line fix on stderr, claude never starts, and no other part of the file
 reaches stdout or stderr. It also exits 3 when anything (a directory, a file,
 a dangling symlink) is at the Anthropic profile store path the child claude
 reads: $XDG_CONFIG_HOME/anthropic, else $HOME/.config/anthropic, each
-variable trimmed of surrounding whitespace. Before exec, claude-sub unsets
-every variable that outranks the login (ANTHROPIC_CONFIG_DIR, which names the
-store, included; XDG_CONFIG_HOME stays) and the calling Claude Code session's
-own variables. The config dir is $HOME/.claude-sub unless CLAUDE_SUB_CONFIG_DIR
-names another ($HOME/.claude, the dir before 2026-10-03, is never read on its
-own), and claude gets --model sonnet before the caller's arguments unless they
-carry their own --model. Check 16 of bin/selftest, cut out of the file and run
+variable trimmed of surrounding whitespace, and when the config dir's
+settings.json sets an apiKeyHelper or an env entry for a variable that
+outranks the login, or cannot be read or parsed (no value from it is shown).
+Before exec, claude-sub unsets every variable that outranks the login
+(ANTHROPIC_CONFIG_DIR, which names the store, and CLAUDE_SECURESTORAGE_CONFIG_DIR,
+also when empty, included; XDG_CONFIG_HOME stays) and the calling Claude Code
+session's own variables. The config dir is $HOME/.claude-sub unless
+CLAUDE_SUB_CONFIG_DIR names another; an inherited CLAUDE_CONFIG_DIR (every
+fleet seat carries $HOME/.claude-api) is neither run on nor named in a fix,
+and $HOME/.claude, the dir before 2026-10-03, is never read on its own.
+claude gets --model sonnet before the caller's arguments unless they carry
+their own --model. Check 16 of bin/selftest, cut out of the file and run
 alone, passes beside a profile store of the caller's (at
 $XDG_CONFIG_HOME/anthropic or $HOME/.config/anthropic) and shows claude-sub's
 exit code and stderr when it fails.
@@ -66,8 +71,17 @@ OLD_UNSET_VARS = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUT
                   "CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
                   "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_GATEWAY",
                   "CLAUDE_API_PARENT_SID", "CLAUDE_API_SPAWNER_SID"]
+# Four more in claude 2.1.288 (unset since 2026-10-03): the login's storage dir
+# and host-supplied auth (reviewer f1979 [9], f1954 [2]).
+HOST_VARS = ["CLAUDE_SECURESTORAGE_CONFIG_DIR", "CLAUDE_CODE_HOST_AUTH_ENV_VAR",
+             "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "CLAUDE_CODE_HOST_CREDS_FILE"]
+# Every variable that outranks the login: the settings check refuses an env
+# entry for any of them in the config dir's settings.json.
+AUTH_VARS = [v for v in OLD_UNSET_VARS if not v.startswith("CLAUDE_API_")] + NEW_AUTH_VARS + \
+    ["ANTHROPIC_CONFIG_DIR"] + HOST_VARS
 KEEP = "CLAUDE_SUB_TEST_KEEP"   # set beside them and never unset: proves the record sees what crosses
 MISSING = object()
+DIRECTORY = object()   # run(settings=DIRECTORY): settings.json is a directory, so it cannot be read
 n = 0
 
 
@@ -81,14 +95,16 @@ def creds(sub_type):
 
 
 def run(content=None, *, raw=None, unreadable=False, cfg_at="tmp", make_cfg=True, env_extra=None, home=None,
-        args=()):
+        args=(), settings=None):
     """claude-sub 'probe' <args> in a fresh throwaway HOME (`home`, when given,
     is one the caller made with fresh()). The config dir (cfg_at) is
     CLAUDE_SUB_CONFIG_DIR=<tmp>/cfgN ("tmp"), $HOME/.claude-sub with the
     variable unset ("default"), or CLAUDE_SUB_CONFIG_DIR=$HOME/.claude
     ("home_claude"); make_cfg=False leaves it uncreated. Its .credentials.json
     holds `content` as JSON, or the text `raw`, or is a directory with
-    unreadable, or is absent. An inherited XDG_CONFIG_HOME is dropped, like
+    unreadable, or is absent. Its settings.json is absent (settings None),
+    `settings` as JSON (a dict or list), the text `settings` (a str), or a
+    directory (DIRECTORY). An inherited XDG_CONFIG_HOME is dropped, like
     every CLAUDE* and ANTHROPIC* variable. Returns the result, the config dir
     and the fake claude's record (None when it never started)."""
     global n
@@ -112,6 +128,15 @@ def run(content=None, *, raw=None, unreadable=False, cfg_at="tmp", make_cfg=True
             f.write(raw)
     elif unreadable:
         os.makedirs(path)
+    spath = os.path.join(cfg, "settings.json")
+    if settings is DIRECTORY:
+        os.makedirs(spath)
+    elif isinstance(settings, str):
+        with open(spath, "w") as f:
+            f.write(settings)
+    elif settings is not None:
+        with open(spath, "w") as f:
+            json.dump(settings, f)
     if os.path.exists(REC):
         os.remove(REC)
     env = {k: v for k, v in os.environ.items()
@@ -189,6 +214,16 @@ def assert_refused(r, cfg, rec, detail, plain_login=False):
     assert FAKE_TOKEN not in out and "FAKEFAKE" not in out, out
 
 
+def assert_settings_refused(r, cfg, rec, detail, fix):
+    out = r.stdout + r.stderr
+    assert rec is None, "claude started beside a settings.json that outranks the login (rc %d)" % r.returncode
+    assert r.returncode == 3 and r.stdout == "", (r.returncode, out)
+    assert r.stderr == ("claude-sub: refused. Claude reads %s/settings.json, and %s. Fix: %s (claude-sub never "
+                        "prints a value from it).\n" % (cfg, detail, fix)), out
+    assert "\u2014" not in r.stderr, "an em dash in the refusal"
+    assert FAKE_TOKEN not in out and "FAKE" not in out, out
+
+
 def assert_store_refused(r, rec, store):
     out = r.stdout + r.stderr
     assert rec is None, "claude started beside a profile store (rc %d)" % r.returncode
@@ -238,6 +273,48 @@ def _():
 def _():
     r, cfg, rec = run(cfg_at="default", make_cfg=False)
     assert_refused(r, cfg, rec, "its .credentials.json does not exist")
+
+
+# Every fleet seat runs with CLAUDE_CONFIG_DIR=~/.claude-api, the identity all
+# workers share. claude-sub must neither run on it nor print a fix that logs
+# the personal account into it (reviewer f1979 [6]).
+def api_dir(home, sub_type=None):
+    """$HOME/.claude-api like the fleet's: a settings.json with a fake
+    apiKeyHelper, and a login of `sub_type` when given. Returns its path."""
+    path = os.path.join(home, ".claude-api")
+    os.makedirs(path)
+    with open(os.path.join(path, "settings.json"), "w") as f:
+        json.dump({"apiKeyHelper": "printf " + FAKE_TOKEN}, f)
+    if sub_type is not None:
+        with open(os.path.join(path, ".credentials.json"), "w") as f:
+            json.dump(creds(sub_type), f)
+    return path
+
+
+@case("an inherited CLAUDE_CONFIG_DIR=$HOME/.claude-api, max in $HOME/.claude-sub: claude starts on "
+      "$HOME/.claude-sub")
+def _():
+    home = fresh("home")
+    r, cfg, rec = run(creds("max"), cfg_at="default", home=home, env_extra={"CLAUDE_CONFIG_DIR": api_dir(home)})
+    assert_ran(r, cfg, rec)
+
+
+@case("an inherited CLAUDE_CONFIG_DIR=$HOME/.claude-api holding a max login, no $HOME/.claude-sub: refused, and "
+      "the fix names $HOME/.claude-sub, never $HOME/.claude-api")
+def _():
+    home = fresh("home")
+    r, cfg, rec = run(cfg_at="default", make_cfg=False, home=home,
+                      env_extra={"CLAUDE_CONFIG_DIR": api_dir(home, "max")})
+    assert_refused(r, cfg, rec, "its .credentials.json does not exist")
+    assert ".claude-api" not in r.stderr, r.stderr
+
+
+@case("CLAUDE_SUB_CONFIG_DIR set beside an inherited CLAUDE_CONFIG_DIR (an enterprise login there): claude starts "
+      "on CLAUDE_SUB_CONFIG_DIR")
+def _():
+    home = fresh("home")
+    r, cfg, rec = run(creds("max"), home=home, env_extra={"CLAUDE_CONFIG_DIR": api_dir(home, "enterprise")})
+    assert_ran(r, cfg, rec)
 
 
 MODEL_CASES = [   # (label, the caller's arguments after the prompt, claude's argv)
@@ -298,6 +375,7 @@ def _():
 
 for label, names in (("the calling session's variables", SESSION_VARS),
                      ("ANTHROPIC_UNIX_SOCKET, _FEDERATION_RULE_ID, _ORGANIZATION_ID and _PROFILE", NEW_AUTH_VARS),
+                     ("CLAUDE_SECURESTORAGE_CONFIG_DIR and the host-auth variables", HOST_VARS),
                      ("the variables claude-sub already unset", OLD_UNSET_VARS)):
     @case("%s, set in the parent, are absent in claude" % label)
     def _(names=names):
@@ -306,6 +384,65 @@ for label, names in (("the calling session's variables", SESSION_VARS),
         assert KEEP in seen, "the record misses a variable that crosses"
         left = [v for v in names if v in seen]
         assert not left, "still set in claude: %s" % left
+
+
+# claude 2.1.288 reads its login from CLAUDE_SECURESTORAGE_CONFIG_DIR when the
+# variable is defined, and from ~/.claude (Julian's Enterprise login) when it is
+# empty, so the empty value must go too (reviewer f1979 [9]).
+@case("CLAUDE_SECURESTORAGE_CONFIG_DIR set empty in the parent is absent in claude, and claude starts")
+def _():
+    r, cfg, rec = run(creds("max"), env_extra={"CLAUDE_SECURESTORAGE_CONFIG_DIR": "", KEEP: "1"})
+    seen = assert_ran(r, cfg, rec)
+    assert KEEP in seen, "the record misses a variable that crosses"
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in seen, "CLAUDE_SECURESTORAGE_CONFIG_DIR still set in claude"
+
+
+# The config dir's settings.json: an apiKeyHelper there, or an env entry for a
+# variable that outranks the login, would win over the login it checked
+# (reviewer f1954 [3], f1979 [10]). Values are fake tokens; none may show.
+SETS = "which claude would use instead of the subscription login"
+UNKNOWN = "so claude-sub cannot tell whether it sets an apiKeyHelper or an auth variable"
+SETTINGS_REFUSALS = [   # (label, settings, detail, fix)
+    ("an apiKeyHelper", {"apiKeyHelper": "printf " + FAKE_TOKEN}, "it sets apiKeyHelper, " + SETS,
+     "remove those keys from it"),
+    ("an env block with ANTHROPIC_API_KEY beside an unrelated entry",
+     {"env": {"ANTHROPIC_API_KEY": FAKE_TOKEN, "FOO": "1"}}, "it sets env.ANTHROPIC_API_KEY, " + SETS,
+     "remove those keys from it"),
+    ("an apiKeyHelper and an env block with CLAUDE_SECURESTORAGE_CONFIG_DIR set empty",
+     {"apiKeyHelper": "x", "env": {"CLAUDE_SECURESTORAGE_CONFIG_DIR": ""}},
+     "it sets apiKeyHelper, env.CLAUDE_SECURESTORAGE_CONFIG_DIR, " + SETS, "remove those keys from it"),
+    ("an env block naming every variable claude-sub unsets as outranking the login",
+     {"env": {v: FAKE_TOKEN for v in AUTH_VARS}},
+     "it sets %s, %s" % (", ".join("env." + v for v in sorted(AUTH_VARS)), SETS), "remove those keys from it"),
+    ("malformed JSON (a cut-off file)", '{"apiKeyHelper": "printf %s' % FAKE_TOKEN,
+     "it is not a JSON object with an object as env, " + UNKNOWN, "repair it"),
+    ("JSON that is not an object", [{"apiKeyHelper": "x"}], "it is not a JSON object with an object as env, " + UNKNOWN,
+     "repair it"),
+    ("an env that is not an object", {"env": ["ANTHROPIC_API_KEY=" + FAKE_TOKEN]},
+     "it is not a JSON object with an object as env, " + UNKNOWN, "repair it"),
+    ("a directory in place of the file", DIRECTORY, "it cannot be read, " + UNKNOWN,
+     "make it a readable file"),
+]
+for label, settings, detail, fix in SETTINGS_REFUSALS:
+    @case("max login, settings.json with %s: refused with exit 3 and the fix, claude never starts, no value shown"
+          % label)
+    def _(settings=settings, detail=detail, fix=fix):
+        r, cfg, rec = run(creds("max"), settings=settings)
+        assert_settings_refused(r, cfg, rec, detail, fix)
+
+
+@case("max login, settings.json with an empty apiKeyHelper, a model and env entries that outrank nothing: "
+      "claude starts")
+def _():
+    r, cfg, rec = run(creds("max"), settings={"apiKeyHelper": "", "model": "opus",
+                                               "env": {"FOO": "1", "ANTHROPIC_MODEL": "claude-sonnet-5"}})
+    assert_ran(r, cfg, rec)
+
+
+@case("the default config dir's settings.json with an apiKeyHelper: refused, naming $HOME/.claude-sub")
+def _():
+    r, cfg, rec = run(creds("max"), cfg_at="default", settings={"apiKeyHelper": "printf " + FAKE_TOKEN})
+    assert_settings_refused(r, cfg, rec, "it sets apiKeyHelper, " + SETS, "remove those keys from it")
 
 
 # The Anthropic profile store (claude 2.1.287, read from its binary on

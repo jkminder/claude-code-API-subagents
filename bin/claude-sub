@@ -46,6 +46,11 @@
 # Anything else (enterprise, team, an empty or missing field, a missing,
 # unreadable or malformed file) exits 3 with a one-line fix on stderr. No other
 # part of the file is ever printed: it holds the OAuth tokens.
+# The dir's settings.json is checked too: an apiKeyHelper there, or an env
+# entry for a variable that outranks the login, exits 3 the same way (its
+# values are never printed). An inherited CLAUDE_CONFIG_DIR is never used:
+# every fleet seat carries the fleet's ~/.claude-api, and a /login there would
+# put the personal login into the identity every worker shares.
 #
 # THE MODEL IS SONNET unless the caller passes its own --model (Julian,
 # 2026-10-03, D175: "no need to use fable for getting todoist things or
@@ -117,9 +122,18 @@ fi
 # connectors. Four more outrank the stored login in the installed claude 2.1.287
 # (read from its binary, 2026-10-02): ANTHROPIC_UNIX_SOCKET,
 # ANTHROPIC_FEDERATION_RULE_ID, ANTHROPIC_ORGANIZATION_ID and ANTHROPIC_PROFILE.
-# The helper is not an environment variable: it lives in a settings.json, and
-# CLAUDE_CONFIG_DIR below points at the subscription config dir, where the
-# fleet keeps none.
+# Four more in claude 2.1.288 (read from its binary, 2026-10-03):
+# CLAUDE_SECURESTORAGE_CONFIG_DIR names the dir claude reads its login from in
+# place of the config dir (set empty, it means ~/.claude, which holds Julian's
+# Enterprise login), so the dir claude-sub checks would not be the one claude
+# logs in from. CLAUDE_CODE_HOST_AUTH_ENV_VAR names a variable claude reads as
+# the auth token, and CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST with
+# CLAUDE_CODE_HOST_CREDS_FILE hands auth to a host application (claude groups
+# them with ANTHROPIC_UNIX_SOCKET).
+# The helper is not an environment variable: it lives in a settings.json. The
+# settings check before exec reads the config dir's settings.json and refuses
+# an apiKeyHelper there, or an env entry for any of the auth variables below
+# (claude applies a settings env block like an exported variable).
 #
 # An Anthropic profile store can outrank the login too (claude 2.1.287, read
 # from its binary on 2026-10-03). claude looks for the store at
@@ -147,17 +161,21 @@ fi
 # claude process), and its messaging socket and token
 # (CLAUDE_CODE_MESSAGING_SOCKET, CLAUDE_CODE_MESSAGING_TOKEN). The run
 # here is a separate one-shot session and must not start as part of the caller.
-unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_BASE_URL \
-      CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR \
-      CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY \
-      CLAUDE_CODE_USE_ANTHROPIC_AWS CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD \
-      CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_USE_GATEWAY \
-      ANTHROPIC_UNIX_SOCKET ANTHROPIC_FEDERATION_RULE_ID ANTHROPIC_ORGANIZATION_ID ANTHROPIC_PROFILE \
-      ANTHROPIC_CONFIG_DIR \
+auth_vars=(ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_BASE_URL
+           CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR
+           CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
+           CLAUDE_CODE_USE_ANTHROPIC_AWS CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD
+           CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_USE_GATEWAY
+           ANTHROPIC_UNIX_SOCKET ANTHROPIC_FEDERATION_RULE_ID ANTHROPIC_ORGANIZATION_ID ANTHROPIC_PROFILE
+           ANTHROPIC_CONFIG_DIR
+           CLAUDE_SECURESTORAGE_CONFIG_DIR CLAUDE_CODE_HOST_AUTH_ENV_VAR
+           CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST CLAUDE_CODE_HOST_CREDS_FILE)
+unset "${auth_vars[@]}" \
       CLAUDE_API_PARENT_SID CLAUDE_API_SPAWNER_SID \
       CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ID CLAUDE_CODE_SESSION_ATTENDED \
       CLAUDE_CODE_CHILD_SESSION CLAUDE_AGENT_SDK_VERSION CLAUDE_CODE_EXECPATH CLAUDE_PID \
       CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN
+# Replaces an inherited CLAUDE_CONFIG_DIR, never falls back to it (header).
 export CLAUDE_CONFIG_DIR="${CLAUDE_SUB_CONFIG_DIR:-$HOME/.claude-sub}"
 
 # The login check (header: THE LOGIN MUST BE JULIAN'S PERSONAL SUBSCRIPTION).
@@ -198,6 +216,44 @@ if [ "$check_rc" -ne 0 ] || { [ "$sub_type" != max ] && [ "$sub_type" != pro ]; 
   login_cmd="claude"
   [ "$CLAUDE_CONFIG_DIR" = "$HOME/.claude" ] || login_cmd="CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR claude"
   echo "claude-sub: refused. It needs Julian's personal claude.ai login (subscription type max or pro) in $CLAUDE_CONFIG_DIR, but $detail. Fix: in a devbox terminal run $login_cmd, type /login, choose the claude.ai subscription and sign in with the personal account." >&2
+  exit 3
+fi
+
+# The settings check (the comment above the unset list says why). python3
+# prints only key names: "apiKeyHelper" when it is set to anything but "", and
+# "env.<name>" for each name of auth_vars in the env block. A missing file
+# passes. Every other outcome is an exit code, so no value from the file
+# reaches a variable or the terminal.
+settings_keys="$(python3 - "$CLAUDE_CONFIG_DIR/settings.json" "${auth_vars[@]}" <<'PY'
+import json, sys
+path, names = sys.argv[1], set(sys.argv[2:])
+try:
+    with open(path) as f:
+        settings = json.load(f)
+except FileNotFoundError:
+    sys.exit(0)
+except OSError:
+    sys.exit(11)
+except ValueError:
+    sys.exit(12)
+env = settings.get("env", {}) if isinstance(settings, dict) else None
+if not isinstance(env, dict):
+    sys.exit(12)
+found = [] if settings.get("apiKeyHelper") in (None, "") else ["apiKeyHelper"]
+print(", ".join(found + ["env." + k for k in sorted(env) if k in names]))
+PY
+)"
+settings_rc=$?
+if [ "$settings_rc" -ne 0 ] || [ -n "$settings_keys" ]; then
+  unknown="so claude-sub cannot tell whether it sets an apiKeyHelper or an auth variable"
+  case "$settings_rc" in
+    0)  detail="it sets $settings_keys, which claude would use instead of the subscription login"
+        fix="remove those keys from it" ;;
+    11) detail="it cannot be read, $unknown"; fix="make it a readable file" ;;
+    12) detail="it is not a JSON object with an object as env, $unknown"; fix="repair it" ;;
+    *)  detail="python3 could not check it (exit $settings_rc)"; fix="check python3" ;;
+  esac
+  echo "claude-sub: refused. Claude reads $CLAUDE_CONFIG_DIR/settings.json, and $detail. Fix: $fix (claude-sub never prints a value from it)." >&2
   exit 3
 fi
 

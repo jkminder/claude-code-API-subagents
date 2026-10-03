@@ -115,11 +115,14 @@ claude.ai login, kept in its own config dir `~/.claude-sub` so his own
 `claude` can stay on the Enterprise account. That dir's `.credentials.json`
 must record subscription type `max` or `pro`. Exit 3 means it refused and
 claude never started: an Enterprise or Team login, a missing or malformed
-credentials file, or an Anthropic profile store at `$XDG_CONFIG_HOME/anthropic`
-(else `~/.config/anthropic`), whose profile claude can run on instead of the
-login without saying so. Only Julian can fix it; the stderr line names the fix
-(`CLAUDE_CONFIG_DIR=~/.claude-sub claude`, then `/login` to his personal
-account in a devbox terminal) or says to move the store away.
+credentials file, an `apiKeyHelper` or an auth variable's `env` entry in
+`~/.claude-sub/settings.json` (or a settings.json it cannot read or parse), or
+an Anthropic profile store at `$XDG_CONFIG_HOME/anthropic` (else
+`~/.config/anthropic`); claude would run on any of these instead of the login
+without saying so. An inherited `CLAUDE_CONFIG_DIR` (every fleet seat carries
+`~/.claude-api`) is never used. Only Julian can fix it; the stderr line names
+the fix (`CLAUDE_CONFIG_DIR=~/.claude-sub claude`, then `/login` to his
+personal account in a devbox terminal) or says what to remove or move away.
 
 ## Spawning workers
 
