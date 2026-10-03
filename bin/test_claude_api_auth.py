@@ -5,7 +5,10 @@ Enterprise OAuth token from 1Password (a fake with-op here) into
 CLAUDE_CODE_OAUTH_TOKEN for the worker and empties apiKeyHelper through the
 injected --settings (merged into the model pin; alone beside a caller's
 --model; a caller's own --settings is warned, not merged). Any other AUTH_MODE
-refuses without showing the value, and is a FAIL row in doctor. In enterprise
+refuses without showing the value, and is a FAIL row in doctor. An AUTH_MODE
+or OAUTH_TOKEN_REF exported empty is not set (fleet.conf's value applies) and
+reaches the worker, and doctor's children, still empty; a non-empty export
+wins over the file. In enterprise
 mode a leftover apiKeyHelper is a WARN row in doctor that names the workers it
 still reaches. The injected model is fleet.conf's
 MODEL_DEFAULT (Julian's D165 = A, 2026-10-02), with no built-in default: unset,
@@ -47,6 +50,7 @@ with open(os.path.join(FAKE_BIN, "claude"), "w") as f:
     f.write('#!/usr/bin/env bash\n'
             '{ echo CALL; for a in "$@"; do printf \'ARG %s\\n\' "$a"; done; } >> ' + repr(CLAUDE_REC) + '\n'
             'echo "CLAUDE_FAKE oauth_set=${CLAUDE_CODE_OAUTH_TOKEN:+1} len=${#CLAUDE_CODE_OAUTH_TOKEN}"\n'
+            'echo "CLAUDE_FAKE_ENV auth_mode=[${AUTH_MODE-unset}] ref=[${OAUTH_TOKEN_REF-unset}]"\n'
             'for a in "$@"; do printf \'ARG %s\\n\' "$a"; done\n')
 os.chmod(os.path.join(FAKE_BIN, "claude"), 0o755)
 REC = os.path.join(TMP, "op-calls.log")
@@ -55,12 +59,16 @@ OP = os.path.join(TMP, "fake-with-op")
 # the reference and its vault segment, literally. "op-2.38": op 2.38.1's own
 # wording for an item it cannot find (measured 2026-10-03), which repeats the
 # reference, the vault, the item and "<vault>/<item>" literally. The other
-# modes repeat a piece in a changed form (reviewer f1954 [1]).
+# modes repeat a piece in a changed form (reviewer f1954 [1]). FAKE_OP_ENV_OUT
+# names a file that gets the AUTH_MODE this child of the tool inherited.
 FAKE_OP = r'''#!/usr/bin/env python3
 import json, os, sys, urllib.parse
 args = sys.argv[1:]
 with open(@REC@, "a") as f:
     f.write(" ".join(args) + "\n")
+if os.environ.get("FAKE_OP_ENV_OUT"):
+    with open(os.environ["FAKE_OP_ENV_OUT"], "a") as f:
+        f.write("AUTH_MODE=[%s]\n" % os.environ.get("AUTH_MODE", "unset"))
 mode = os.environ.get("FAKE_OP_ECHO", "")
 if mode:
     ref = args[2]
@@ -199,6 +207,32 @@ refused_unshown(r, calls, FAKE_TOKEN, AUTH_REFUSAL)
 r, calls = case("a token-shaped AUTH_MODE in the environment refuses without showing it", helper=True,
                 conf_lines=["AUTH_MODE=api"], env_extra={"AUTH_MODE": FAKE_TOKEN})
 refused_unshown(r, calls, FAKE_TOKEN, AUTH_REFUSAL)
+
+# An AUTH_MODE exported empty is not set: fleet.conf's value (or the api
+# default) decides, and the worker inherits AUTH_MODE as the caller exported
+# it, still empty. claude-api used to assign the file's value to the inherited
+# name, which kept the export flag, so every worker carried the file's value
+# as an exported AUTH_MODE that a nested claude-api or happy-api reads as
+# winning over the file (reviewer r1965 [17]). A non-empty export still wins.
+# OAUTH_TOKEN_REF, exported empty beside it, reaches the worker empty too.
+EXPORTED_MODE = [   # (label, AUTH_MODE line in fleet.conf or None, exported AUTH_MODE, the mode that applies)
+    ("exported empty, fleet.conf says enterprise: enterprise", "AUTH_MODE=enterprise", "", "enterprise"),
+    ("exported empty, no AUTH_MODE line: the api default", None, "", "api"),
+    ("exported api, fleet.conf says enterprise: the export wins", "AUTH_MODE=enterprise", "api", "api"),
+]
+for label, mode_line, exported, mode in EXPORTED_MODE:
+    r, calls = case("AUTH_MODE %s; the worker sees AUTH_MODE as exported" % label, helper=True,
+                    conf_lines=([mode_line] if mode_line else []) + ["OAUTH_TOKEN_REF=" + TOKEN_REF],
+                    env_extra={"AUTH_MODE": exported, "OAUTH_TOKEN_REF": ""})
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    if mode == "enterprise":
+        assert calls == ["op read " + TOKEN_REF] and "CLAUDE_FAKE oauth_set=1 len=11" in r.stdout, (out, calls)
+        assert settings_arg(r) == '{"model": "claude-fable-5-1", "apiKeyHelper": ""}', out
+    else:
+        assert calls == [] and "CLAUDE_FAKE oauth_set= len=0" in r.stdout, (out, calls)
+        assert settings_arg(r) == '{"model": "claude-fable-5-1"}', out
+    assert "CLAUDE_FAKE_ENV auth_mode=[%s] ref=[]\n" % exported in r.stdout, out
 
 # --- a token pasted where the 1Password reference belongs: refused, never printed ---
 # With op working and failing, so neither the spawn nor the op-read failure line
@@ -373,6 +407,18 @@ for label, conf_lines in (("no AUTH_MODE line (api)", []), ("AUTH_MODE=api", ["A
                           ("AUTH_MODE=enterprise", ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF])):
     r, calls = doctor("%s has no AUTH_MODE FAIL row" % label, conf_lines)
     assert "AUTH_MODE (value not shown)" not in r.stdout + r.stderr, r.stdout + r.stderr
+# doctor reads AUTH_MODE as claude-api does: exported empty, fleet.conf's
+# enterprise applies, and doctor's children (op here, the --ping worker) inherit
+# AUTH_MODE still empty, not the file's value (reviewer r1965 [17]).
+OP_ENV = os.path.join(TMP, "op-env.log")
+r, calls = doctor("AUTH_MODE exported empty: fleet.conf's enterprise applies, op inherits AUTH_MODE empty",
+                  ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF], {"AUTH_MODE": "", "FAKE_OP_ENV_OUT": OP_ENV})
+conf = os.path.join(TMP, "docfleet%d.conf" % n)
+assert "  ok    AUTH_MODE=enterprise: OAUTH_TOKEN_REF set (not shown), from %s\n" % conf in r.stdout, r.stdout
+assert calls == ["op read " + TOKEN_REF], calls
+with open(OP_ENV) as f:
+    seen = f.read()
+assert seen == "AUTH_MODE=[]\n", seen
 
 # The OAUTH_TOKEN_REF shapes again, in doctor, plus a newline from the
 # environment (a variable of that name wins over fleet.conf, as in claude-api).

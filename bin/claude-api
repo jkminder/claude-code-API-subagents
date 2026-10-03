@@ -93,10 +93,15 @@ except OSError:
 print(val)
 PY
 }
-AUTH_MODE="$(fleet_key AUTH_MODE api)"
-# The reference read in enterprise mode lives in oauth_ref: an assignment to the
-# inherited name would hide an exported OAUTH_TOKEN_REF from fleet_key, and the
-# environment wins over fleet.conf here as in doctor and every fleet reader.
+# Both keys are read into names other than the keys' (auth_mode, oauth_ref). An
+# assignment to the inherited name keeps its export flag: with AUTH_MODE
+# exported empty (not set, so the file's value applies) it would export the
+# file's value to every worker, where a nested claude-api or happy-api reads it
+# as an exported variable that wins over the file, even after fleet.conf
+# changes (reviewer r1965 [17]). An empty OAUTH_TOKEN_REF assigned here would
+# hide an exported one from fleet_key. The environment wins over fleet.conf
+# here as in doctor and every fleet reader.
+auth_mode="$(fleet_key AUTH_MODE api)"
 oauth_ref=""
 
 # Framework subcommands.
@@ -652,7 +657,7 @@ sys.stdout.buffer.write(text.encode("utf-8", "surrogateescape"))
 }
 if [ "$meta" -eq 0 ]; then
   command -v python3 >/dev/null 2>&1 || { echo "claude-api: python3 is required (key-source check, run supervisor, worker-ctl)" >&2; exit 1; }
-  case "$AUTH_MODE" in
+  case "$auth_mode" in
     api) ;;
     enterprise)
       oauth_ref="$(fleet_key OAUTH_TOKEN_REF "")"
@@ -681,7 +686,7 @@ if [ "$meta" -eq 0 ]; then
     # (and, for a run worker, its .err file)
     *) echo "claude-api: AUTH_MODE (value not shown) is neither api nor enterprise. Fix ${FLEET_CONF:-$HOME/.config/fleet/fleet.conf} (an AUTH_MODE variable in the environment wins over the file)" >&2; exit 1 ;;
   esac
-  if [ "$AUTH_MODE" = api ] && [ -z "$(api_key_helper "$CONFIG_DIR")" ]; then
+  if [ "$auth_mode" = api ] && [ -z "$(api_key_helper "$CONFIG_DIR")" ]; then
     {
       echo "claude-api: no API key source — $CONFIG_DIR/settings.json has no apiKeyHelper."
       echo "  The worker fetches its key at runtime through that helper (Claude Code runs it in the"
@@ -714,7 +719,7 @@ fi
 # AUTH_MODE=enterprise: the Enterprise OAuth token, read from 1Password under
 # with-op for this one spawn, rides in the worker's environment (and nowhere
 # else). CLAUDE_API_WITH_OP: tests.
-if [ "$AUTH_MODE" = enterprise ]; then
+if [ "$auth_mode" = enterprise ]; then
   WITH_OP="${CLAUDE_API_WITH_OP:-$(command -v with-op 2>/dev/null || echo "$HOME/.local/bin/with-op")}"
   if ! oauth_token="$("$WITH_OP" op read "$oauth_ref" 2>/dev/null)" || [ -z "$oauth_token" ]; then
     # op's reason comes from a second read, held in memory and never in a file
@@ -858,7 +863,7 @@ done
 # own --settings is not merged into — warned, and the worker then bills the API
 # key as long as the helper is in settings.json.
 overlay=""
-[ "$AUTH_MODE" = enterprise ] && overlay=', "apiKeyHelper": ""'
+[ "$auth_mode" = enterprise ] && overlay=', "apiKeyHelper": ""'
 if [ "$has_settings" -eq 0 ] && [ "$has_model" -eq 0 ]; then
   worker_model="$(fleet_key MODEL_DEFAULT "")"
   if [ -z "$worker_model" ]; then
