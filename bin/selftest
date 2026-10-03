@@ -4,13 +4,13 @@
 # upgrades. Spends a few API-billed sonnet/haiku runs; the supervision-protocol
 # checks (7-9) and the guard/shim checks (11-19) use stub workers and are free.
 # SELFTEST_SKIP_LIVE=1 skips checks 1-10 and runs only 11-19 — use it to
-# iterate on the shim checks. Those use no credential, whatever AUTH_MODE the
-# box uses: they export AUTH_MODE=api and run claude-api against FAKE
-# apiKeyHelpers and stub claudes, and CLAUDE_API_WITH_OP points at a stub that
-# fails if anything calls op (check 19 asserts nothing did). They start no
-# claude session (doctor, in check 19, runs the installed claude for --version
-# only), and they need MODEL_DEFAULT (fleet.conf or the environment), without
-# which claude-api refuses to spawn.
+# iterate on the shim checks. Those use no credential and read none of the
+# box's fleet settings, whatever its AUTH_MODE: they run claude-api on their own
+# fleet.conf (AUTH_MODE=api and a MODEL_DEFAULT, without which claude-api
+# refuses to spawn) against FAKE apiKeyHelpers and stub claudes, and
+# CLAUDE_API_WITH_OP points at a stub that fails if anything calls op (check 19
+# asserts nothing did). They start no claude session (doctor, in check 19, runs
+# the installed claude for --version only).
 # (`claude-api ask` spawns nothing either, so check 18 is in the free block.)
 # The subagent gate and its check were retired 2026-08-15 (the fleet moved to
 # API billing permanently, so there is no subscription billing left to guard).
@@ -287,15 +287,19 @@ fi # SELFTEST_SKIP_LIVE (checks 7-10)
 ISO="$WORK/isoconfig"
 mkdir -p "$ISO" "$ISO/run"
 printf '{"apiKeyHelper": "printf sk-dummy-selftest"}\n' > "$ISO/settings.json"
-# claude-api reads AUTH_MODE from the caller's fleet.conf, and in
-# AUTH_MODE=enterprise every spawn reads the real Enterprise token through op.
-# So checks 11-19 run in api mode, whatever the box uses: AUTH_MODE=api is
-# exported (an exported value wins over fleet.conf; none of these checks tests
-# enterprise mode, and check 19 tests api mode). CLAUDE_API_WITH_OP points at a
-# stub that records each call (never its arguments, which hold a 1Password
+# claude-api reads AUTH_MODE and MODEL_DEFAULT from the caller's fleet.conf, and
+# in AUTH_MODE=enterprise every spawn reads the real Enterprise token through
+# op. So checks 11-19 read their own fleet.conf: AUTH_MODE=api (none of these
+# checks tests enterprise mode, and check 19 tests api mode) and a MODEL_DEFAULT
+# (required since 2026-10-02; check 13's depth-2 spawn runs under a throwaway
+# HOME, where the default path holds no file). The environment wins over the
+# file, so the three keys it could carry are unset. CLAUDE_API_WITH_OP points at
+# a stub that records each call (never its arguments, which hold a 1Password
 # reference) and fails, so whatever still reaches op fails a check instead of
 # reading a credential; check 19 asserts the stub recorded no call.
-export AUTH_MODE=api
+unset AUTH_MODE OAUTH_TOKEN_REF MODEL_DEFAULT
+export FLEET_CONF="$WORK/fleet.conf"
+printf 'AUTH_MODE=api\nMODEL_DEFAULT=claude-opus-5-5\n' > "$FLEET_CONF"
 cat > "$WORK/op-stub" <<'EOF'
 #!/usr/bin/env bash
 echo called >> "$0.calls"
@@ -311,24 +315,6 @@ if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
   printf 'acceptEdits' > "$ISO/run/permission-mode-$CLAUDE_CODE_SESSION_ID"
 fi
 IRWDIR="$ISO/run/workers/${CLAUDE_CODE_SESSION_ID:-manual}"
-# The free checks read their own fleet.conf, never the machine's: AUTH_MODE=api,
-# whose helper rules check 19 tests (under the fleet's AUTH_MODE=enterprise every
-# stub spawn read the real Enterprise token from 1Password, and check 19's
-# no-helper case spawned instead of refusing), and a MODEL_DEFAULT, required
-# since 2026-10-02 (check 13's depth-2 spawn runs under a throwaway HOME, so it
-# found no fleet.conf at all). The environment wins over the file, so the keys
-# are unset here. with-op is a stub that fails the run: no free check may read
-# a token.
-unset AUTH_MODE OAUTH_TOKEN_REF MODEL_DEFAULT
-export FLEET_CONF="$WORK/fleet.conf"
-printf 'AUTH_MODE=api\nMODEL_DEFAULT=claude-opus-5-5\n' > "$FLEET_CONF"
-cat > "$WORK/with-op-refuses" <<'EOF'
-#!/usr/bin/env bash
-echo "selftest: a free check called with-op; none may read a token" >&2
-exit 1
-EOF
-chmod +x "$WORK/with-op-refuses"
-export CLAUDE_API_WITH_OP="$WORK/with-op-refuses"
 
 step "11/19 run: dirty-tree guard — refuses in a dirty repo, skipped outside a repo"
 git init -q dirtyrepo
