@@ -288,6 +288,24 @@ if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
   printf 'acceptEdits' > "$ISO/run/permission-mode-$CLAUDE_CODE_SESSION_ID"
 fi
 IRWDIR="$ISO/run/workers/${CLAUDE_CODE_SESSION_ID:-manual}"
+# The free checks read their own fleet.conf, never the machine's: AUTH_MODE=api,
+# whose helper rules check 19 tests (under the fleet's AUTH_MODE=enterprise every
+# stub spawn read the real Enterprise token from 1Password, and check 19's
+# no-helper case spawned instead of refusing), and a MODEL_DEFAULT, required
+# since 2026-10-02 (check 13's depth-2 spawn runs under a throwaway HOME, so it
+# found no fleet.conf at all). The environment wins over the file, so the keys
+# are unset here. with-op is a stub that fails the run: no free check may read
+# a token.
+unset AUTH_MODE OAUTH_TOKEN_REF MODEL_DEFAULT
+export FLEET_CONF="$WORK/fleet.conf"
+printf 'AUTH_MODE=api\nMODEL_DEFAULT=claude-opus-5-5\n' > "$FLEET_CONF"
+cat > "$WORK/with-op-refuses" <<'EOF'
+#!/usr/bin/env bash
+echo "selftest: a free check called with-op; none may read a token" >&2
+exit 1
+EOF
+chmod +x "$WORK/with-op-refuses"
+export CLAUDE_API_WITH_OP="$WORK/with-op-refuses"
 
 step "11/19 run: dirty-tree guard — refuses in a dirty repo, skipped outside a repo"
 git init -q dirtyrepo
