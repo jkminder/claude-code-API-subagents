@@ -13,7 +13,10 @@ store, included; XDG_CONFIG_HOME stays) and the calling Claude Code session's
 own variables. The config dir is $HOME/.claude-sub unless CLAUDE_SUB_CONFIG_DIR
 names another ($HOME/.claude, the dir before 2026-10-03, is never read on its
 own), and claude gets --model sonnet before the caller's arguments unless they
-carry their own --model.
+carry their own --model. Check 16 of bin/selftest, cut out of the file and run
+alone, passes beside a profile store of the caller's (at
+$XDG_CONFIG_HOME/anthropic or $HOME/.config/anthropic) and shows claude-sub's
+exit code and stderr when it fails.
 Hermetic: a throwaway HOME and config dir, no inherited XDG_CONFIG_HOME, fake
 profile stores holding fake data, a fake claude on PATH that records
 its argv, its CLAUDE_CONFIG_DIR (a path this test made) and the NAMES of its
@@ -24,6 +27,8 @@ Run: python3 bin/test_claude_sub.py
 import atexit
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -360,6 +365,68 @@ for label, xdg, kind in HOME_STORES:
         store = make_store(os.path.join(home, ".config", "anthropic"), kind)
         r, cfg, rec = run(creds("max"), home=home, env_extra=None if xdg is None else {"XDG_CONFIG_HOME": xdg})
         assert_store_refused(r, rec, store)
+
+
+# selftest's check 16 runs claude-sub against a stub claude. It used to inherit
+# the caller's HOME and XDG_CONFIG_HOME, so a store of the caller's failed it as
+# "claude-sub passed through: ''", the reason left in a file (reviewer r1965
+# [18]). selftest as a whole reads the caller's real fleet.conf, so these cases
+# cut the check out of bin/selftest (its step line up to the next step line)
+# and run it alone with selftest's own step/ok/bad helpers, in a throwaway
+# work dir and HOME.
+SELFTEST = os.path.join(HERE, "selftest")
+
+
+def selftest_check16(bin_dir, home, xdg=None):
+    """The claude-sub check of bin/selftest, alone, with claude-sub from
+    bin_dir, the caller's HOME `home` and XDG_CONFIG_HOME `xdg` (None: unset).
+    Returns the result."""
+    with open(SELFTEST) as f:
+        lines = f.read().splitlines(keepends=True)
+    steps = [i for i, l in enumerate(lines) if l.startswith('step "')]
+    start = [i for i in steps if "claude-sub" in lines[i]]
+    assert len(start) == 1, "selftest has %d claude-sub checks" % len(start)
+    end = [i for i in steps if i > start[0]]
+    assert end, "no step after the claude-sub check"
+    helpers = [l for l in lines if re.match(r"(step|ok|bad)\(\) ", l)]
+    assert len(helpers) == 3, helpers
+    work = fresh("work")
+    script = ("set -uo pipefail\nfails=0\nWORK=%s\nBIN_DIR=%s\n" % (shlex.quote(work), shlex.quote(bin_dir))
+              + "".join(helpers) + 'cd "$WORK" || exit 99\n' + "".join(lines[start[0]:end[0]])
+              + '[ "$fails" -eq 0 ]\n')
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("CLAUDE", "ANTHROPIC")) and k != "XDG_CONFIG_HOME"}
+    env["HOME"] = home
+    if xdg is not None:
+        env["XDG_CONFIG_HOME"] = xdg
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60, cwd=work,
+                          stdin=subprocess.DEVNULL)
+
+
+CALLER_STORES = [   # (label, store under XDG_CONFIG_HOME rather than HOME)
+    ("a store at the caller's $XDG_CONFIG_HOME/anthropic", True),
+    ("a store at the caller's $HOME/.config/anthropic, XDG_CONFIG_HOME unset", False),
+]
+for label, under_xdg in CALLER_STORES:
+    @case("selftest check 16 beside %s: PASS (it runs in its own HOME, XDG_CONFIG_HOME unset)" % label)
+    def _(under_xdg=under_xdg):
+        home, xdg = fresh("home"), fresh("xdg") if under_xdg else None
+        make_store(os.path.join(xdg, "anthropic") if under_xdg else os.path.join(home, ".config", "anthropic"))
+        r = selftest_check16(HERE, home, xdg)
+        assert r.returncode == 0 and "   PASS\n" in r.stdout and "FAIL" not in r.stdout, (r.returncode, r.stdout,
+                                                                                       r.stderr)
+
+
+@case("selftest check 16 when claude-sub fails: the FAIL line carries its exit code and stderr")
+def _():
+    stub_dir = fresh("stubbin")
+    with open(os.path.join(stub_dir, "claude-sub"), "w") as f:
+        f.write("#!/usr/bin/env bash\necho 'claude-sub: refused. STUB REASON' >&2\necho 'second line' >&2\nexit 3\n")
+    os.chmod(os.path.join(stub_dir, "claude-sub"), 0o755)
+    r = selftest_check16(stub_dir, fresh("home"))
+    assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+    assert ("   FAIL: claude-sub (exit 3) passed through: ''; its stderr: claude-sub: refused. STUB REASON "
+            "second line \n") in r.stdout, r.stdout
 
 
 failed = []
