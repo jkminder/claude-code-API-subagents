@@ -25,13 +25,16 @@ fake op echoes the reference back, literally as op 2.38.1 does or in a changed
 form) is shown with the reference and each of its segments replaced by <ref>,
 or withheld whole when 6 letters or digits in a row from the reference survive
 that (compared in any letter case); op's message is read into memory, never
-into a file. Hermetic: throwaway HOME and config dir, a fake
+into a file. selftest's no-API checks (SELFTEST_SKIP_LIVE=1), run beside a
+fleet.conf that says AUTH_MODE=enterprise, pass without calling with-op, op or
+a claude session. Hermetic: throwaway HOME and config dir, a fake
 claude on PATH, no key, no network.
 Run: python3 bin/test_claude_api_auth.py
 """
 import atexit
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -674,4 +677,44 @@ r2 = subprocess.run(["bash", CLAUDE_API, "--version"], capture_output=True, text
 assert r2.returncode == 0 and "CLAUDE_FAKE oauth_set= len=0" in r2.stdout, r2.stdout + r2.stderr
 assert not os.path.exists(REC), "a meta command read the token"
 print("ok  a meta command (--version) under enterprise conf passes through without a token (rc %d)" % r2.returncode)
+
+# selftest's no-API checks (11-19, what SELFTEST_SKIP_LIVE=1 runs) use no
+# credential, whatever AUTH_MODE the box uses: they export AUTH_MODE=api, and
+# CLAUDE_API_WITH_OP points at a stub that fails if called. They used to take
+# AUTH_MODE from the caller's fleet.conf, so on an enterprise box every
+# claude-api spawn in them read the real Enterprise token through with-op. Here
+# selftest runs through that switch (checks 1-10 never start) in a throwaway
+# HOME, TMPDIR and fleet.conf that says AUTH_MODE=enterprise, with a fake
+# reference and a MODEL_DEFAULT like a fleet box. Traps for with-op, op and a
+# claude session sit first on PATH: on a real box those would be the real
+# ones, so any call to them fails this case (the claude trap answers --version,
+# which doctor asks in check 19).
+st_dir = os.path.join(TMP, "selftest")
+st_trapbin, st_home, st_tmp = (os.path.join(st_dir, d) for d in ("trapbin", "home", "tmp"))
+for d in (st_trapbin, st_home, st_tmp):
+    os.makedirs(d)
+ST_TRAPS = os.path.join(st_dir, "traps.log")
+for name, body in (("with-op", "echo with-op >> %s\nexit 98\n"), ("op", "echo op >> %s\nexit 98\n"),
+                   ("claude", '[ "$*" = --version ] && { echo "0.0.0 (trap)"; exit 0; }\necho claude >> %s\nexit 98\n')):
+    with open(os.path.join(st_trapbin, name), "w") as f:
+        f.write("#!/usr/bin/env bash\n" + body % shlex.quote(ST_TRAPS))
+    os.chmod(os.path.join(st_trapbin, name), 0o755)
+st_conf = os.path.join(st_dir, "fleet.conf")
+with open(st_conf, "w") as f:
+    f.write("AUTH_MODE=enterprise\nOAUTH_TOKEN_REF=op://Selftest Vault/Selftest Item/credential\n"
+            "MODEL_DEFAULT=claude-opus-5-5\n")
+st_env = {k: v for k, v in os.environ.items()
+          if not k.startswith(("CLAUDE", "ANTHROPIC", "SELFTEST_"))
+          and k not in ("AUTH_MODE", "OAUTH_TOKEN_REF", "MODEL_DEFAULT", "XDG_CONFIG_HOME")}
+st_env.update({"HOME": st_home, "TMPDIR": st_tmp, "FLEET_CONF": st_conf, "SELFTEST_SKIP_LIVE": "1",
+               "PATH": st_trapbin + os.pathsep + os.environ.get("PATH", "")})
+r = subprocess.run(["bash", os.path.join(HERE, "selftest")], capture_output=True, text=True, env=st_env, timeout=600,
+                   cwd=st_tmp, stdin=subprocess.DEVNULL)
+n += 1
+print("ok  selftest checks 11-19 beside an enterprise fleet.conf (rc %d)" % r.returncode)
+traps = open(ST_TRAPS).read() if os.path.exists(ST_TRAPS) else ""
+assert traps == "", ("with-op, op or a claude session on PATH ran", traps, r.stdout)
+assert r.returncode == 0 and "selftest: checks 11-19 passed (live checks 1-10 SKIPPED)\n" in r.stdout, \
+    r.stdout + r.stderr
+assert r.stdout.count("   PASS\n") == 9 and "FAIL" not in r.stdout, r.stdout
 print("all %d claude-api auth cases passed" % (n + 1))
