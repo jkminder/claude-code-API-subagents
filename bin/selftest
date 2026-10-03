@@ -925,8 +925,12 @@ HOME="$WORK/dochome" CLAUDE_API_CONFIG_DIR="$DOC" "$BIN_DIR/doctor" > t19doc3.ou
 grep -q 'FAIL  no apiKeyHelper' t19doc3.out || k_fail "doctor without a helper: want 'FAIL  no apiKeyHelper' (t19doc3.out)"
 grep -q 'store-key' t19doc1.out t19doc2.out t19doc3.out && k_fail "doctor output still points at store-key"
 # (f) nothing in checks 11-19 reached op: the stub CLAUDE_API_WITH_OP points at
-# records every call.
-[ -e "$WORK/op-stub.calls" ] && k_fail "op was called in checks 11-19: the op stub recorded $(wc -l < "$WORK/op-stub.calls") call(s) (the t*.err files name the failing spawns)"
+# records every call. A spawn that reaches op also fails the steps above, and
+# k_fail keeps only the first reason, so this one goes ahead of it: it says why.
+if [ -e "$WORK/op-stub.calls" ]; then
+  k_ok=0
+  k_why="op was called in checks 11-19: the op stub recorded $(wc -l < "$WORK/op-stub.calls") call(s) (the t*.err files name the failing spawns)${k_why:+; first other reason: $k_why}"
+fi
 if [ "$k_ok" -eq 1 ]; then
   ok
 else

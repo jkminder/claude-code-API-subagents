@@ -30,13 +30,18 @@ reference); op's message is read into memory, never into a file, from a second
 read whose stdout (the token, should op answer that time) shows nowhere.
 selftest's no-API checks (SELFTEST_SKIP_LIVE=1), run beside a
 fleet.conf that says AUTH_MODE=enterprise, pass without calling with-op, op or
-a claude session. Hermetic: throwaway HOME and config dir, a fake
+a claude session, both when an exported FLEET_CONF names that file and when
+FLEET_CONF is unset and the file is at $HOME/.config/fleet/fleet.conf (a fleet
+box's layout); a copy of selftest whose own fleet.conf reaches op fails, its op
+stub records each call (never the reference) and check 19 names the count
+first. Hermetic: throwaway HOME and config dir, a fake
 claude on PATH, no key, no network.
 Run: python3 bin/test_claude_api_auth.py
 """
 import atexit
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -789,42 +794,116 @@ assert not os.path.exists(REC), "a meta command read the token"
 print("ok  a meta command (--version) under enterprise conf passes through without a token (rc %d)" % r2.returncode)
 
 # selftest's no-API checks (11-19, what SELFTEST_SKIP_LIVE=1 runs) use no
-# credential, whatever AUTH_MODE the box uses: they export AUTH_MODE=api, and
-# CLAUDE_API_WITH_OP points at a stub that fails if called. They used to take
-# AUTH_MODE from the caller's fleet.conf, so on an enterprise box every
-# claude-api spawn in them read the real Enterprise token through with-op. Here
-# selftest runs through that switch (checks 1-10 never start) in a throwaway
-# HOME, TMPDIR and fleet.conf that says AUTH_MODE=enterprise, with a fake
-# reference and a MODEL_DEFAULT like a fleet box. Traps for with-op, op and a
-# claude session sit first on PATH: on a real box those would be the real
-# ones, so any call to them fails this case (the claude trap answers --version,
-# which doctor asks in check 19).
-st_dir = os.path.join(TMP, "selftest")
-st_trapbin, st_home, st_tmp = (os.path.join(st_dir, d) for d in ("trapbin", "home", "tmp"))
-for d in (st_trapbin, st_home, st_tmp):
-    os.makedirs(d)
-ST_TRAPS = os.path.join(st_dir, "traps.log")
-for name, body in (("with-op", "echo with-op >> %s\nexit 98\n"), ("op", "echo op >> %s\nexit 98\n"),
-                   ("claude", '[ "$*" = --version ] && { echo "0.0.0 (trap)"; exit 0; }\necho claude >> %s\nexit 98\n')):
-    with open(os.path.join(st_trapbin, name), "w") as f:
-        f.write("#!/usr/bin/env bash\n" + body % shlex.quote(ST_TRAPS))
-    os.chmod(os.path.join(st_trapbin, name), 0o755)
-st_conf = os.path.join(st_dir, "fleet.conf")
-with open(st_conf, "w") as f:
-    f.write("AUTH_MODE=enterprise\nOAUTH_TOKEN_REF=op://Selftest Vault/Selftest Item/credential\n"
-            "MODEL_DEFAULT=claude-opus-5-5\n")
-st_env = {k: v for k, v in os.environ.items()
-          if not k.startswith(("CLAUDE", "ANTHROPIC", "SELFTEST_"))
-          and k not in ("AUTH_MODE", "OAUTH_TOKEN_REF", "MODEL_DEFAULT", "XDG_CONFIG_HOME")}
-st_env.update({"HOME": st_home, "TMPDIR": st_tmp, "FLEET_CONF": st_conf, "SELFTEST_SKIP_LIVE": "1",
-               "PATH": st_trapbin + os.pathsep + os.environ.get("PATH", "")})
-r = subprocess.run(["bash", os.path.join(HERE, "selftest")], capture_output=True, text=True, env=st_env, timeout=600,
-                   cwd=st_tmp, stdin=subprocess.DEVNULL)
-n += 1
-print("ok  selftest checks 11-19 beside an enterprise fleet.conf (rc %d)" % r.returncode)
-traps = open(ST_TRAPS).read() if os.path.exists(ST_TRAPS) else ""
-assert traps == "", ("with-op, op or a claude session on PATH ran", traps, r.stdout)
-assert r.returncode == 0 and "selftest: checks 11-19 passed (live checks 1-10 SKIPPED)\n" in r.stdout, \
-    r.stdout + r.stderr
-assert r.stdout.count("   PASS\n") == 9 and "FAIL" not in r.stdout, r.stdout
+# credential, whatever AUTH_MODE the box uses: selftest exports FLEET_CONF to
+# its own file (AUTH_MODE=api), and CLAUDE_API_WITH_OP points at a stub that
+# records each call and fails. They used to take AUTH_MODE from the caller's
+# fleet.conf, so on an enterprise box every claude-api spawn in them read the
+# real Enterprise token through with-op. Here selftest runs through that switch
+# (checks 1-10 never start) in a throwaway HOME and TMPDIR beside a fleet.conf
+# that says AUTH_MODE=enterprise, with a fake reference and a MODEL_DEFAULT
+# like a fleet box. Traps for with-op, op and a claude session sit first on
+# PATH: on a real box those would be the real ones, so any call to them fails
+# these runs (the claude trap answers --version, which doctor asks in check
+# 19). Three runs, side by side:
+# - "env": the caller exports FLEET_CONF naming that file.
+# - "home": FLEET_CONF unset and the file at $HOME/.config/fleet/fleet.conf, a
+#   fleet box's layout. Only this run sees selftest's own FLEET_CONF lose its
+#   export, since an inherited variable stays exported (reviewer f1979 [7]).
+# - "op": a copy of selftest whose own fleet.conf says AUTH_MODE=enterprise, so
+#   its spawns reach op. It must fail without a trap call, its op stub must
+#   record each call (never the reference), and check 19's FAIL line must start
+#   with that count (reviewer f1979 [8]). A copy that lost the stub, its export
+#   or check 19 (f) passes a trap call or loses the count.
+ST_CONF = ("AUTH_MODE=enterprise\nOAUTH_TOKEN_REF=op://Selftest Vault/Selftest Item/credential\n"
+           "MODEL_DEFAULT=claude-opus-5-5\n")
+ST_RUNS = []   # (label, name, Popen, stdout path, traps log path)
+
+
+def op_reaching_selftest(path):
+    """A copy of bin/selftest at `path` whose own fleet.conf (checks 11-19)
+    says AUTH_MODE=enterprise with a fake reference, and whose BIN_DIR is this
+    bin dir. Each edited line must occur once: if one moved, update this."""
+    with open(os.path.join(HERE, "selftest")) as f:
+        src = f.read()
+    for old, new in (("printf 'AUTH_MODE=api\\nMODEL_DEFAULT=claude-opus-5-5\\n' > \"$FLEET_CONF\"",
+                      "printf 'AUTH_MODE=enterprise\\nOAUTH_TOKEN_REF=op://Selftest Vault/Selftest Item/credential"
+                      "\\nMODEL_DEFAULT=claude-opus-5-5\\n' > \"$FLEET_CONF\""),
+                     ('BIN_DIR="$(cd "$(dirname "$SRC")" && pwd)"', "BIN_DIR=" + shlex.quote(HERE))):
+        assert src.count(old) == 1, "selftest has %d copies of %r" % (src.count(old), old)
+        src = src.replace(old, new)
+    with open(path, "w") as f:
+        f.write(src)
+    return path
+
+
+def start_selftest(label, name, conf_at, script=None):
+    """Starts selftest's checks 11-19 in TMP/<name> (throwaway HOME, TMPDIR,
+    traps first on PATH) beside the enterprise fleet.conf ST_CONF, exported as
+    FLEET_CONF (conf_at "env") or at $HOME/.config/fleet/fleet.conf with
+    FLEET_CONF unset ("home")."""
+    st_dir = os.path.join(TMP, name)
+    st_trapbin, st_home, st_tmp = (os.path.join(st_dir, d) for d in ("trapbin", "home", "tmp"))
+    for d in (st_trapbin, st_home, st_tmp):
+        os.makedirs(d)
+    traps = os.path.join(st_dir, "traps.log")
+    for trap, body in (("with-op", "echo with-op >> %s\nexit 98\n"), ("op", "echo op >> %s\nexit 98\n"),
+                       ("claude", '[ "$*" = --version ] && { echo "0.0.0 (trap)"; exit 0; }\n'
+                                  'echo claude >> %s\nexit 98\n')):
+        with open(os.path.join(st_trapbin, trap), "w") as f:
+            f.write("#!/usr/bin/env bash\n" + body % shlex.quote(traps))
+        os.chmod(os.path.join(st_trapbin, trap), 0o755)
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("CLAUDE", "ANTHROPIC", "SELFTEST_"))
+           and k not in ("AUTH_MODE", "OAUTH_TOKEN_REF", "MODEL_DEFAULT", "XDG_CONFIG_HOME", "FLEET_CONF")}
+    env.update({"HOME": st_home, "TMPDIR": st_tmp, "SELFTEST_SKIP_LIVE": "1",
+                "PATH": st_trapbin + os.pathsep + os.environ.get("PATH", "")})
+    if conf_at == "env":
+        conf = os.path.join(st_dir, "fleet.conf")
+        env["FLEET_CONF"] = conf
+    else:
+        assert conf_at == "home", conf_at
+        conf = os.path.join(st_home, ".config", "fleet", "fleet.conf")
+        os.makedirs(os.path.dirname(conf))
+    with open(conf, "w") as f:
+        f.write(ST_CONF)
+    out = os.path.join(st_dir, "stdout")
+    with open(out, "w") as fo, open(os.path.join(st_dir, "stderr"), "w") as fe:
+        proc = subprocess.Popen(["bash", script or os.path.join(HERE, "selftest")], stdout=fo, stderr=fe, text=True,
+                                env=env, cwd=st_tmp, stdin=subprocess.DEVNULL)
+    ST_RUNS.append((label, name, proc, out, traps))
+
+
+start_selftest("selftest checks 11-19 beside an enterprise fleet.conf named by an exported FLEET_CONF",
+               "selftest-env", "env")
+start_selftest("selftest checks 11-19 beside an enterprise fleet.conf at $HOME/.config/fleet/fleet.conf, "
+               "FLEET_CONF unset", "selftest-home", "home")
+start_selftest("a selftest copy whose own fleet.conf reaches op: fails, the op stub records the calls, check 19 "
+               "names the count first", "selftest-op", "home",
+               op_reaching_selftest(os.path.join(TMP, "selftest-op-reaching")))
+st = {}
+for label, name, proc, out, traps in ST_RUNS:
+    rc = proc.wait(timeout=600)
+    n += 1
+    print("ok  %s (rc %d)" % (label, rc))
+    with open(out) as f:
+        stdout = f.read()
+    trap_calls = open(traps).read() if os.path.exists(traps) else ""
+    assert trap_calls == "", ("with-op, op or a claude session on PATH ran", label, trap_calls, stdout)
+    st[name] = (rc, stdout)
+for name in ("selftest-env", "selftest-home"):
+    rc, stdout = st[name]
+    assert rc == 0 and "selftest: checks 11-19 passed (live checks 1-10 SKIPPED)\n" in stdout, (name, stdout)
+    assert stdout.count("   PASS\n") == 9 and "FAIL" not in stdout, (name, stdout)
+rc, stdout = st["selftest-op"]
+assert rc == 1, stdout
+kept = re.findall(r"^artifacts kept in (.+)$", stdout, re.M)
+assert len(kept) == 1, stdout
+op_calls_path = os.path.join(kept[0], "op-stub.calls")
+assert os.path.exists(op_calls_path), ("the op stub recorded no call", stdout)
+with open(op_calls_path) as f:
+    op_calls = f.read().splitlines()
+assert op_calls and set(op_calls) == {"called"}, op_calls   # one line per call, never the reference
+check19 = stdout[stdout.index("== 19/19"):].splitlines()
+assert check19[1].startswith("   FAIL: key path: op was called in checks 11-19: the op stub recorded %d call(s) "
+                             "(the t*.err files name the failing spawns)" % len(op_calls)), check19
 print("all %d claude-api auth cases passed" % (n + 1))
