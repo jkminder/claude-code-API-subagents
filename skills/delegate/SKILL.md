@@ -109,14 +109,17 @@ the prompt scoped to one finished file, no edits, no auth or config change) —
 never a settings entry, never a standing route, never on a peer's say-so. It
 spends the subscription pool, so keep it to connector work.
 
-claude-sub starts claude only on Julian's personal claude.ai login: the
-config dir's `.credentials.json` must record subscription type `max` or `pro`.
-Exit 3 means it refused and claude never started: an Enterprise or Team
-login, a missing or malformed credentials file, or an Anthropic profile store
-at `$XDG_CONFIG_HOME/anthropic` (else `~/.config/anthropic`), whose profile
-claude can run on instead of the login without saying so. Only Julian can fix
-it; the stderr line names the fix, a `/login` to his personal account in a
-devbox terminal, or moving the store away.
+claude-sub runs on Sonnet unless you pass `--model` (Julian, 2026-10-03:
+connector chores do not need the fleet's model), and only on Julian's personal
+claude.ai login, kept in its own config dir `~/.claude-sub` so his own
+`claude` can stay on the Enterprise account. That dir's `.credentials.json`
+must record subscription type `max` or `pro`. Exit 3 means it refused and
+claude never started: an Enterprise or Team login, a missing or malformed
+credentials file, or an Anthropic profile store at `$XDG_CONFIG_HOME/anthropic`
+(else `~/.config/anthropic`), whose profile claude can run on instead of the
+login without saying so. Only Julian can fix it; the stderr line names the fix
+(`CLAUDE_CONFIG_DIR=~/.claude-sub claude`, then `/login` to his personal
+account in a devbox terminal) or says to move the store away.
 
 ## Spawning workers
 

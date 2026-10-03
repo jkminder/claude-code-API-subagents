@@ -10,7 +10,10 @@ reads: $XDG_CONFIG_HOME/anthropic, else $HOME/.config/anthropic, each
 variable trimmed of surrounding whitespace. Before exec, claude-sub unsets
 every variable that outranks the login (ANTHROPIC_CONFIG_DIR, which names the
 store, included; XDG_CONFIG_HOME stays) and the calling Claude Code session's
-own variables.
+own variables. The config dir is $HOME/.claude-sub unless CLAUDE_SUB_CONFIG_DIR
+names another ($HOME/.claude, the dir before 2026-10-03, is never read on its
+own), and claude gets --model sonnet before the caller's arguments unless they
+carry their own --model.
 Hermetic: a throwaway HOME and config dir, no inherited XDG_CONFIG_HOME, fake
 profile stores holding fake data, a fake claude on PATH that records
 its argv, its CLAUDE_CONFIG_DIR (a path this test made) and the NAMES of its
@@ -72,22 +75,29 @@ def creds(sub_type):
     return {"claudeAiOauth": oauth}
 
 
-def run(content=None, *, raw=None, unreadable=False, default_dir=False, env_extra=None, home=None):
-    """claude-sub 'probe' in a fresh throwaway HOME (`home`, when given, is one
-    the caller made with fresh()). The config dir is
-    CLAUDE_SUB_CONFIG_DIR=<tmp>/cfgN, or $HOME/.claude (the variable unset) with
-    default_dir. Its .credentials.json holds `content` as JSON, or the text
-    `raw`, or is a directory with unreadable, or is absent. An inherited
-    XDG_CONFIG_HOME is dropped, like every CLAUDE* and ANTHROPIC* variable.
-    Returns the result, the config dir and the fake claude's record (None when
-    it never started)."""
+def run(content=None, *, raw=None, unreadable=False, cfg_at="tmp", make_cfg=True, env_extra=None, home=None,
+        args=()):
+    """claude-sub 'probe' <args> in a fresh throwaway HOME (`home`, when given,
+    is one the caller made with fresh()). The config dir (cfg_at) is
+    CLAUDE_SUB_CONFIG_DIR=<tmp>/cfgN ("tmp"), $HOME/.claude-sub with the
+    variable unset ("default"), or CLAUDE_SUB_CONFIG_DIR=$HOME/.claude
+    ("home_claude"); make_cfg=False leaves it uncreated. Its .credentials.json
+    holds `content` as JSON, or the text `raw`, or is a directory with
+    unreadable, or is absent. An inherited XDG_CONFIG_HOME is dropped, like
+    every CLAUDE* and ANTHROPIC* variable. Returns the result, the config dir
+    and the fake claude's record (None when it never started)."""
     global n
     n += 1
     if home is None:
         home = os.path.join(TMP, "home%d" % n)
         os.makedirs(home)
-    cfg = os.path.join(home, ".claude") if default_dir else os.path.join(TMP, "cfg%d" % n)
-    os.makedirs(cfg, exist_ok=True)
+    cfg = {"tmp": os.path.join(TMP, "cfg%d" % n), "default": os.path.join(home, ".claude-sub"),
+           "home_claude": os.path.join(home, ".claude")}[cfg_at]
+    if make_cfg:
+        os.makedirs(cfg, exist_ok=True)
+    else:
+        assert content is None and raw is None and not unreadable
+        assert not os.path.lexists(cfg), cfg
     path = os.path.join(cfg, ".credentials.json")
     if content is not None:
         with open(path, "w") as f:
@@ -102,10 +112,10 @@ def run(content=None, *, raw=None, unreadable=False, default_dir=False, env_extr
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("CLAUDE", "ANTHROPIC")) and k != "XDG_CONFIG_HOME"}
     env.update({"HOME": home, "PATH": FAKE_BIN + os.pathsep + env.get("PATH", "")})
-    if not default_dir:
+    if cfg_at != "default":
         env["CLAUDE_SUB_CONFIG_DIR"] = cfg
     env.update(env_extra or {})
-    r = subprocess.run(["bash", CLAUDE_SUB, "probe"], capture_output=True, text=True, env=env, timeout=60,
+    r = subprocess.run(["bash", CLAUDE_SUB, "probe", *args], capture_output=True, text=True, env=env, timeout=60,
                        cwd=TMP, stdin=subprocess.DEVNULL)
     rec = open(REC).read() if os.path.exists(REC) else None
     return r, cfg, rec
@@ -148,28 +158,28 @@ def parse(rec):
             {l[4:] for l in lines if l.startswith("ENV ")})
 
 
-def refusal(cfg, detail, default_dir=False):
-    login_cmd = "claude" if default_dir else "CLAUDE_CONFIG_DIR=%s claude" % cfg
+def refusal(cfg, detail, plain_login=False):
+    login_cmd = "claude" if plain_login else "CLAUDE_CONFIG_DIR=%s claude" % cfg
     return ("claude-sub: refused. It needs Julian's personal claude.ai login (subscription type max or pro) "
             "in %s, but %s. Fix: in a devbox terminal run %s, type /login, choose the claude.ai subscription "
             "and sign in with the personal account.\n" % (cfg, detail, login_cmd))
 
 
-def assert_ran(r, cfg, rec):
+def assert_ran(r, cfg, rec, argv=("-p", "probe", "--model", "sonnet")):
     assert rec is not None, "claude never started: rc %d, stderr %r" % (r.returncode, r.stderr)
     assert r.returncode == 0 and r.stdout == "FAKE_CLAUDE_RAN\n" and r.stderr == "", (r.returncode, r.stdout, r.stderr)
-    argv, cfgs, names = parse(rec)
-    assert argv == ["-p", "probe"], argv
+    got, cfgs, names = parse(rec)
+    assert got == list(argv), got
     assert cfgs == [cfg], (cfgs, cfg)   # claude runs on the dir whose login was checked
     return names
 
 
-def assert_refused(r, cfg, rec, detail, default_dir=False):
+def assert_refused(r, cfg, rec, detail, plain_login=False):
     out = r.stdout + r.stderr
     assert rec is None, "claude started on a refused login (rc %d)" % r.returncode
     assert r.returncode == 3, (r.returncode, out)
     assert r.stdout == "", out
-    assert r.stderr == refusal(cfg, detail, default_dir), out
+    assert r.stderr == refusal(cfg, detail, plain_login), out
     assert "—" not in r.stderr, "an em dash in the refusal"
     assert FAKE_TOKEN not in out and "FAKEFAKE" not in out, out
 
@@ -202,10 +212,45 @@ for sub_type in ("max", "pro"):
         assert_ran(r, cfg, rec)
 
 
-@case("max in the default config dir ($HOME/.claude): claude starts on that dir")
+@case("max in the default config dir ($HOME/.claude-sub): claude starts on that dir")
 def _():
-    r, cfg, rec = run(creds("max"), default_dir=True)
+    r, cfg, rec = run(creds("max"), cfg_at="default")
     assert_ran(r, cfg, rec)
+
+
+@case("max only in $HOME/.claude (the default dir before 2026-10-03), CLAUDE_SUB_CONFIG_DIR unset: refused, "
+      "claude-sub checks only $HOME/.claude-sub")
+def _():
+    home = fresh("home")
+    os.makedirs(os.path.join(home, ".claude"))
+    with open(os.path.join(home, ".claude", ".credentials.json"), "w") as f:
+        json.dump(creds("max"), f)
+    r, cfg, rec = run(cfg_at="default", home=home)
+    assert_refused(r, cfg, rec, "its .credentials.json does not exist")
+
+
+@case("no $HOME/.claude-sub at all (never logged in): refused with the /login fix for that dir")
+def _():
+    r, cfg, rec = run(cfg_at="default", make_cfg=False)
+    assert_refused(r, cfg, rec, "its .credentials.json does not exist")
+
+
+MODEL_CASES = [   # (label, the caller's arguments after the prompt, claude's argv)
+    ("no --model from the caller: --model sonnet goes before the caller's arguments",
+     ("--allowedTools", "mcp__claude_ai_Todoist__find-tasks"),
+     ["-p", "probe", "--model", "sonnet", "--allowedTools", "mcp__claude_ai_Todoist__find-tasks"]),
+    ("--model opus from the caller: claude gets only the caller's model",
+     ("--model", "opus"), ["-p", "probe", "--model", "opus"]),
+    ("--model=claude-opus-5-5 from the caller: claude gets only that",
+     ("--model=claude-opus-5-5",), ["-p", "probe", "--model=claude-opus-5-5"]),
+    ("--model after other arguments: claude gets only the caller's model",
+     ("--allowedTools", "x", "--model", "haiku"), ["-p", "probe", "--allowedTools", "x", "--model", "haiku"]),
+]
+for label, args, argv in MODEL_CASES:
+    @case(label)
+    def _(args=args, argv=argv):
+        r, cfg, rec = run(creds("max"), args=args)
+        assert_ran(r, cfg, rec, argv)
 
 
 NO_TYPE = "its .credentials.json has no claudeAiOauth.subscriptionType"
@@ -234,10 +279,16 @@ for label, kwargs, detail in REFUSALS:
         assert_refused(r, cfg, rec, detail)
 
 
-@case("enterprise in the default config dir: the fix is a plain `claude` and /login")
+@case("enterprise in the default config dir: the fix names CLAUDE_CONFIG_DIR=$HOME/.claude-sub")
 def _():
-    r, cfg, rec = run(creds("enterprise"), default_dir=True)
-    assert_refused(r, cfg, rec, 'its login is subscription type "enterprise"', default_dir=True)
+    r, cfg, rec = run(creds("enterprise"), cfg_at="default")
+    assert_refused(r, cfg, rec, 'its login is subscription type "enterprise"')
+
+
+@case("CLAUDE_SUB_CONFIG_DIR=$HOME/.claude with an enterprise login: the fix is a plain `claude` and /login")
+def _():
+    r, cfg, rec = run(creds("enterprise"), cfg_at="home_claude")
+    assert_refused(r, cfg, rec, 'its login is subscription type "enterprise"', plain_login=True)
 
 
 for label, names in (("the calling session's variables", SESSION_VARS),

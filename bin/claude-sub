@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Run a SUBSCRIPTION-auth Claude from a session that is billing the API.
+# Run Claude on Julian's personal claude.ai subscription from a fleet session.
 #
 # The mirror of `claude-api`, and it exists for one reason: the claude.ai-hosted
-# connectors (Notion, Todoist, Gmail, Drive) load only when the active auth is a
-# claude.ai subscription login. Measured 2026-08-14: an API-key worker has zero
-# mcp__claude_ai_* tools; a headless subscription session has the full Todoist
-# set and Notion. So under API billing, connector work is delegated here.
+# connectors (Notion, Todoist, Gmail, Drive) load only under a login that has
+# them. Measured 2026-08-14: an API-key worker has zero mcp__claude_ai_* tools;
+# a headless subscription session has the full Todoist set and Notion. The
+# Enterprise account the fleet runs on since 2026-10-02 has none either (Julian
+# cannot add his connectors there, 2026-10-03). So connector work is delegated
+# here.
 #
 #   claude-sub 'How many Todoist tasks are due today? Answer with the list.'
 #   claude-sub --prompt-file /tmp/ask.txt
@@ -29,16 +31,27 @@
 # to spare. Keep it to connector reads. If it becomes the general escape hatch
 # from API billing, it defeats its own purpose — that is a rule, not a caution.
 #
-# THE LOGIN MUST BE JULIAN'S PERSONAL SUBSCRIPTION. The config dir's
+# THE LOGIN MUST BE JULIAN'S PERSONAL SUBSCRIPTION, kept in its own config
+# dir, ~/.claude-sub (CLAUDE_SUB_CONFIG_DIR overrides it). A config dir's
 # .credentials.json is shared with every interactive `claude` that uses the
 # same dir, so a /login there to another account changes what this wrapper runs
-# on. On 2026-10-02 a /login to the Enterprise account in ~/.claude did exactly
-# that: claude-sub ran on the Enterprise seat, without the connectors, and
-# nothing failed; runs just answered "no tools". So before exec it reads ONE
-# field of that file, claudeAiOauth.subscriptionType, and starts claude only on
-# max or pro. Anything else (enterprise, team, an empty or missing field, a
-# missing, unreadable or malformed file) exits 3 with a one-line fix on stderr.
-# No other part of the file is ever printed: it holds the OAuth tokens.
+# on. On 2026-10-02 a /login to the Enterprise account in ~/.claude, the dir
+# claude-sub then shared with Julian's own `claude`, did exactly that:
+# claude-sub ran on the Enterprise seat, without the connectors, and nothing
+# failed; runs just answered "no tools". Julian's own `claude` stays on the
+# Enterprise account, so since 2026-10-03 (his answer to D175) claude-sub has a
+# dir of its own, logged in once with `CLAUDE_CONFIG_DIR=~/.claude-sub claude`
+# and /login. Before exec it reads ONE field of that dir's file,
+# claudeAiOauth.subscriptionType, and starts claude only on max or pro.
+# Anything else (enterprise, team, an empty or missing field, a missing,
+# unreadable or malformed file) exits 3 with a one-line fix on stderr. No other
+# part of the file is ever printed: it holds the OAuth tokens.
+#
+# THE MODEL IS SONNET unless the caller passes its own --model (Julian,
+# 2026-10-03, D175: "no need to use fable for getting todoist things or
+# uploading stuff to notion"). claude gets `--model sonnet`, the alias for the
+# newest Sonnet the installed claude knows, before the caller's arguments; a
+# --model or --model=... among them replaces it.
 #
 # NO ANTHROPIC PROFILE STORE MAY TAKE THE LOGIN'S PLACE. In claude 2.1.287
 # (read from its binary on 2026-10-03), a profile from an Anthropic profile
@@ -54,8 +67,10 @@ usage: claude-sub '<prompt>'
        claude-sub --prompt-file <path>
 
 Runs Claude on SUBSCRIPTION auth for claude.ai connector work (Notion,
-Todoist). Prints the answer on stdout. Use --prompt-file when the prompt
-contains backticks or $ — your shell would eat them inside double quotes.
+Todoist): Julian's personal login in ~/.claude-sub, on Sonnet unless you pass
+--model. Prints the answer on stdout. Arguments after the prompt go to claude.
+Use --prompt-file when the prompt contains backticks or $ — your shell would
+eat them inside double quotes.
 EOF
   exit 2
 }
@@ -143,7 +158,7 @@ unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_B
       CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ID CLAUDE_CODE_SESSION_ATTENDED \
       CLAUDE_CODE_CHILD_SESSION CLAUDE_AGENT_SDK_VERSION CLAUDE_CODE_EXECPATH CLAUDE_PID \
       CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN
-export CLAUDE_CONFIG_DIR="${CLAUDE_SUB_CONFIG_DIR:-$HOME/.claude}"
+export CLAUDE_CONFIG_DIR="${CLAUDE_SUB_CONFIG_DIR:-$HOME/.claude-sub}"
 
 # The login check (header: THE LOGIN MUST BE JULIAN'S PERSONAL SUBSCRIPTION).
 # python3 prints only the subscriptionType, and only when it is a plain
@@ -208,4 +223,10 @@ if [ -n "$store" ] && { [ -e "$store" ] || [ -L "$store" ]; }; then
   exit 3
 fi
 
-exec claude -p "$prompt" "$@"
+# The model (header: THE MODEL IS SONNET). A caller's own --model wins.
+model_args=(--model sonnet)
+for arg in "$@"; do
+  case "$arg" in --model|--model=*) model_args=() ;; esac
+done
+
+exec claude -p "$prompt" "${model_args[@]}" "$@"
