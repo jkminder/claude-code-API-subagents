@@ -87,10 +87,11 @@ json,sys;d=json.load(open(sys.argv[1]));print(d["result"],d["session_id"])'
 - The pin is a convention, not a block (Julian, 2026-08-11): `claude-api` still
   honours an explicit `--model`, and a caller-supplied `--settings` suppresses
   the pin. The rule above is the only thing stopping you.
-- **One exception:** a subagent whose only job is creating or publishing a
-  Notion page may run on Opus (`model: "opus"`). The page text is written by
-  the calling session and handed over verbatim for the Opus agent to
-  paste. Opus never writes or rewrites prose.
+- **One exception: connector chores.** A subagent or `claude-sub` run whose
+  only job is reading Todoist or creating or updating Notion pages runs on
+  Sonnet (`model: "sonnet"`; claude-sub's default) (Julian, 2026-10-03). The
+  text it publishes is written by the calling session and handed over word
+  for word. Sonnet never writes or rewrites prose.
 - **The other exception:** `claude-code-guide` runs on sonnet
   (`model: "sonnet"`) per CLAUDE.md — a docs lookup does not need the fleet
   default model.
