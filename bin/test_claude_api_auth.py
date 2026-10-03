@@ -5,7 +5,9 @@ Enterprise OAuth token from 1Password (a fake with-op here) into
 CLAUDE_CODE_OAUTH_TOKEN for the worker and empties apiKeyHelper through the
 injected --settings (merged into the model pin; alone beside a caller's
 --model; a caller's own --settings is warned, not merged). Any other AUTH_MODE
-refuses without showing the value, and is a FAIL row in doctor. The injected model is fleet.conf's
+refuses without showing the value, and is a FAIL row in doctor. In enterprise
+mode a leftover apiKeyHelper is a WARN row in doctor that names the workers it
+still reaches. The injected model is fleet.conf's
 MODEL_DEFAULT (Julian's D165 = A, 2026-10-02), with no built-in default: unset,
 claude-api refuses like the seat launchers (Julian's D73); only
 the fleet's canonical id (claude-<fable|mythos|opus>-<n>[-<n>...]) passes, and
@@ -272,14 +274,18 @@ r, calls = case("claude-api: a 256-character reference still reaches op and read
 assert r.returncode == 0 and "oauth_set=1" in r.stdout and calls == ["op read " + ref256], (r.stdout + r.stderr, calls)
 
 
-def doctor(label, conf_lines, env_extra=None):
+def doctor(label, conf_lines, env_extra=None, helper=False):
     """bin/doctor in a throwaway HOME (no --ping: nothing live), the fake with-op
-    and the fake claude on PATH. Its rc is not asserted: the throwaway HOME lacks
+    and the fake claude on PATH; with helper, the config dir's settings.json
+    carries an apiKeyHelper. Its rc is not asserted: the throwaway HOME lacks
     the skill install, which fails doctor on its own."""
     global n
     n += 1
     home = os.path.join(TMP, "dochome%d" % n)
     os.makedirs(os.path.join(home, ".claude-api"))
+    if helper:
+        with open(os.path.join(home, ".claude-api", "settings.json"), "w") as f:
+            json.dump({"apiKeyHelper": "/x/with-op op read 'op://v/i/credential'"}, f)
     conf = os.path.join(TMP, "docfleet%d.conf" % n)
     with open(conf, "w") as f:
         f.write("".join(l + "\n" for l in conf_lines))
@@ -302,6 +308,15 @@ r, calls = doctor("enterprise with an op:// ref reads the token once, never show
                   ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF])
 assert "  ok    the Enterprise token reads from 1Password (not shown; 11 chars)" in r.stdout, r.stdout + r.stderr
 assert calls == ["op read " + TOKEN_REF] and "tok-abc-123" not in r.stdout + r.stderr, (calls, r.stdout)
+# A leftover apiKeyHelper in enterprise mode is a WARN row naming the workers it
+# still reaches: claude-api empties it only through the --settings it injects.
+# The row used to say every worker empties it.
+r, calls = doctor("enterprise with a leftover apiKeyHelper: the WARN row names who still runs it",
+                  ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF], helper=True)
+assert ("  WARN  an apiKeyHelper is still in %s/settings.json. claude-api empties it for a worker through the "
+        "--settings it injects, but a worker given its own --settings runs it and bills the API key unless that "
+        "--settings carries \"apiKeyHelper\": \"\". Remove it once every seat has restarted on the token.\n"
+        % os.path.join(TMP, "dochome%d" % n, ".claude-api")) in r.stdout, r.stdout
 for where, conf_ref, env_ref in (("fleet.conf", FAKE_TOKEN, None), ("the environment", TOKEN_REF, FAKE_TOKEN)):
     r, calls = doctor("a non-op:// OAUTH_TOKEN_REF from %s is a FAIL row that never shows the value" % where,
                       ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + conf_ref],

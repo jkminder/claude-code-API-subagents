@@ -41,8 +41,10 @@ print(v.strip() if isinstance(v, str) else "")
 PY
 )"
 # AUTH_MODE (fleet.conf; Julian's D159 = C, 2026-10-02): enterprise = the
-# Enterprise OAuth token in 1Password is what workers run on; the helper is then
-# only a note (each worker empties it through its --settings overlay).
+# Enterprise OAuth token in 1Password is what workers run on, and a leftover
+# helper is a warning. claude-api empties the helper for a worker through the
+# --settings it injects. A worker given its own --settings runs the helper, and
+# bills the API key, unless that --settings carries "apiKeyHelper": "".
 fleet_key() { # <KEY> <default>
   python3 - "$1" "$2" <<'PY' 2>/dev/null
 import os, sys
@@ -126,7 +128,7 @@ elif [ "$AUTH_MODE" = enterprise ]; then
   else
     fail "AUTH_MODE=enterprise but OAUTH_TOKEN_REF is unset in fleet.conf (op://<vault>/<item>/credential of the \`claude setup-token\` token)"
   fi
-  [ -n "$helper" ] && warn "an apiKeyHelper is still in $CONFIG_DIR/settings.json — every worker empties it through its --settings overlay; remove it once every seat has restarted on the token"
+  [ -n "$helper" ] && warn "an apiKeyHelper is still in $CONFIG_DIR/settings.json. claude-api empties it for a worker through the --settings it injects, but a worker given its own --settings runs it and bills the API key unless that --settings carries \"apiKeyHelper\": \"\". Remove it once every seat has restarted on the token."
 elif [ -n "$helper" ]; then
   ok "apiKeyHelper set in $CONFIG_DIR/settings.json (workers fetch the key at runtime through it)"
   helper_err="$(mktemp)"
