@@ -807,8 +807,12 @@ print("ok  a meta command (--version) under enterprise conf passes through witho
 # like a fleet box. Traps for with-op, op and a claude session sit first on
 # PATH: on a real box those would be the real ones, so any call to them fails
 # these runs (the claude trap answers --version, which doctor asks in check
-# 19). Three runs, side by side:
+# 19). Four runs, side by side:
 # - "env": the caller exports FLEET_CONF naming that file.
+# - "exported": as "env", and the caller also exports AUTH_MODE=enterprise and
+#   OAUTH_TOKEN_REF, as a seat's shell may. The environment wins over the file,
+#   so only selftest's own unset keeps checks 11-19 in api mode (reviewer r1982
+#   [13]: without it 6 of them fail).
 # - "home": FLEET_CONF unset and the file at $HOME/.config/fleet/fleet.conf, a
 #   fleet box's layout. Only this run sees selftest's own FLEET_CONF lose its
 #   export, since an inherited variable stays exported (reviewer f1979 [7]).
@@ -842,11 +846,11 @@ def op_reaching_selftest(path):
     return path
 
 
-def start_selftest(label, name, conf_at, script=None):
+def start_selftest(label, name, conf_at, script=None, exported=None):
     """Starts selftest's checks 11-19 in TMP/<name> (throwaway HOME, TMPDIR,
     traps first on PATH) beside the enterprise fleet.conf ST_CONF, exported as
     FLEET_CONF (conf_at "env") or at $HOME/.config/fleet/fleet.conf with
-    FLEET_CONF unset ("home")."""
+    FLEET_CONF unset ("home"). `exported`: more variables the caller exports."""
     st_dir = os.path.join(TMP, name)
     st_trapbin, st_home, st_tmp = (os.path.join(st_dir, d) for d in ("trapbin", "home", "tmp"))
     for d in (st_trapbin, st_home, st_tmp):
@@ -863,6 +867,7 @@ def start_selftest(label, name, conf_at, script=None):
            and k not in ("AUTH_MODE", "OAUTH_TOKEN_REF", "MODEL_DEFAULT", "XDG_CONFIG_HOME", "FLEET_CONF")}
     env.update({"HOME": st_home, "TMPDIR": st_tmp, "SELFTEST_SKIP_LIVE": "1",
                 "PATH": st_trapbin + os.pathsep + os.environ.get("PATH", "")})
+    env.update(exported or {})
     if conf_at == "env":
         conf = os.path.join(st_dir, "fleet.conf")
         env["FLEET_CONF"] = conf
@@ -881,6 +886,9 @@ def start_selftest(label, name, conf_at, script=None):
 
 start_selftest("selftest checks 11-19 beside an enterprise fleet.conf named by an exported FLEET_CONF",
                "selftest-env", "env")
+start_selftest("selftest checks 11-19 with AUTH_MODE=enterprise and OAUTH_TOKEN_REF exported by the caller",
+               "selftest-exported", "env",
+               exported={"AUTH_MODE": "enterprise", "OAUTH_TOKEN_REF": "op://Selftest Vault/Selftest Item/credential"})
 start_selftest("selftest checks 11-19 beside an enterprise fleet.conf at $HOME/.config/fleet/fleet.conf, "
                "FLEET_CONF unset", "selftest-home", "home")
 start_selftest("a selftest copy whose own fleet.conf reaches op: fails, the op stub records the calls, check 19 "
@@ -898,7 +906,7 @@ for label, name, proc, out, traps, conf in ST_RUNS:
     with open(conf) as f:
         assert f.read() == ST_CONF, ("selftest changed the caller's fleet.conf", label, conf)
     st[name] = (rc, stdout)
-for name in ("selftest-env", "selftest-home"):
+for name in ("selftest-env", "selftest-exported", "selftest-home"):
     rc, stdout = st[name]
     assert rc == 0 and "selftest: checks 11-19 passed (live checks 1-10 SKIPPED)\n" in stdout, (name, stdout)
     assert stdout.count("   PASS\n") == 9 and "FAIL" not in stdout, (name, stdout)
