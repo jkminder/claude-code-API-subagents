@@ -79,18 +79,30 @@ oauth_ref_ok() { # <ref>
   local re=$'^op://[^/\n\r\t]+/[^/\n\r\t]+/[^/\n\r\t]+$'
   [ "${#1}" -le 256 ] && [[ $1 =~ $re ]]
 }
-# op echoes the reference back on stderr, and a token can still ride inside a
-# well-formed one (op://<token>/x/y): op's stderr is shown with the whole
-# reference, then each of its three segments, longest first, replaced by <ref>.
-# The reference reaches python on stdin, never on a command line.
-redact_ref() { # <ref>; stdin: op's stderr → stdout: the same text, redacted
+# op's message can repeat the reference, and a token can ride inside a
+# well-formed one (op://<token>/x/y, or "<ref> <token>"). The message is shown
+# with the whole reference and each of its three segments replaced by <ref>,
+# in one pass, longest first (so a short segment never cuts into a longer one
+# or into a <ref> already written). op may also repeat a piece in a changed
+# form (URL-encoded, escaped, lower-cased, cut short, split into words, a query
+# value alone) that no replacement finds, so the message is withheld whole
+# when, after the replacement, any 6 letters or digits in a row from the
+# reference are still in it, compared in any letter case (reviewer f1954 [1]).
+# Shorter pieces can still show. op 2.38.1 repeats the reference and its segments
+# literally (measured 2026-10-03), so its messages show. The reference reaches
+# python on stdin, never on a command line.
+redact_ref() { # <ref>; stdin: op's message → stdout: the message, redacted, or a withheld note
   { printf '%s\0' "$1"; cat; } | python3 -c '
-import sys
+import re, sys
 ref, text = sys.stdin.buffer.read().decode("utf-8", "surrogateescape").split("\0", 1)
 segs = ref[len("op://"):].split("/")
 assert ref.startswith("op://") and len(segs) == 3 and all(segs), "redact_ref: a reference oauth_ref_ok refuses"
-for s in sorted([ref] + segs, key=len, reverse=True):
-    text = text.replace(s, "<ref>")
+parts = sorted(set([ref] + segs), key=len, reverse=True)
+text = re.sub("|".join(map(re.escape, parts)), "<ref>", text)
+seen = text.lower()
+runs = re.findall("[a-z0-9]{6,}", ref.lower())
+if any(run[i:i + 6] in seen for run in runs for i in range(len(run) - 5)):
+    text = "(withheld: it repeats part of the reference in a changed form)"
 sys.stdout.buffer.write(text.encode("utf-8", "surrogateescape"))
 '
 }
@@ -117,14 +129,15 @@ elif [ "$AUTH_MODE" = enterprise ]; then
   elif [ -n "$ref" ]; then
     ok "AUTH_MODE=enterprise: OAUTH_TOKEN_REF set (not shown), from $ref_origin"
     WITH_OP="${CLAUDE_API_WITH_OP:-$(command -v with-op 2>/dev/null || echo "$HOME/.local/bin/with-op")}"
-    tok_err="$(mktemp)"
-    if tok="$("$WITH_OP" op read "$ref" 2>"$tok_err")" && [ -n "$tok" ]; then
+    if tok="$("$WITH_OP" op read "$ref" 2>/dev/null)" && [ -n "$tok" ]; then
       ok "the Enterprise token reads from 1Password (not shown; ${#tok} chars)"
     else
-      fail "op cannot read the Enterprise token at the reference in OAUTH_TOKEN_REF (not shown) — stderr: $(redact_ref "$ref" < "$tok_err" | tr '\n' ' ' | cut -c1-400)"
+      # op's reason comes from a second read, held in memory and never in a
+      # file (it may repeat the reference); its stdout goes to /dev/null
+      op_msg="$("$WITH_OP" op read "$ref" 2>&1 >/dev/null)" || true
+      fail "op cannot read the Enterprise token at the reference in OAUTH_TOKEN_REF (not shown) — stderr: $(printf '%s' "$op_msg" | redact_ref "$ref" | tr '\n' ' ' | cut -c1-400)"
     fi
-    unset tok
-    rm -f "$tok_err"
+    unset tok op_msg
   else
     fail "AUTH_MODE=enterprise but OAUTH_TOKEN_REF is unset in fleet.conf (op://<vault>/<item>/credential of the \`claude setup-token\` token)"
   fi

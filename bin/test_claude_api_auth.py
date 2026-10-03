@@ -18,8 +18,11 @@ pin. An OAUTH_TOKEN_REF that is not op:// plus exactly three non-empty segments
 FAIL row in doctor, before op runs and without showing the value (both tools
 read an exported OAUTH_TOKEN_REF before fleet.conf and name the source); when op
 cannot read a well-formed one, neither shows the reference, and op's stderr (a
-fake op echoes the reference back) is shown with the reference and each of its
-segments replaced by <ref>. Hermetic: throwaway HOME and config dir, a fake
+fake op echoes the reference back, literally as op 2.38.1 does or in a changed
+form) is shown with the reference and each of its segments replaced by <ref>,
+or withheld whole when 6 letters or digits in a row from the reference survive
+that (compared in any letter case); op's message is read into memory, never
+into a file. Hermetic: throwaway HOME and config dir, a fake
 claude on PATH, no key, no network.
 Run: python3 bin/test_claude_api_auth.py
 """
@@ -48,13 +51,41 @@ with open(os.path.join(FAKE_BIN, "claude"), "w") as f:
 os.chmod(os.path.join(FAKE_BIN, "claude"), 0o755)
 REC = os.path.join(TMP, "op-calls.log")
 OP = os.path.join(TMP, "fake-with-op")
-# FAKE_OP_ECHO fails the way op does: the reference and its vault segment come
-# back on stderr.
+# FAKE_OP_ECHO fails the way op does, repeating the reference on stderr. "1":
+# the reference and its vault segment, literally. "op-2.38": op 2.38.1's own
+# wording for an item it cannot find (measured 2026-10-03), which repeats the
+# reference, the vault, the item and "<vault>/<item>" literally. The other
+# modes repeat a piece in a changed form (reviewer f1954 [1]).
+FAKE_OP = r'''#!/usr/bin/env python3
+import json, os, sys, urllib.parse
+args = sys.argv[1:]
+with open(@REC@, "a") as f:
+    f.write(" ".join(args) + "\n")
+mode = os.environ.get("FAKE_OP_ECHO", "")
+if mode:
+    ref = args[2]
+    vault, _, rest = ref[len("op://"):].partition("/")
+    item, _, field = rest.partition("/")
+    msg = {
+        "1": f"[ERROR] could not read secret '{ref}': vault '{vault}' not found",
+        "op-2.38": (f"[ERROR] 2026/10/03 07:24:46 could not read secret '{ref}': could not get item {vault}/{item}: "
+                    f"\"{item}\" isn't an item in the \"{vault}\" vault. Specify the item with its UUID, name, or domain."),
+        "lower": "[ERROR] could not read secret " + ref.lower(),
+        "json": "[ERROR] " + json.dumps({"reference": ref}),
+        "url": "[ERROR] could not read secret " + urllib.parse.quote(ref, safe=":/"),
+        "escaped": "[ERROR] could not read secret " + ref.replace(" ", "\\ "),
+        "words": " ".join(f"[ERROR] field '{w}' not found" for w in field.split()),
+        "truncated": f"[ERROR] vault '{vault[:19]}...' not found",
+        "attribute": "[ERROR] '" + ref.partition("?attribute=")[2] + "' is not a valid attribute",
+    }[mode]
+    sys.stderr.write(msg + "\n")
+    sys.exit(1)
+if os.environ.get("FAKE_OP_FAIL"):
+    sys.exit(1)
+print("tok-abc-123")
+'''
 with open(OP, "w") as f:
-    f.write("#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> " + repr(REC) + "\n"
-            "if [ -n \"${FAKE_OP_ECHO:-}\" ]; then v=\"${3#op://}\"\n"
-            "  printf \"[ERROR] could not read secret '%s': vault '%s' not found\\n\" \"$3\" \"${v%%/*}\" >&2; exit 1; fi\n"
-            "if [ -n \"${FAKE_OP_FAIL:-}\" ]; then exit 1; fi\nprintf '%s\\n' tok-abc-123\n")
+    f.write(FAKE_OP.replace("@REC@", repr(REC)))
 os.chmod(OP, 0o755)
 n = 0
 
@@ -262,7 +293,7 @@ for label, ref, refused in REF_SHAPES:
                     conf_lines=["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + ref], env_extra={"FAKE_OP_ECHO": "1"})
     out = r.stdout + r.stderr
     want = (API_REF_REFUSAL in r.stderr and calls == []) if refused else \
-        (API_OP_FAIL in r.stderr and calls == ["op read " + ref])
+        (API_OP_FAIL in r.stderr and calls == ["op read " + ref] * 2)
     if not (want and r.returncode == 1 and ref not in out and FAKE_TOKEN not in out and "FAKEFAKE" not in out
             and claude_record() == ""):
         bad.append((label, r.returncode, calls, out))
@@ -361,10 +392,95 @@ for label, conf_ref, env_ref, refused in ([(l, ref, None, refused) for l, ref, r
                       ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + conf_ref], extra)
     out = r.stdout + r.stderr
     want = (DOC_REF_FAIL in r.stdout and calls == []) if refused else \
-        (DOC_OP_FAIL in r.stdout and calls == ["op read " + ref])
+        (DOC_OP_FAIL in r.stdout and calls == ["op read " + ref] * 2)
     if not (want and ref not in out and FAKE_TOKEN not in out and "FAKEFAKE" not in out):
         bad.append((label, calls, out))
 assert not bad, bad
+
+# op repeating the reference in a changed form (reviewer f1954 [1]), in both
+# tools. op 2.38.1 repeats the whole reference and its segments literally
+# (FAKE_OP_ECHO=op-2.38), which the replacement covers, so op's message shows;
+# a JSON-quoted copy is replaced too. A piece in any other form (URL-encoded,
+# escaped, lower-cased, split into words, cut short, an attribute alone)
+# withholds the whole message once 6 letters or digits in a row from the
+# reference survive the replacement, compared in any letter case. Every mode runs against every reference
+# before the block's assert, so a run on an older tool lists each leak.
+ECHO_REFS = [TOKEN_REF + " " + FAKE_TOKEN, "op://%s/x/y" % FAKE_TOKEN, TOKEN_REF + "?attribute=" + FAKE_TOKEN]
+# cut to 19 characters, the vault keeps exactly 6 letters of the token's random
+# part ("sk-ant-oat01-FAKEFA"): the shortest piece that withholds
+ECHO_MODES = ["op-2.38", "lower", "json", "url", "escaped", "words", "truncated", "attribute"]
+WITHHELD = "(withheld: it repeats part of the reference in a changed form)"
+MUST_WITHHOLD = ({("url", 0), ("escaped", 0), ("words", 0), ("truncated", 1), ("attribute", 2)}
+                 | {("lower", i) for i in range(len(ECHO_REFS))})
+MUST_SHOW = {(mode, i) for mode in ("op-2.38", "json") for i in range(len(ECHO_REFS))}
+OP_238_SHOWN = ("[ERROR] 2026/10/03 07:24:46 could not read secret '<ref>': could not get item <ref>/<ref>: "
+                "\"<ref>\" isn't an item in the \"<ref>\" vault. Specify the item with its UUID, name, or domain.")
+bad = []
+for tool in ("claude-api", "doctor"):
+    for mode in ECHO_MODES:
+        for i, ref in enumerate(ECHO_REFS):
+            conf_lines = ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + ref]
+            label = "%s, op repeating the reference (%s) of shape %d" % (tool, mode, i)
+            if tool == "claude-api":
+                r, calls = case(label, helper=True, conf_lines=conf_lines, env_extra={"FAKE_OP_ECHO": mode})
+                lines = [l for l in r.stderr.splitlines() if l.startswith("claude-api: op cannot read")]
+                shown = lines[0].split("; stderr: ", 1)[1] if len(lines) == 1 else None
+                ok = r.returncode == 1 and claude_record() == ""
+            else:
+                r, calls = doctor(label, conf_lines, {"FAKE_OP_ECHO": mode})
+                lines = [l for l in r.stdout.splitlines() if l.startswith("  FAIL  op cannot read")]
+                shown = lines[0].split(" — stderr: ", 1)[1] if len(lines) == 1 else None
+                ok = True
+            out = r.stdout + r.stderr
+            ok = ok and shown is not None and calls == ["op read " + ref] * 2
+            low = out.lower()   # a lower-cased copy leaks the token too
+            ok = ok and "fakefa" not in low and FAKE_TOKEN.lower() not in low and ref.lower() not in low
+            if (mode, i) in MUST_WITHHOLD:
+                ok = ok and shown.strip() == WITHHELD
+            if (mode, i) in MUST_SHOW:
+                ok = ok and WITHHELD not in shown and "<ref>" in shown
+            if not ok:
+                bad.append((tool, mode, i, calls, out))
+assert not bad, bad
+# One pass of the replacement: a segment that is also part of "<ref>" never
+# cuts into a <ref> already written (one replacement after another did:
+# "'<<ref>>'").
+for tool in ("claude-api", "doctor"):
+    conf_lines = ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=op://ref/q/z"]
+    want = "[ERROR] could not read secret '<ref>': vault '<ref>' not found"
+    if tool == "claude-api":
+        r, calls = case("claude-api: a segment named ref leaves the <ref> marks whole", helper=True,
+                        conf_lines=conf_lines, env_extra={"FAKE_OP_ECHO": "1"})
+        assert r.stderr.rstrip(" \n").endswith("; stderr: " + want), r.stderr
+    else:
+        r, calls = doctor("a segment named ref leaves the <ref> marks whole", conf_lines, {"FAKE_OP_ECHO": "1"})
+        assert "— stderr: " + want + "\n" in r.stdout, r.stdout
+# op 2.38.1's own wording on the fleet's reference shows whole, every name in it replaced
+for tool in ("claude-api", "doctor"):
+    conf_lines = ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF]
+    if tool == "claude-api":
+        r, calls = case("claude-api: op 2.38.1's wording on the fleet's reference shows", helper=True,
+                        conf_lines=conf_lines, env_extra={"FAKE_OP_ECHO": "op-2.38"})
+        assert r.stderr.rstrip(" \n").endswith("; stderr: " + OP_238_SHOWN), r.stderr
+    else:
+        r, calls = doctor("op 2.38.1's wording on the fleet's reference shows", conf_lines, {"FAKE_OP_ECHO": "op-2.38"})
+        assert ("  FAIL  op cannot read the Enterprise token at the reference in OAUTH_TOKEN_REF (not shown) — stderr: "
+                + OP_238_SHOWN) in r.stdout, r.stdout
+    assert "Fellow" not in r.stdout + r.stderr and "Enterprise Token" not in r.stdout + r.stderr, r.stdout + r.stderr
+# op's message is held in memory, never in a file: with no usable temporary
+# directory the failure line still carries it (claude-api used to stop at
+# mktemp, doctor at the redirect into an unnamed file).
+for tool in ("claude-api", "doctor"):
+    extra = {"FAKE_OP_ECHO": "1", "TMPDIR": os.path.join(TMP, "no-such-dir")}
+    conf_lines = ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF]
+    if tool == "claude-api":
+        r, calls = case("claude-api: op's message needs no temporary file", helper=True, conf_lines=conf_lines,
+                        env_extra=extra)
+        assert API_OP_FAIL in r.stderr and r.returncode == 1, r.stderr
+    else:
+        r, calls = doctor("op's message needs no temporary file", conf_lines, extra)
+        assert DOC_OP_FAIL in r.stdout, r.stdout + r.stderr
+    assert calls == ["op read " + TOKEN_REF] * 2, calls
 
 # doctor names the source of the reference too, and reads the exported one.
 DOC_ENV_FAIL = ("  FAIL  OAUTH_TOKEN_REF is not an op:// reference (value not shown); it comes from the "
