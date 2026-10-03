@@ -107,10 +107,12 @@ spends the subscription pool, so keep it to connector work.
 
 claude-sub starts claude only on Julian's personal claude.ai login: the
 config dir's `.credentials.json` must record subscription type `max` or `pro`.
-Exit 3 means it refused (an Enterprise or Team login, or a missing or
-malformed credentials file) and claude never started. Only Julian can fix it;
-the stderr line names the config dir and the fix, a `/login` to his personal
-account in a devbox terminal.
+Exit 3 means it refused and claude never started: an Enterprise or Team
+login, a missing or malformed credentials file, or an Anthropic profile store
+at `$XDG_CONFIG_HOME/anthropic` (else `~/.config/anthropic`), whose profile
+claude can run on instead of the login without saying so. Only Julian can fix
+it; the stderr line names the fix, a `/login` to his personal account in a
+devbox terminal, or moving the store away.
 
 ## Spawning workers
 

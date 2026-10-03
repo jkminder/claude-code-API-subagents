@@ -39,6 +39,13 @@
 # max or pro. Anything else (enterprise, team, an empty or missing field, a
 # missing, unreadable or malformed file) exits 3 with a one-line fix on stderr.
 # No other part of the file is ever printed: it holds the OAuth tokens.
+#
+# NO ANTHROPIC PROFILE STORE MAY TAKE THE LOGIN'S PLACE. In claude 2.1.287
+# (read from its binary on 2026-10-03), a profile from an Anthropic profile
+# store can replace the login, and claude does not say so. So claude-sub also
+# exits 3, with a one-line fix on stderr, when anything exists where the child
+# claude looks for a store. It never reads the store. The comment above the
+# unset list says where claude looks.
 set -uo pipefail
 
 usage() {
@@ -99,6 +106,18 @@ fi
 # CLAUDE_CONFIG_DIR below points at the subscription config dir, where the
 # fleet keeps none.
 #
+# An Anthropic profile store can outrank the login too (claude 2.1.287, read
+# from its binary on 2026-10-03). claude looks for the store at
+# $ANTHROPIC_CONFIG_DIR, else $XDG_CONFIG_HOME/anthropic, else
+# $HOME/.config/anthropic. A variable counts only when it is non-empty after
+# trimming surrounding whitespace, and claude uses the trimmed value. With
+# ANTHROPIC_PROFILE unset, a store whose active profile uses OIDC federation
+# runs claude on that profile instead of the claude.ai login, and claude says
+# nothing. ANTHROPIC_CONFIG_DIR only names the store, so it goes.
+# XDG_CONFIG_HOME stays: git, gh and other tools in the session read their
+# config through it, and without it claude would read $HOME/.config/anthropic
+# instead. The store check before exec covers the path claude then reads.
+#
 # CLAUDE_API_PARENT_SID and CLAUDE_API_SPAWNER_SID must go too: claude-api
 # reads them as this session's worker lineage / direct spawner, so leaving them
 # set would file this session's own delegated runs and questions under the
@@ -119,6 +138,7 @@ unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_B
       CLAUDE_CODE_USE_ANTHROPIC_AWS CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD \
       CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_USE_GATEWAY \
       ANTHROPIC_UNIX_SOCKET ANTHROPIC_FEDERATION_RULE_ID ANTHROPIC_ORGANIZATION_ID ANTHROPIC_PROFILE \
+      ANTHROPIC_CONFIG_DIR \
       CLAUDE_API_PARENT_SID CLAUDE_API_SPAWNER_SID \
       CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ID CLAUDE_CODE_SESSION_ATTENDED \
       CLAUDE_CODE_CHILD_SESSION CLAUDE_AGENT_SDK_VERSION CLAUDE_CODE_EXECPATH CLAUDE_PID \
@@ -163,6 +183,28 @@ if [ "$check_rc" -ne 0 ] || { [ "$sub_type" != max ] && [ "$sub_type" != pro ]; 
   login_cmd="claude"
   [ "$CLAUDE_CONFIG_DIR" = "$HOME/.claude" ] || login_cmd="CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR claude"
   echo "claude-sub: refused. It needs Julian's personal claude.ai login (subscription type max or pro) in $CLAUDE_CONFIG_DIR, but $detail. Fix: in a devbox terminal run $login_cmd, type /login, choose the claude.ai subscription and sign in with the personal account." >&2
+  exit 3
+fi
+
+# The profile store check (the comment above the unset list says why). The path
+# is the one the child claude reads now that ANTHROPIC_CONFIG_DIR is gone:
+# $XDG_CONFIG_HOME/anthropic, else $HOME/.config/anthropic, each variable with
+# surrounding whitespace trimmed (claude trims too; its trim also takes
+# Unicode spaces); no check when both are empty. Anything at the
+# path refuses: a directory, a file or a dangling symlink. Nothing inside is
+# read. Existence alone refuses, so a new store layout in a later claude cannot
+# slip past the check.
+trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
+xdg="$(trim "${XDG_CONFIG_HOME-}")"
+home_dir="$(trim "${HOME-}")"
+store=""
+if [ -n "$xdg" ]; then
+  store="$xdg/anthropic"
+elif [ -n "$home_dir" ]; then
+  store="$home_dir/.config/anthropic"
+fi
+if [ -n "$store" ] && { [ -e "$store" ] || [ -L "$store" ]; }; then
+  echo "claude-sub: refused. An Anthropic profile store exists at $store, and claude can run on a profile from it instead of the subscription login, without saying so. Fix: move $store away (claude-sub never reads it), or point XDG_CONFIG_HOME at a directory without an anthropic store for this run." >&2
   exit 3
 fi
 

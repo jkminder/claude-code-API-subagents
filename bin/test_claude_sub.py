@@ -4,9 +4,15 @@ config dir's .credentials.json must record claudeAiOauth.subscriptionType max
 or pro. Anything else (enterprise, team, an empty or missing type, a missing,
 unreadable or malformed file, a type that is not a plain name) exits 3 with a
 one-line fix on stderr, claude never starts, and no other part of the file
-reaches stdout or stderr. Before exec, claude-sub unsets every variable that
-outranks the login and the calling Claude Code session's own variables.
-Hermetic: a throwaway HOME and config dir, a fake claude on PATH that records
+reaches stdout or stderr. It also exits 3 when anything (a directory, a file,
+a dangling symlink) is at the Anthropic profile store path the child claude
+reads: $XDG_CONFIG_HOME/anthropic, else $HOME/.config/anthropic, each
+variable trimmed of surrounding whitespace. Before exec, claude-sub unsets
+every variable that outranks the login (ANTHROPIC_CONFIG_DIR, which names the
+store, included; XDG_CONFIG_HOME stays) and the calling Claude Code session's
+own variables.
+Hermetic: a throwaway HOME and config dir, no inherited XDG_CONFIG_HOME, fake
+profile stores holding fake data, a fake claude on PATH that records
 its argv, its CLAUDE_CONFIG_DIR (a path this test made) and the NAMES of its
 environment variables (never a value), no key, no network. Every case runs
 even when an earlier one fails; the exit code is 1 when any case failed.
@@ -66,17 +72,21 @@ def creds(sub_type):
     return {"claudeAiOauth": oauth}
 
 
-def run(content=None, *, raw=None, unreadable=False, default_dir=False, env_extra=None):
-    """claude-sub 'probe' in a fresh throwaway HOME. The config dir is
+def run(content=None, *, raw=None, unreadable=False, default_dir=False, env_extra=None, home=None):
+    """claude-sub 'probe' in a fresh throwaway HOME (`home`, when given, is one
+    the caller made with fresh()). The config dir is
     CLAUDE_SUB_CONFIG_DIR=<tmp>/cfgN, or $HOME/.claude (the variable unset) with
     default_dir. Its .credentials.json holds `content` as JSON, or the text
-    `raw`, or is a directory with unreadable, or is absent. Returns the result,
-    the config dir and the fake claude's record (None when it never started)."""
+    `raw`, or is a directory with unreadable, or is absent. An inherited
+    XDG_CONFIG_HOME is dropped, like every CLAUDE* and ANTHROPIC* variable.
+    Returns the result, the config dir and the fake claude's record (None when
+    it never started)."""
     global n
     n += 1
-    home = os.path.join(TMP, "home%d" % n)
+    if home is None:
+        home = os.path.join(TMP, "home%d" % n)
+        os.makedirs(home)
     cfg = os.path.join(home, ".claude") if default_dir else os.path.join(TMP, "cfg%d" % n)
-    os.makedirs(home)
     os.makedirs(cfg, exist_ok=True)
     path = os.path.join(cfg, ".credentials.json")
     if content is not None:
@@ -89,7 +99,8 @@ def run(content=None, *, raw=None, unreadable=False, default_dir=False, env_extr
         os.makedirs(path)
     if os.path.exists(REC):
         os.remove(REC)
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "ANTHROPIC"))}
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("CLAUDE", "ANTHROPIC")) and k != "XDG_CONFIG_HOME"}
     env.update({"HOME": home, "PATH": FAKE_BIN + os.pathsep + env.get("PATH", "")})
     if not default_dir:
         env["CLAUDE_SUB_CONFIG_DIR"] = cfg
@@ -98,6 +109,35 @@ def run(content=None, *, raw=None, unreadable=False, default_dir=False, env_extr
                        cwd=TMP, stdin=subprocess.DEVNULL)
     rec = open(REC).read() if os.path.exists(REC) else None
     return r, cfg, rec
+
+
+def fresh(name):
+    """A new empty directory under TMP."""
+    global n
+    n += 1
+    path = os.path.join(TMP, "%s%d" % (name, n))
+    os.makedirs(path)
+    return path
+
+
+def make_store(path, kind="dir"):
+    """Something at `path`, where claude may look for an Anthropic profile store:
+    a store directory whose default profile uses OIDC federation (fake data, no
+    credentials), a plain file, or a dangling symlink. Returns `path`."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if kind == "dir":
+        os.makedirs(os.path.join(path, "configs"))
+        with open(os.path.join(path, "configs", "default.json"), "w") as f:
+            json.dump({"authentication": {"type": "oidc_federation"}}, f)
+    elif kind == "file":
+        with open(path, "w") as f:
+            f.write("not a store\n")
+    else:
+        assert kind == "dangling", kind
+        target = os.path.join(TMP, "no-such-store")
+        assert not os.path.lexists(target), target
+        os.symlink(target, path)
+    return path
 
 
 def parse(rec):
@@ -132,6 +172,17 @@ def assert_refused(r, cfg, rec, detail, default_dir=False):
     assert r.stderr == refusal(cfg, detail, default_dir), out
     assert "—" not in r.stderr, "an em dash in the refusal"
     assert FAKE_TOKEN not in out and "FAKEFAKE" not in out, out
+
+
+def assert_store_refused(r, rec, store):
+    out = r.stdout + r.stderr
+    assert rec is None, "claude started beside a profile store (rc %d)" % r.returncode
+    assert r.returncode == 3 and r.stdout == "", (r.returncode, out)
+    assert r.stderr == ("claude-sub: refused. An Anthropic profile store exists at %s, and claude can run on a "
+                        "profile from it instead of the subscription login, without saying so. Fix: move %s away "
+                        "(claude-sub never reads it), or point XDG_CONFIG_HOME at a directory without an anthropic "
+                        "store for this run.\n" % (store, store)), out
+    assert "—" not in r.stderr, "an em dash in the refusal"
 
 
 CASES = []
@@ -199,6 +250,65 @@ for label, names in (("the calling session's variables", SESSION_VARS),
         assert KEEP in seen, "the record misses a variable that crosses"
         left = [v for v in names if v in seen]
         assert not left, "still set in claude: %s" % left
+
+
+# The Anthropic profile store (claude 2.1.287, read from its binary on
+# 2026-10-03): claude reads it at $ANTHROPIC_CONFIG_DIR, else
+# $XDG_CONFIG_HOME/anthropic, else $HOME/.config/anthropic, and a profile there
+# can replace the login without a word.
+@case("ANTHROPIC_CONFIG_DIR, set in the parent to a profile store, is absent in claude, and claude starts")
+def _():
+    store = make_store(os.path.join(fresh("acd"), "anthropic"))
+    r, cfg, rec = run(creds("max"), env_extra={"ANTHROPIC_CONFIG_DIR": store, KEEP: "1"})
+    seen = assert_ran(r, cfg, rec)
+    assert KEEP in seen, "the record misses a variable that crosses"
+    assert "ANTHROPIC_CONFIG_DIR" not in seen, "ANTHROPIC_CONFIG_DIR still set in claude"
+
+
+@case("XDG_CONFIG_HOME set, no store under it: claude starts, and XDG_CONFIG_HOME reaches claude")
+def _():
+    r, cfg, rec = run(creds("max"), env_extra={"XDG_CONFIG_HOME": fresh("xdg")})
+    assert "XDG_CONFIG_HOME" in assert_ran(r, cfg, rec), "XDG_CONFIG_HOME did not reach claude"
+
+
+@case("a store at $XDG_CONFIG_HOME/anthropic: refused with exit 3 and the fix, claude never starts")
+def _():
+    xdg = fresh("xdg")
+    store = make_store(os.path.join(xdg, "anthropic"))
+    r, cfg, rec = run(creds("max"), env_extra={"XDG_CONFIG_HOME": xdg})
+    assert_store_refused(r, rec, store)
+
+
+@case("whitespace around XDG_CONFIG_HOME: a store at the trimmed path is refused")
+def _():
+    xdg = fresh("xdg")
+    store = make_store(os.path.join(xdg, "anthropic"))
+    r, cfg, rec = run(creds("max"), env_extra={"XDG_CONFIG_HOME": " %s\t" % xdg})
+    assert_store_refused(r, rec, store)
+
+
+@case("XDG_CONFIG_HOME set, no store there, a store at $HOME/.config/anthropic: claude starts (it reads only the "
+      "XDG path)")
+def _():
+    home = fresh("home")
+    make_store(os.path.join(home, ".config", "anthropic"))
+    r, cfg, rec = run(creds("max"), home=home, env_extra={"XDG_CONFIG_HOME": fresh("xdg")})
+    assert_ran(r, cfg, rec)
+
+
+HOME_STORES = [   # (label, XDG_CONFIG_HOME or None for unset, what is at $HOME/.config/anthropic)
+    ("XDG_CONFIG_HOME unset, a store directory at $HOME/.config/anthropic", None, "dir"),
+    ("XDG_CONFIG_HOME whitespace only, a store directory at $HOME/.config/anthropic", " \t ", "dir"),
+    ("XDG_CONFIG_HOME unset, a plain file at $HOME/.config/anthropic", None, "file"),
+    ("XDG_CONFIG_HOME unset, a dangling symlink at $HOME/.config/anthropic", None, "dangling"),
+]
+for label, xdg, kind in HOME_STORES:
+    @case("%s: refused with exit 3 and the fix, claude never starts" % label)
+    def _(xdg=xdg, kind=kind):
+        home = fresh("home")
+        store = make_store(os.path.join(home, ".config", "anthropic"), kind)
+        r, cfg, rec = run(creds("max"), home=home, env_extra=None if xdg is None else {"XDG_CONFIG_HOME": xdg})
+        assert_store_refused(r, rec, store)
 
 
 failed = []
