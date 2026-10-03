@@ -598,8 +598,9 @@ assert not bad, bad
 # op says on stderr, withheld?). Runs of exactly 6 ("ab12cd", "qwerty") are one
 # window each, found in any letter case; their 5-character pieces show, and so
 # does a word whose runs are 5 long. A word of 15 ASCII letters only is a name
-# word and is not checked; 16 letters, or one digit, make a word checked. A
-# shown message is unchanged (no exact piece of the reference is in it).
+# word and is not checked; 16 letters, or one digit, '-' or '_', make a word
+# checked (reviewer r1982 [8]: 'sk-ant-FAKEFAKE' is 15 characters). A shown
+# message is unchanged (no exact piece of the reference is in it).
 EDGES = [
     ("op://Vault/Item/key ab12cd-QWERTY", "[ERROR] field 'ab12cd' not found", True),
     ("op://Vault/Item/key ab12cd-QWERTY", "[ERROR] field 'qwerty' not found", True),
@@ -609,6 +610,8 @@ EDGES = [
     ("op://Vault/Item/key Abcdefghijklmnop", "[ERROR] could not read secret op://vault/item/key abcdefghijklmnop", True),
     ("op://Vault/Item/key Qwertyui", "[ERROR] could not read secret op://vault/item/key qwertyui", False),
     ("op://Vault/Item/key Qwerty1i", "[ERROR] could not read secret op://vault/item/key qwerty1i", True),
+    ("op://Vault/Item/key sk-ant-FAKEFAKE", "[ERROR] could not read secret op://vault/item/key sk-ant-fakefake", True),
+    ("op://Vault/Item/key sk_ant_FAKEFAKE", "[ERROR] could not read secret op://vault/item/key sk_ant_fakefake", True),
 ]
 bad = []
 for tool in ("claude-api", "doctor"):
