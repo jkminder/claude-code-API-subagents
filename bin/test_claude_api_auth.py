@@ -16,7 +16,7 @@ claude-api refuses like the seat launchers (Julian's D73); only
 the fleet's canonical id (claude-<fable|mythos|opus>-<n>[-<n>...]) passes, and
 any other value, a pasted token included, refuses before claude starts and
 without showing the value; a caller's --model or --settings still bypasses the
-pin. An OAUTH_TOKEN_REF that is not op:// plus exactly three non-empty segments
+pin, and runs with MODEL_DEFAULT unset. An OAUTH_TOKEN_REF that is not op:// plus exactly three non-empty segments
 (a pasted token, alone or inside an op:// value) refuses in claude-api and is a
 FAIL row in doctor, before op runs and without showing the value (both tools
 read an exported OAUTH_TOKEN_REF before fleet.conf and name the source); when op
@@ -609,6 +609,16 @@ assert r.returncode == 0 and settings_arg(r) == '{"model": "claude-opus-5-5"}', 
 r, calls = case("unset, but the caller passes --model: runs, nothing injected", helper=True, conf_lines=[],
                 model_line=None, args=("--model", "claude-fable-5-1", "-p", "say hi"))
 assert r.returncode == 0 and settings_arg(r) is None and "ARG claude-fable-5-1" in r.stdout, r.stdout + r.stderr
+
+# The --settings bypass with the key unset too: the caller's --settings is the
+# only one claude gets, and nothing refuses. A refusal of --settings callers on
+# an unset key passed every case above (reviewer r1965 [4]).
+r, calls = case("unset, but the caller passes --settings: runs on the caller's --settings alone", helper=True,
+                conf_lines=[], model_line=None, args=("--settings", '{"model": "claude-sonnet-5"}', "-p", "say hi"))
+out = r.stdout + r.stderr
+assert r.returncode == 0 and "MODEL_DEFAULT" not in r.stderr, out
+assert [l for l in r.stdout.splitlines() if l.startswith("ARG ")].count("ARG --settings") == 1, out
+assert settings_arg(r) == '{"model": "claude-sonnet-5"}', out
 
 r, calls = case("MODEL_DEFAULT from the environment wins over fleet.conf", helper=True, conf_lines=[],
                 model_line="MODEL_DEFAULT=claude-opus-5-5", env_extra={"MODEL_DEFAULT": "claude-fable-5-1"})
