@@ -23,9 +23,12 @@ read an exported OAUTH_TOKEN_REF before fleet.conf and name the source); when op
 cannot read a well-formed one, neither shows the reference, and op's stderr (a
 fake op echoes the reference back, literally as op 2.38.1 does or in a changed
 form) is shown with the reference and each of its segments replaced by <ref>,
-or withheld whole when 6 letters or digits in a row from the reference survive
-that (compared in any letter case); op's message is read into memory, never
-into a file. selftest's no-API checks (SELFTEST_SKIP_LIVE=1), run beside a
+or withheld whole when 6 letters or digits in a row from a reference word
+survive that (compared in any letter case; a name word, 1 to 15 ASCII letters
+only, is not checked, so op's and with-op's real failures show on the fleet's
+reference); op's message is read into memory, never into a file, from a second
+read whose stdout (the token, should op answer that time) shows nowhere.
+selftest's no-API checks (SELFTEST_SKIP_LIVE=1), run beside a
 fleet.conf that says AUTH_MODE=enterprise, pass without calling with-op, op or
 a claude session. Hermetic: throwaway HOME and config dir, a fake
 claude on PATH, no key, no network.
@@ -44,6 +47,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CLAUDE_API = os.path.join(HERE, "claude-api")
 TOKEN_REF = "op://Fellow - Julian Minder/Claude Enterprise Token/credential"
 FAKE_TOKEN = "sk-ant-oat01-FAKEFAKEFAKE"   # token-shaped, not a real token
+FLAKY_TOKEN = "sk-ant-oat01-FAKEFLAKYTOKEN"   # made up: what an op that answers the second read prints
+FLAKY_ERR = "[WARN] 2026/10/03 07:24:46 a warning beside the token"
 TMP = tempfile.mkdtemp(prefix="claude-api-auth-test-")
 atexit.register(shutil.rmtree, TMP, ignore_errors=True)
 FAKE_BIN = os.path.join(TMP, "fakebin")
@@ -64,6 +69,9 @@ OP = os.path.join(TMP, "fake-with-op")
 # reference, the vault, the item and "<vault>/<item>" literally. The other
 # modes repeat a piece in a changed form (reviewer f1954 [1]). FAKE_OP_ENV_OUT
 # names a file that gets the AUTH_MODE this child of the tool inherited.
+# FAKE_OP_SAYS: exit 1 with that text on stderr. FAKE_OP_FLAKY: the first call
+# fails saying nothing, a later one prints FLAKY_TOKEN on stdout and FLAKY_ERR
+# on stderr (an op that fails once and then answers; reviewer f1971 [15]).
 FAKE_OP = r'''#!/usr/bin/env python3
 import json, os, sys, urllib.parse
 args = sys.argv[1:]
@@ -72,6 +80,16 @@ with open(@REC@, "a") as f:
 if os.environ.get("FAKE_OP_ENV_OUT"):
     with open(os.environ["FAKE_OP_ENV_OUT"], "a") as f:
         f.write("AUTH_MODE=[%s]\n" % os.environ.get("AUTH_MODE", "unset"))
+if os.environ.get("FAKE_OP_FLAKY"):
+    with open(@REC@) as f:
+        if len(f.read().splitlines()) == 1:
+            sys.exit(1)
+    print(@FLAKY_TOKEN@)
+    sys.stderr.write(@FLAKY_ERR@ + "\n")
+    sys.exit(0)
+if os.environ.get("FAKE_OP_SAYS"):
+    sys.stderr.write(os.environ["FAKE_OP_SAYS"] + "\n")
+    sys.exit(1)
 mode = os.environ.get("FAKE_OP_ECHO", "")
 if mode:
     ref = args[2]
@@ -96,7 +114,8 @@ if os.environ.get("FAKE_OP_FAIL"):
 print("tok-abc-123")
 '''
 with open(OP, "w") as f:
-    f.write(FAKE_OP.replace("@REC@", repr(REC)))
+    f.write(FAKE_OP.replace("@REC@", repr(REC)).replace("@FLAKY_TOKEN@", repr(FLAKY_TOKEN))
+            .replace("@FLAKY_ERR@", repr(FLAKY_ERR)))
 os.chmod(OP, 0o755)
 n = 0
 
@@ -446,15 +465,34 @@ for label, conf_ref, env_ref, refused in ([(l, ref, None, refused) for l, ref, r
         bad.append((label, calls, out))
 assert not bad, bad
 
+
+def op_failure(tool, label, conf_lines, extra):
+    """claude-api (a -p spawn) or doctor, with op failing: (r, op calls, what
+    the failure line shows of op's stderr or None without exactly one such
+    line, whether the tool otherwise behaved: claude-api exits 1 and never
+    starts claude; doctor's rc is not asserted)."""
+    if tool == "claude-api":
+        r, calls = case("claude-api, " + label, helper=True, conf_lines=conf_lines, env_extra=extra)
+        lines = [l for l in r.stderr.splitlines() if l.startswith("claude-api: op cannot read")]
+        shown = lines[0].split("; stderr: ", 1)[1] if len(lines) == 1 else None
+        return r, calls, shown, r.returncode == 1 and claude_record() == ""
+    r, calls = doctor(label, conf_lines, extra)
+    lines = [l for l in r.stdout.splitlines() if l.startswith("  FAIL  op cannot read")]
+    shown = lines[0].split(" — stderr: ", 1)[1] if len(lines) == 1 else None
+    return r, calls, shown, True
+
+
 # op repeating the reference in a changed form (reviewer f1954 [1]), in both
 # tools. op 2.38.1 repeats the whole reference and its segments literally
 # (FAKE_OP_ECHO=op-2.38), which the replacement covers, so op's message shows;
 # a JSON-quoted copy is replaced too. A piece in any other form (URL-encoded,
 # escaped, lower-cased, split into words, cut short, an attribute alone)
-# withholds the whole message once 6 letters or digits in a row from the
-# reference survive the replacement, compared in any letter case. Every mode runs against every reference
-# before the block's assert, so a run on an older tool lists each leak.
-ECHO_REFS = [TOKEN_REF + " " + FAKE_TOKEN, "op://%s/x/y" % FAKE_TOKEN, TOKEN_REF + "?attribute=" + FAKE_TOKEN]
+# withholds the whole message once 6 letters or digits in a row from a checked
+# word of the reference (any word but a name word: 1 to 15 ASCII letters only)
+# survive the replacement, compared in any letter case. Every mode runs against
+# every reference before the block's assert, so a run on an older tool lists
+# each leak.
+ECHO_REFS =[TOKEN_REF + " " + FAKE_TOKEN, "op://%s/x/y" % FAKE_TOKEN, TOKEN_REF + "?attribute=" + FAKE_TOKEN]
 # cut to 19 characters, the vault keeps exactly 6 letters of the token's random
 # part ("sk-ant-oat01-FAKEFA"): the shortest piece that withholds
 ECHO_MODES = ["op-2.38", "lower", "json", "url", "escaped", "words", "truncated", "attribute"]
@@ -468,18 +506,8 @@ bad = []
 for tool in ("claude-api", "doctor"):
     for mode in ECHO_MODES:
         for i, ref in enumerate(ECHO_REFS):
-            conf_lines = ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + ref]
-            label = "%s, op repeating the reference (%s) of shape %d" % (tool, mode, i)
-            if tool == "claude-api":
-                r, calls = case(label, helper=True, conf_lines=conf_lines, env_extra={"FAKE_OP_ECHO": mode})
-                lines = [l for l in r.stderr.splitlines() if l.startswith("claude-api: op cannot read")]
-                shown = lines[0].split("; stderr: ", 1)[1] if len(lines) == 1 else None
-                ok = r.returncode == 1 and claude_record() == ""
-            else:
-                r, calls = doctor(label, conf_lines, {"FAKE_OP_ECHO": mode})
-                lines = [l for l in r.stdout.splitlines() if l.startswith("  FAIL  op cannot read")]
-                shown = lines[0].split(" — stderr: ", 1)[1] if len(lines) == 1 else None
-                ok = True
+            r, calls, shown, ok = op_failure(tool, "op repeating the reference (%s) of shape %d" % (mode, i),
+                                             ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + ref], {"FAKE_OP_ECHO": mode})
             out = r.stdout + r.stderr
             ok = ok and shown is not None and calls == ["op read " + ref] * 2
             low = out.lower()   # a lower-cased copy leaks the token too
@@ -516,6 +544,88 @@ for tool in ("claude-api", "doctor"):
         assert ("  FAIL  op cannot read the Enterprise token at the reference in OAUTH_TOKEN_REF (not shown) — stderr: "
                 + OP_238_SHOWN) in r.stdout, r.stdout
     assert "Fellow" not in r.stdout + r.stderr and "Enterprise Token" not in r.stdout + r.stderr, r.stdout + r.stderr
+# Longest first (reviewer f1971 [16]): a segment that starts a longer segment
+# never cuts into it. Shortest first turned the item "Vault <token>" into
+# "<ref> <token>" (then withheld whole) and the item "Fellow Token" into
+# "<ref> Token".
+bad = []
+for tool in ("claude-api", "doctor"):
+    for ref in ("op://Vault/Vault %s/credential" % FAKE_TOKEN, "op://Fellow/Fellow Token/credential"):
+        r, calls, shown, ok = op_failure(tool, "the item starts with the vault's name: replaced longest first",
+                                         ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + ref], {"FAKE_OP_ECHO": "op-2.38"})
+        out = r.stdout + r.stderr
+        if not (ok and shown == OP_238_SHOWN and "FAKEFAKE" not in out.upper() and calls == ["op read " + ref] * 2):
+            bad.append((tool, ref, calls, out))
+assert not bad, bad
+
+# What a seat on this box reads when op cannot start (reviewer f1971 [14]): the
+# four bootstrap-file refusals of agent-skills' with-op in its words (HOME
+# /home/jkminder, user jkminder) and two op errors, a bad service-account token
+# and a config directory op does not own (strings in op 2.38.1; how op joins
+# their parts is assumed). On the fleet's reference every word is a name word,
+# which the check skips, so each shows whole, with the exact replacement
+# applied ("credentials" holds the field segment "credential"); the check used
+# to withhold all of them and blame the reference ("minder", "credential").
+BOOTSTRAP_FILE = "/home/jkminder/.config/op/service-account-token"
+WITH_OP_REFUSALS = [
+    "with-op: op bootstrap token file missing: " + BOOTSTRAP_FILE
+    + " (the one sanctioned on-disk secret; see CLAUDE.md 'Secrets and API keys')",
+    "with-op: cannot stat " + BOOTSTRAP_FILE,
+    "with-op: refusing " + BOOTSTRAP_FILE + ": mode and owner are '644 jkminder', must be '600 jkminder' "
+    "(chmod 600 and chown jkminder it)",
+    "with-op: op bootstrap token file is empty: " + BOOTSTRAP_FILE,
+]
+OP_NOT_OWNED = ("[ERROR] 2026/10/03 07:24:46 Can't continue. We can't safely access \"/home/jkminder/.config/op\" "
+                "because it's not owned by the current user. Change the owner or logged in user and try again.")
+REAL_FAILURES = [(said, said) for said in WITH_OP_REFUSALS + [OP_NOT_OWNED]] + [
+    ("[ERROR] 2026/10/03 07:24:46 failed to DecodeSACredentials: invalid credentials provided",
+     "[ERROR] 2026/10/03 07:24:46 failed to DecodeSACredentials: invalid <ref>s provided")]
+bad = []
+for tool in ("claude-api", "doctor"):
+    for i, (said, want) in enumerate(REAL_FAILURES):
+        r, calls, shown, ok = op_failure(tool, "op's real failure %d on the fleet's reference shows" % i,
+                                         ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF], {"FAKE_OP_SAYS": said})
+        if not (ok and shown == want and calls == ["op read " + TOKEN_REF] * 2):
+            bad.append((tool, said, r.stdout + r.stderr))
+assert not bad, bad
+
+# The withhold rule at its edges (reviewer f1971 [16]): (OAUTH_TOKEN_REF, what
+# op says on stderr, withheld?). Runs of exactly 6 ("ab12cd", "qwerty") are one
+# window each, found in any letter case; their 5-character pieces show, and so
+# does a word whose runs are 5 long. A word of 15 ASCII letters only is a name
+# word and is not checked; 16 letters, or one digit, make a word checked. A
+# shown message is unchanged (no exact piece of the reference is in it).
+EDGES = [
+    ("op://Vault/Item/key ab12cd-QWERTY", "[ERROR] field 'ab12cd' not found", True),
+    ("op://Vault/Item/key ab12cd-QWERTY", "[ERROR] field 'qwerty' not found", True),
+    ("op://Vault/Item/key ab12cd-QWERTY", "[ERROR] ab12c b12cd qwert werty", False),
+    ("op://Vault/Item/key ab12c-QWERT", "[ERROR] field 'ab12c-qwert' not found", False),
+    ("op://Vault/Item/key Abcdefghijklmno", "[ERROR] could not read secret op://vault/item/key abcdefghijklmno", False),
+    ("op://Vault/Item/key Abcdefghijklmnop", "[ERROR] could not read secret op://vault/item/key abcdefghijklmnop", True),
+    ("op://Vault/Item/key Qwertyui", "[ERROR] could not read secret op://vault/item/key qwertyui", False),
+    ("op://Vault/Item/key Qwerty1i", "[ERROR] could not read secret op://vault/item/key qwerty1i", True),
+]
+bad = []
+for tool in ("claude-api", "doctor"):
+    for i, (ref, said, withheld) in enumerate(EDGES):
+        r, calls, shown, ok = op_failure(tool, "the withhold rule's edge %d (%s)" % (i, "withheld" if withheld else "shown"),
+                                         ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + ref], {"FAKE_OP_SAYS": said})
+        if not (ok and shown == (WITHHELD if withheld else said) and calls == ["op read " + ref] * 2):
+            bad.append((tool, ref, said, r.stdout + r.stderr))
+assert not bad, bad
+
+# op's reason comes from a second read whose stdout goes to /dev/null (reviewer
+# f1971 [15]). An op that fails the first read and answers the second prints
+# the token on that stdout: the failure line shows the second read's stderr
+# only, and the token shows nowhere.
+bad = []
+for tool in ("claude-api", "doctor"):
+    r, calls, shown, ok = op_failure(tool, "op fails the first read and answers the second: the token shows nowhere",
+                                     ["AUTH_MODE=enterprise", "OAUTH_TOKEN_REF=" + TOKEN_REF], {"FAKE_OP_FLAKY": "1"})
+    out = r.stdout + r.stderr
+    if not (ok and shown == FLAKY_ERR and calls == ["op read " + TOKEN_REF] * 2 and "FAKEFLAKY" not in out.upper()):
+        bad.append((tool, calls, out))
+assert not bad, bad
 # op's message is held in memory, never in a file: with no usable temporary
 # directory the failure line still carries it (claude-api used to stop at
 # mktemp, doctor at the redirect into an unnamed file).

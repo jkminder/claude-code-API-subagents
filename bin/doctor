@@ -86,9 +86,14 @@ oauth_ref_ok() { # <ref>
 # or into a <ref> already written). op may also repeat a piece in a changed
 # form (URL-encoded, escaped, lower-cased, cut short, split into words, a query
 # value alone) that no replacement finds, so the message is withheld whole
-# when, after the replacement, any 6 letters or digits in a row from the
-# reference are still in it, compared in any letter case (reviewer f1954 [1]).
-# Shorter pieces can still show. op 2.38.1 repeats the reference and its segments
+# when, after the replacement, any 6 letters or digits in a row from a checked
+# word of the reference are still in it, compared in any letter case (reviewer
+# f1954 [1]). Shorter pieces can still show. The reference is split into words
+# at whitespace and "/"; a name word, 1 to 15 ASCII letters and nothing else
+# (Fellow, Minder, credential), is not checked, since such words also turn up
+# in unrelated text (with-op's refusals name /home/jkminder, op says "invalid
+# credentials") and every token shape the fleet uses has a digit, "-" or "_"
+# (reviewer f1971 [14]). op 2.38.1 repeats the reference and its segments
 # literally (measured 2026-10-03), so its messages show. The reference reaches
 # python on stdin, never on a command line.
 redact_ref() { # <ref>; stdin: op's message → stdout: the message, redacted, or a withheld note
@@ -100,7 +105,8 @@ assert ref.startswith("op://") and len(segs) == 3 and all(segs), "redact_ref: a 
 parts = sorted(set([ref] + segs), key=len, reverse=True)
 text = re.sub("|".join(map(re.escape, parts)), "<ref>", text)
 seen = text.lower()
-runs = re.findall("[a-z0-9]{6,}", ref.lower())
+checked = [w for seg in segs for w in seg.split() if not re.fullmatch("[A-Za-z]{1,15}", w)]
+runs = [run for w in checked for run in re.findall("[a-z0-9]{6,}", w.lower())]
 if any(run[i:i + 6] in seen for run in runs for i in range(len(run) - 5)):
     text = "(withheld: it repeats part of the reference in a changed form)"
 sys.stdout.buffer.write(text.encode("utf-8", "surrogateescape"))
