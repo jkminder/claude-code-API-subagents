@@ -814,9 +814,12 @@ print("ok  a meta command (--version) under enterprise conf passes through witho
 #   record each call (never the reference), and check 19's FAIL line must start
 #   with that count (reviewer f1979 [8]). A copy that lost the stub, its export
 #   or check 19 (f) passes a trap call or loses the count.
+# Every run must leave the caller's fleet.conf as it was: a selftest that took
+# an exported FLEET_CONF for its own would write AUTH_MODE=api into it, and
+# pass.
 ST_CONF = ("AUTH_MODE=enterprise\nOAUTH_TOKEN_REF=op://Selftest Vault/Selftest Item/credential\n"
            "MODEL_DEFAULT=claude-opus-5-5\n")
-ST_RUNS = []   # (label, name, Popen, stdout path, traps log path)
+ST_RUNS = []   # (label, name, Popen, stdout path, traps log path, the caller's fleet.conf)
 
 
 def op_reaching_selftest(path):
@@ -870,7 +873,7 @@ def start_selftest(label, name, conf_at, script=None):
     with open(out, "w") as fo, open(os.path.join(st_dir, "stderr"), "w") as fe:
         proc = subprocess.Popen(["bash", script or os.path.join(HERE, "selftest")], stdout=fo, stderr=fe, text=True,
                                 env=env, cwd=st_tmp, stdin=subprocess.DEVNULL)
-    ST_RUNS.append((label, name, proc, out, traps))
+    ST_RUNS.append((label, name, proc, out, traps, conf))
 
 
 start_selftest("selftest checks 11-19 beside an enterprise fleet.conf named by an exported FLEET_CONF",
@@ -881,7 +884,7 @@ start_selftest("a selftest copy whose own fleet.conf reaches op: fails, the op s
                "names the count first", "selftest-op", "home",
                op_reaching_selftest(os.path.join(TMP, "selftest-op-reaching")))
 st = {}
-for label, name, proc, out, traps in ST_RUNS:
+for label, name, proc, out, traps, conf in ST_RUNS:
     rc = proc.wait(timeout=600)
     n += 1
     print("ok  %s (rc %d)" % (label, rc))
@@ -889,6 +892,8 @@ for label, name, proc, out, traps in ST_RUNS:
         stdout = f.read()
     trap_calls = open(traps).read() if os.path.exists(traps) else ""
     assert trap_calls == "", ("with-op, op or a claude session on PATH ran", label, trap_calls, stdout)
+    with open(conf) as f:
+        assert f.read() == ST_CONF, ("selftest changed the caller's fleet.conf", label, conf)
     st[name] = (rc, stdout)
 for name in ("selftest-env", "selftest-home"):
     rc, stdout = st[name]
