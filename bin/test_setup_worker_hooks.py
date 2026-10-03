@@ -3,8 +3,11 @@
 ~/.claude/settings.json are mirrored into the worker identity, and hook groups
 only the worker file carries (a fleet's API-only gates) survive a rerun; a hook
 the user removed from the user file leaves the worker file too, tracked in
-<config dir>/run/mirrored-hooks.json. Hermetic: a throwaway HOME and config
-dir, no key, no claude on PATH needed (setup-worker only warns).
+<config dir>/run/mirrored-hooks.json. setup-worker never writes or changes
+the model key (reviewer r1965 [5]): a fresh install has none, a value already
+there stays, and the fixed file written without python3 has none either.
+Hermetic: a throwaway HOME and config dir, no key, no claude on PATH needed
+(setup-worker only warns).
 Run: python3 bin/test_setup_worker_hooks.py
 """
 import atexit
@@ -132,11 +135,50 @@ def test_malformed_worker_hooks_are_replaced_not_crashed():
     assert isinstance(hooks["PreToolUse"], list) and any("permission-mode-hook" in c for c in commands(read(WORKER), "PreToolUse")), hooks
 
 
+def test_no_model_key_is_written_or_changed():
+    """claude-api pins fleet.conf's MODEL_DEFAULT per run, and the fleet model
+    has no built-in default, so setup-worker writes no model: it used to write
+    the retired claude-fable-5 into a file without one and turn claude-opus-5
+    into it. Every value already in the file stays as it is."""
+    shutil.rmtree(HOME, ignore_errors=True)
+    run()
+    assert "model" not in read(WORKER), read(WORKER)
+    for model in ("claude-opus-5", "claude-fable-5", "fable", "claude-opus-5-5"):
+        cfg = read(WORKER)
+        cfg["model"] = model
+        write(WORKER, cfg)
+        run()
+        assert read(WORKER).get("model") == model, (model, read(WORKER).get("model"))
+
+
+def test_without_python3_the_fixed_file_has_no_model():
+    """Without python3 setup-worker writes a fixed settings.json once, with no
+    merge; it carries no model either. PATH holds only the tools it runs."""
+    shutil.rmtree(HOME, ignore_errors=True)
+    nopy = os.path.join(TMP, "nopy-bin")
+    os.makedirs(nopy, exist_ok=True)
+    for tool in ("bash", "dirname", "readlink", "mkdir", "chmod", "cat", "ln", "rm", "mv", "rmdir", "basename"):
+        path = shutil.which(tool)
+        assert path, tool
+        if not os.path.lexists(os.path.join(nopy, tool)):
+            os.symlink(path, os.path.join(nopy, tool))
+    env = dict(os.environ, HOME=HOME, CLAUDE_API_CONFIG_DIR=CFG, PATH=nopy)
+    env.pop("CLAUDE_API_KEY_CMD", None)
+    probe = subprocess.run([shutil.which("bash"), "-c", "command -v python3"], env=env, capture_output=True, text=True)
+    assert probe.returncode != 0, ("python3 is still on the test PATH", probe.stdout)
+    r = subprocess.run([SETUP], env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert "python3 absent: created, will not merge on rerun" in r.stdout, r.stdout
+    cfg = read(WORKER)
+    assert "model" not in cfg and cfg.get("skipDangerousModePermissionPrompt") is True, cfg
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     order = [test_worker_only_groups_survive_and_user_hooks_are_mirrored, test_rerun_is_idempotent,
              test_a_hook_the_user_removed_leaves_the_worker_file_too,
-             test_without_a_record_every_worker_only_group_is_kept, test_malformed_worker_hooks_are_replaced_not_crashed]
+             test_without_a_record_every_worker_only_group_is_kept, test_malformed_worker_hooks_are_replaced_not_crashed,
+             test_no_model_key_is_written_or_changed, test_without_python3_the_fixed_file_has_no_model]
     assert sorted(t.__name__ for t in tests) == sorted(t.__name__ for t in order), "runner misses a test"
     for t in order:
         t()

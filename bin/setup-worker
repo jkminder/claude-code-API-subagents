@@ -86,14 +86,13 @@ if os.path.exists(path):
 if not isinstance(cfg, dict):
     cfg = {}
 changed = False
-# Default worker model: fable. "claude-opus-5" was briefly the managed default,
-# so migrate it back; any other explicitly-chosen model is preserved. (Headless
-# runs ignore this key — bin/claude-api pins fleet.conf's MODEL_DEFAULT via
-# --settings and refuses when it is unset — but it
-# still governs interactive worker sessions.)
-if cfg.get("model") in (None, "claude-opus-5"):
-    if cfg.get("model") != "claude-fable-5":
-        cfg["model"] = "claude-fable-5"; changed = True
+# No model key is written or migrated here (it used to get a built-in default;
+# the fleet model has none, Julian's D73). bin/claude-api pins fleet.conf's
+# MODEL_DEFAULT through --settings on every run without --model or --settings,
+# interactive ones included, and refuses when it is unset. The key in this file
+# governs only sessions that bypass that pin (a caller's own --settings without
+# a model, a plain claude on this config dir such as a Happy seat's local-mode
+# leg), so it is the operator's to set, and a value already here stays.
 env = cfg.setdefault("env", {})
 if env.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS") != "1":
     env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"; changed = True
@@ -179,7 +178,6 @@ PY
 elif [ ! -f "$CONFIG_DIR/settings.json" ]; then
   cat > "$CONFIG_DIR/settings.json" <<'JSON'
 {
-  "model": "claude-fable-5",
   "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" },
   "skipDangerousModePermissionPrompt": true
 }
