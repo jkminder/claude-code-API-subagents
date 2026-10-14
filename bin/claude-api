@@ -63,6 +63,11 @@ RUN_DIR="$CONFIG_DIR/run"
 # hooks decided whether our parent's permission mode got recorded.
 PARENT_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 export CLAUDE_CONFIG_DIR="$CONFIG_DIR"
+# The "tokens left" counter off (Julian's D207 = a, 2026-10-14): Claude Code's
+# <total_tokens> reminder counts down a 15M budget that a worker's prompts
+# rarely refill, and at 0 sessions read it as an exhausted context and stopped
+# work. Read at each claude start. An explicit caller env still wins.
+export CLAUDE_CODE_TOTAL_TOKENS_REMINDER="${CLAUDE_CODE_TOTAL_TOKENS_REMINDER:-off}"
 
 # fleet.conf reader (env wins, then $FLEET_CONF or ~/.config/fleet/fleet.conf;
 # the fleet grammar: KEY=VALUE, one pair of matching quotes stripped, full-line

@@ -64,6 +64,7 @@ with open(os.path.join(FAKE_BIN, "claude"), "w") as f:
             '{ echo CALL; for a in "$@"; do printf \'ARG %s\\n\' "$a"; done; } >> ' + repr(CLAUDE_REC) + '\n'
             'echo "CLAUDE_FAKE oauth_set=${CLAUDE_CODE_OAUTH_TOKEN:+1} len=${#CLAUDE_CODE_OAUTH_TOKEN}"\n'
             'echo "CLAUDE_FAKE_ENV auth_mode=[${AUTH_MODE-unset}] ref=[${OAUTH_TOKEN_REF-unset}]"\n'
+            'echo "CLAUDE_FAKE_REMINDER [${CLAUDE_CODE_TOTAL_TOKENS_REMINDER-unset}]"\n'
             'for a in "$@"; do printf \'ARG %s\\n\' "$a"; done\n')
 os.chmod(os.path.join(FAKE_BIN, "claude"), 0o755)
 REC = os.path.join(TMP, "op-calls.log")
@@ -190,6 +191,7 @@ def refused_unshown(r, calls, value, message):
 r, calls = case("api mode is the default: no token, no overlay, no op call", helper=True, conf_lines=[])
 assert r.returncode == 0, r.stdout + r.stderr
 assert "CLAUDE_FAKE oauth_set= len=0" in r.stdout, r.stdout
+assert "CLAUDE_FAKE_REMINDER [off]" in r.stdout, r.stdout   # the tokens-left counter is off (D207)
 assert settings_arg(r) == '{"model": "claude-fable-5-1"}', r.stdout
 assert calls == [], calls
 
