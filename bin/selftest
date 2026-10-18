@@ -171,8 +171,10 @@ cat > fakebin/claude <<'EOF'
 # whether an API key reached this process — "unset" is the expected value.
 [ -n "${FAKE_ENV_OUT:-}" ] && printf '%s\n' "${ANTHROPIC_API_KEY-unset}" > "$FAKE_ENV_OUT"
 n=0
-while IFS= read -r _; do
+while IFS= read -r line; do
   n=$((n+1))
+  # FAKE_IN_OUT (check 15): the first input line, the task message as the worker got it
+  [ "$n" = 1 ] && [ -n "${FAKE_IN_OUT:-}" ] && printf '%s\n' "$line" > "$FAKE_IN_OUT"
   if [ "${FAKE_MODE:-}" = crash ]; then
     printf '{"type":"assistant","session_id":"fake-sid"}\n'
     exit 3
@@ -458,7 +460,7 @@ else
 fi
 
 echo
-step "15/19 text args: file flags keep backticks out of the shell, and empty text is refused"
+step "15/19 text args: file flags keep backticks out of the shell, empty text is refused, and a brief over 128 KiB launches whole"
 # A brief passed as a quoted argument is mangled by the CALLER's shell before
 # run sees it, so the durable fix is to read it from a file. Guard both the
 # file reading and the argument parsing around it: an earlier version of this
@@ -472,6 +474,20 @@ CLAUDE_API_CONFIG_DIR="$ISO" PATH="$WORK/fakebin:$PATH" "$CA" run st-pf-missing 
 misrc=$?
 CLAUDE_API_CONFIG_DIR="$ISO" PATH="$WORK/fakebin:$PATH" "$CA" run st-pf-empty --prompt-file "$WORK/brief-empty.txt" > t15c.out 2> t15c.err
 emprc=$?
+# a brief over the kernel's 128 KiB cap on one argv/env string still launches and
+# reaches the worker whole (2026-10-18: a 142 KB merge-round brief died with
+# "Argument list too long" while the task travelled in an environment string)
+python3 -c 'import sys; sys.stdout.write(("Brief line with `ticks` and $HOME — " * 4 + "\n") * 1300)' > brief-big.txt
+( cd notrepo && CLAUDE_API_CONFIG_DIR="$ISO" PATH="$WORK/fakebin:$PATH" FAKE_IN_OUT="$WORK/t15p.in" "$CA" run st-pf-big --prompt-file "$WORK/brief-big.txt" ) > t15p.out 2> t15p.err
+bigrc=$?
+bigok=0
+python3 - "$WORK/brief-big.txt" "$WORK/t15p.in" 2> t15p.chk <<'PYCHK' && bigok=1
+import json, sys
+want = open(sys.argv[1], encoding="utf-8").read().rstrip("\n")
+got = json.loads(open(sys.argv[2], encoding="utf-8").read())["message"]["content"]
+assert len(want.encode()) > 131072, len(want.encode())
+assert got == want, (len(got), len(want))
+PYCHK
 # the dirty-tree refusal proves the slug survived parsing intact and the file
 # was accepted; a mangled slug would have been rejected by the slug check first
 # the same class one step to the side: send/ask/answer carry agent-written text
@@ -511,10 +527,11 @@ if [ "$pfrc" -eq 2 ] && grep -q 'uncommitted changes' t15.err && ! grep -q 'slug
    && [ "$runws" -eq 2 ] && grep -q 'refusing an empty task' t15l.err \
    && [ "$askempty" -eq 2 ] && grep -q 'is empty' t15m.err \
    && [ "$ansempty" -eq 2 ] && grep -q 'is empty' t15n.err \
-   && [ "$badslug" -eq 2 ] && grep -q 'slug must match' t15o.err; then
+   && [ "$badslug" -eq 2 ] && grep -q 'slug must match' t15o.err \
+   && [ "$bigrc" -eq 0 ] && [ "$(cat t15p.out)" = "TURN 1" ] && [ "$bigok" -eq 1 ]; then
   ok
 else
-  bad "text args: files run=$pfrc/$misrc/$emprc send=$sendmiss/$sendempty ask=$askmiss answer=$ansmiss (want 2); empty text run=$runws send=$sendblank/$sendws answer=$ansblank ask=$askws/$askempty answer-file=$ansempty badslug=$badslug (t15*.err)"
+  bad "text args: files run=$pfrc/$misrc/$emprc send=$sendmiss/$sendempty ask=$askmiss answer=$ansmiss (want 2); empty text run=$runws send=$sendblank/$sendws answer=$ansblank ask=$askws/$askempty answer-file=$ansempty badslug=$badslug; big brief rc=$bigrc whole=$bigok (want 0/1) (t15*.err, t15p.chk)"
 fi
 
 echo

@@ -208,13 +208,22 @@ case "${1:-}" in
       echo "claude-api run: note — slug '$slug' was used before in this session; overwriting its artifacts (concurrent same-slug runs would corrupt each other)" >&2
     fi
     export CLAUDE_API_RUN_SLUG="$slug"
-    CLAUDE_API_RUN_TASK="$prompt" exec python3 - "$SRC" "$WDIR" "$slug" "$CONFIG_DIR" "$stay" ${rest[@]+"${rest[@]}"} <<'PYEOF'
+    # The task reaches the launcher as a file, never as one environment
+    # string: the kernel caps a single argv/env string at 128 KiB, and a
+    # 142 KB merge-round brief died here with "Argument list too long"
+    # (2026-10-18). The launcher reads the file and removes it.
+    taskf="$WDIR/$slug.task"
+    ( umask 077 && printf '%s' "$prompt" > "$taskf" ) || { echo "claude-api run: cannot write the task file $taskf" >&2; exit 2; }
+    CLAUDE_API_RUN_TASK_FILE="$taskf" exec python3 - "$SRC" "$WDIR" "$slug" "$CONFIG_DIR" "$stay" ${rest[@]+"${rest[@]}"} <<'PYEOF'
 import array, errno, fcntl, json, os, signal, stat, subprocess, sys, termios, time
 
 src, wdir, slug, cfg = sys.argv[1:5]
 stay = sys.argv[5] == "1"
 extra = sys.argv[6:]
-task = os.environ.pop("CLAUDE_API_RUN_TASK")
+task_file = os.environ.pop("CLAUDE_API_RUN_TASK_FILE")
+with open(task_file, encoding="utf-8") as f:
+    task = f.read()
+os.unlink(task_file)
 
 base = os.path.join(wdir, slug)
 fifo, nd, errf = base + ".in", base + ".ndjson", base + ".err"
